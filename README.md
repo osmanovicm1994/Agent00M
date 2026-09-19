@@ -33,6 +33,11 @@ List available agents:
 npm run dev -- agents
 ```
 
+Run interactive chat:
+```bash
+npm run chat
+```
+
 ## How it works
 
 1. **Router** picks a specialist agent (`dev`, `api`, `design`) for your task, unless you pass `--agent`.
