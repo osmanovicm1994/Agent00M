@@ -12,7 +12,9 @@
     "build": "tsc -p tsconfig.json",
     "dev": "ts-node src/cli.ts",
     "start": "node dist/cli.js",
-    "chat": "ts-node src/cli.ts chat"
+    "chat": "dotenv -e .env.local -- ts-node src/cli.ts chat",
+    "chat:local": "dotenv -e .env.local -- ts-node src/cli.ts chat",
+    "chat:nim": "dotenv -e .env.nim -- ts-node src/cli.ts chat"
   },
   "dependencies": {
     "commander": "^12.1.0",
@@ -27,6 +29,7 @@
     "@types/diff": "^5.2.1",
     "@types/node": "^20.14.9",
     "@types/prompts": "^2.4.9",
+    "dotenv-cli": "^11.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.4"
   }
