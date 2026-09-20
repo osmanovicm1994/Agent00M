@@ -55,7 +55,7 @@ full-file content for write_file.` + loadSkill("api-standards")
     id: "db",
     name: "Database Agent",
     description:
-      "Backend/API design and implementation: REST endpoints, database schema, server-side business logic, request validation.",
+      "Specialist Database, Schema, and ORM Architect. Design robust, scalable data structures and execute zero-risk data operations.",
     systemPrompt: 
       'Database architecture, schema design, migration management, complex SQL/PostgreSQL queries, indexing strategies, and data integrity enforcement.' + loadSkill("db-standards"),
   },
@@ -70,6 +70,15 @@ existing design system/tokens rather than introducing new styles ad hoc. Read ex
 components and styles before proposing changes. Always propose full-file content for
 write_file.` + loadSkill("uupm"),
   },
+  {
+  id: "logic",
+    name: "Logical Architecture Agent",
+  description:
+      "Specialist Architecture Planning and Problem Decomposition Strategist.",
+  systemPrompt: 
+    "You are a specialist Logical Thinking and Architecture Agent. Your purpose is to analyze complex user problems, perform rigorous step-by-step reasoning, map out execution plans, and identify hidden edge-cases before handing tasks down to execution agents." + 
+    loadSkill("logic-standards"),
+},
 ];
 
 export function getAgent(id: string): AgentDefinition | undefined {
