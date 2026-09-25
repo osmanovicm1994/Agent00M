@@ -79,7 +79,9 @@ program
     console.log(pc.dim(`Workspace: ${workspaceRoot}`));
     console.log(pc.bold("🤖 Interactive Multi-Agent CLI Started. Type your task or 'exit' to quit.\n"));
 
-    const llm = createProvider("lmstudio");
+    // Dynamically choose provider based on environment setup
+    const providerName = (process.env.AI_PROVIDER || "lmstudio") as any;
+    const llm = createProvider(providerName);
     const executor = new Executor(llm, workspaceRoot);
 
     const rl = readline.createInterface({
@@ -88,7 +90,7 @@ program
     });
 
     const askQuestion = () => {
-      rl.question(pc.cyan('User > '), async (taskInput) => {
+      rl.question(pc.cyan('\nUser > '), async (taskInput) => {
         const task = taskInput.trim();
 
         if (task.toLowerCase() === 'exit' || task.toLowerCase() === 'quit') {
@@ -103,21 +105,28 @@ program
         }
 
         try {
-          console.log(pc.dim('... Routing task & executing ...'));
+          console.log(pc.dim('... Routing task & analyzing ...'));
           
           // Auto-route to specialist agent
           const resolvedAgent = await routeTask(llm, task);
           console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
 
+          console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
+
           // Run via your executor
           const result = await executor.run(resolvedAgent, task);
 
-          console.log(pc.dim(`\n(${result.stepsTaken} step(s) taken)`));
+          // Summary output after execution loop completes
+          console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));
+          
+          if (result.filesWritten.length > 0) {
+            console.log(pc.cyan("Files written this session:"));
+            result.filesWritten.forEach(f => console.log(`  - ${f}`));
+          }
         } catch (err) {
-          console.error(pc.red('Execution error:'), err);
+          console.error(pc.red('\nExecution error:'), err);
         }
 
-        console.log(''); // Empty line spacing
         askQuestion();
       });
     };
