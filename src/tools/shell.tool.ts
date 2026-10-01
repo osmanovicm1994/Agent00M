@@ -1,23 +1,47 @@
 import { execSync } from "child_process";
 import type { ToolSchema } from "../llm/types";
 
+export interface ShellResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
 export class ShellTool {
   constructor(private readonly workspaceRoot: string) {}
 
-  // Actually executes the command. Callers (the executor) MUST get user
-  // approval before invoking this — this class does not gate anything itself.
-  run(command: string): { stdout: string; stderr: string; exitCode: number } {
+  /**
+   * Executes a shell command inside the workspace root directory.
+   * Execution options include safeguards against infinite loops and buffer overflows.
+   */
+  run(command: string, timeoutMs = 30000): ShellResult {
     try {
       const stdout = execSync(command, {
         cwd: this.workspaceRoot,
         encoding: "utf8",
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024, // 10MB
         stdio: ["ignore", "pipe", "pipe"],
       });
-      return { stdout, stderr: "", exitCode: 0 };
-    } catch (err: any) {
+
       return {
-        stdout: err.stdout?.toString() ?? "",
-        stderr: err.stderr?.toString() ?? err.message,
+        stdout: stdout || "",
+        stderr: "",
+        exitCode: 0,
+      };
+    } catch (err: any) {
+      const stdout = err.stdout?.toString() ?? "";
+      let stderr = err.stderr?.toString() ?? "";
+
+      if (err.code === "ETIMEDOUT") {
+        stderr = `Command timed out after ${timeoutMs / 1000} seconds.\n${stderr}`;
+      } else if (!stderr) {
+        stderr = err.message || "Command execution failed.";
+      }
+
+      return {
+        stdout,
+        stderr,
         exitCode: typeof err.status === "number" ? err.status : 1,
       };
     }
