@@ -1,6 +1,6 @@
-// Pluggable LLM abstraction. Every backend (LM Studio/DeepSeek, Anthropic, etc.)
-// implements this same interface, so agents/executor never know or care which
-// model is actually running.
+// Pluggable LLM abstraction. Every backend (LM Studio / Qwen, NVIDIA NIM,
+// Anthropic, etc.) implements this same interface, so agents/executor never
+// know or care which model is actually running.
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 
@@ -32,9 +32,14 @@ export interface LLMResponse {
   toolCalls?: ToolCall[];
   // Model's raw reasoning/think block, if the backend exposes one (e.g. DeepSeek R1).
   reasoning?: string;
+  // Why generation stopped. "length" means the output was cut off by the token
+  // limit even after any automatic continuation attempts.
+  finishReason?: string;
 }
 
 export interface LLMProvider {
   readonly name: string;
+  // Model identifier (used e.g. to keep response caches of different models apart).
+  readonly model?: string;
   chat(messages: ChatMessage[], tools?: ToolSchema[]): Promise<LLMResponse>;
 }
