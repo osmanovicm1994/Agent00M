@@ -1,15 +1,17 @@
+// src/llm/factory.ts
 import type { LLMProvider } from "./types";
 import { LMStudioProvider, type LMStudioConfig } from "./providers/lmstudio";
+import { CachedLLMProvider } from "./cached-provider";
 
 export type ProviderId = "lmstudio" | "anthropic";
 
-// Central place that decides which LLM backend an agent talks to.
-// Adding a new backend later = add a case here + a provider file; nothing
-// else in the codebase (agents, executor, planner) needs to change.
 export function createProvider(id: ProviderId = "lmstudio", config?: LMStudioConfig): LLMProvider {
+  let baseProvider: LLMProvider;
+
   switch (id) {
     case "lmstudio":
-      return new LMStudioProvider(config);
+      baseProvider = new LMStudioProvider(config);
+      break;
     case "anthropic":
       throw new Error(
         "Anthropic provider not implemented yet — this is the plug point for adding it later.",
@@ -17,4 +19,7 @@ export function createProvider(id: ProviderId = "lmstudio", config?: LMStudioCon
     default:
       throw new Error(`Unknown LLM provider: ${id}`);
   }
+
+  // Wrap the base provider in the caching layer before returning
+  return new CachedLLMProvider(baseProvider);
 }
