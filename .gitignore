@@ -1,4 +1,9 @@
 .env
 .env.nim
+.env.*
+!.env.example
+!.env.local
 node_modules/
 .DS_Store
+dist/
+.agent_cache/

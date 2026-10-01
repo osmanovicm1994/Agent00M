@@ -1,7 +1,7 @@
 {
   "name": "agent-cli",
   "version": "0.1.0",
-  "description": "Copilot-CLI-style local coding agent, backed by DeepSeek R1 via LM Studio (pluggable LLM backends).",
+  "description": "Copilot-CLI-style local coding agent, backed by a local Qwen model via LM Studio (pluggable LLM backends, MCP tool servers).",
   "private": true,
   "type": "commonjs",
   "bin": {
@@ -10,6 +10,7 @@
   "main": "dist/cli.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "dev": "ts-node src/cli.ts",
     "start": "node dist/cli.js",
     "chat": "dotenv -e .env.local -- ts-node src/cli.ts chat",
