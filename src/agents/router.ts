@@ -33,6 +33,9 @@ export async function routeTask(llm: LLMProvider, task: string): Promise<AgentDe
   const quick = keywordRoute(task);
   if (quick) return quick;
 
+  // AGENT_ROUTER=keywords: never spend a model call on routing (unmatched tasks go to "dev").
+  if ((process.env.AGENT_ROUTER ?? "auto").toLowerCase() === "keywords") return getAgent("dev")!;
+
   const agentList = AGENTS.map((a) => `- ${a.id}: ${a.description}`).join("\n");
 
   const routerPrompt = `You are a router that assigns a coding task to exactly one specialist agent.
@@ -44,10 +47,16 @@ Task: "${task}"
 
 Respond with ONLY the agent id (one of: ${AGENTS.map((a) => a.id).join(", ")}), nothing else.`;
 
-  const response = await llm.chat([
-    { role: "system", content: "You are a precise task router. Reply with a single agent id and nothing else." },
-    { role: "user", content: routerPrompt },
-  ]);
+  // The answer is one word, so cap the output: a model that starts to ramble or think
+  // (reasoning models) must not hold up the task for minutes. An empty answer falls back to "dev".
+  const response = await llm.chat(
+    [
+      { role: "system", content: "You are a precise task router. Reply with a single agent id and nothing else." },
+      { role: "user", content: routerPrompt },
+    ],
+    undefined,
+    { maxTokens: 24, temperature: 0 },
+  );
 
   const candidate = response.content.trim().toLowerCase().replace(/[^a-z-]/g, "");
   return getAgent(candidate) ?? getAgent("dev")!;

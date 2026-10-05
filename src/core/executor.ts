@@ -21,6 +21,7 @@ const TOOL_OUTPUT_LIMIT = 30_000;
 const MAX_THINKING_CALLS = 8;
 const MAX_NUDGES = 6;
 const STACK_KNOWLEDGE_CHARS = 6000;
+const FENCE = "`".repeat(3);
 
 // Tools that only read state. Several of these may be executed in one turn.
 const READ_ONLY_TOOLS = new Set([
@@ -218,6 +219,12 @@ async function confirm(message: string): Promise<boolean> {
   return Boolean(response.ok);
 }
 
+export interface ExecutorOptions {
+  // Apply write_file / append_file without asking; a log line is printed instead.
+  // Commands (run_command) and non-auto-approved MCP tools still ask.
+  autoWrite?: boolean;
+}
+
 export interface ExecutorResult {
   finalMessage: string;
   stepsTaken: number;
@@ -262,17 +269,28 @@ export class Executor {
   private shell: ShellTool;
   private search: SearchTool;
   private toolSchemas: ToolSchema[];
+  private autoWrite: boolean;
 
   constructor(
     private readonly llm: LLMProvider,
     private readonly workspaceRoot: string,
     private readonly mcp?: McpManager,
+    options: ExecutorOptions = {},
   ) {
+    this.autoWrite = options.autoWrite ?? process.env.AGENT_AUTO_WRITE === "1";
     this.workspaceRoot = path.resolve(workspaceRoot);
     this.fs = new FsTools(this.workspaceRoot);
     this.shell = new ShellTool(this.workspaceRoot);
     this.search = new SearchTool(this.workspaceRoot);
     this.toolSchemas = [...BUILTIN_TOOL_SCHEMAS, ...(mcp?.schemas() ?? [])];
+  }
+
+  setAutoWrite(value: boolean): void {
+    this.autoWrite = value;
+  }
+
+  isAutoWrite(): boolean {
+    return this.autoWrite;
   }
 
   // Normalizes a model-supplied path: forward slashes, no leading "./",
@@ -311,14 +329,37 @@ export class Executor {
     return this.toolSchemas.some((t) => /think/i.test(t.name));
   }
 
+  // Compact "name(arg, optionalArg?): description" list for models that cannot
+  // receive a tools payload (no native tool calling).
+  private toolReference(): string {
+    return this.toolSchemas
+      .map((t) => {
+        const params = t.parameters as { properties?: Record<string, unknown>; required?: string[] };
+        const required = new Set(params.required ?? []);
+        const args = Object.keys(params.properties ?? {})
+          .map((k) => (required.has(k) ? k : `${k}?`))
+          .join(", ");
+        const firstSentence = t.description.split(/(?<=\.)\s/)[0].slice(0, 170);
+        return `- ${t.name}(${args}): ${firstSentence}`;
+      })
+      .join("\n");
+  }
+
   private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[]): string {
     const stack = loadKnowledge(stackPaths, STACK_KNOWLEDGE_CHARS);
     const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
+    const native = this.llm.nativeTools !== false;
+    const toolSection = native
+      ? `You have access to these tools: ${toolNames}.\nIf your runtime does not support native tool calls, use these fenced-block formats instead.`
+      : `This model has NO native tool calling. Call tools ONLY by writing the fenced blocks described below.\n\nAvailable tools ("?" marks an optional argument):\n${this.toolReference()}${
+          this.hasThinkingTool()
+            ? `\n\nExample for the planning tool:\n${FENCE}action\n{"name": "sequentialthinking", "arguments": {"thought": "First read the config files, then ...", "nextThoughtNeeded": true, "thoughtNumber": 1, "totalThoughts": 3}}\n${FENCE}`
+            : ""
+        }`;
 
     return `${agent.systemPrompt}${stack}
 
-You have access to these tools: ${toolNames}.
-If your runtime does not support native tool calls, use these fenced-block formats instead.
+${toolSection}
 
 Tools with simple arguments (read_file, read_multiple_files, get_directory_tree, find_files, grep, run_command${this.hasThinkingTool() ? ", MCP tools" : ""}):
 \`\`\`action
@@ -351,8 +392,12 @@ When you are done and have no more actions to take, reply normally with a final 
     let total = messages.reduce((n, m) => n + m.content.length, 0);
     if (total <= CONTEXT_CHAR_BUDGET) return;
 
+    // Compact in ONE pass down to ~60% of the budget instead of trimming a little every turn:
+    // the server can only reuse its cached prompt prefix up to the first message that changed,
+    // so rewriting history on every turn would force a full re-read of the prompt each time.
+    const target = Math.floor(CONTEXT_CHAR_BUDGET * 0.6);
     const protectedTail = 6;
-    for (let i = 2; i < messages.length - protectedTail && total > CONTEXT_CHAR_BUDGET; i++) {
+    for (let i = 2; i < messages.length - protectedTail && total > target; i++) {
       const m = messages[i];
       if ((m.role === "tool" || m.role === "assistant") && m.content.length > 600) {
         const before = m.content.length;
@@ -418,6 +463,11 @@ When you are done and have no more actions to take, reply normally with a final 
     if (stackPaths.length) {
       console.log(pc.dim(`Detected stack standards: ${stackPaths.map((p) => basename(p)).join(", ")}`));
     }
+    console.log(
+      pc.dim(
+        `Model: ${this.llm.model ?? "unknown"} · tool protocol: ${this.llm.nativeTools === false ? "fenced blocks (no native tools)" : "native tool calls"}`,
+      ),
+    );
     const systemPrompt = this.buildSystemPrompt(agent, stackPaths);
 
     // Ground the agent in reality before it can guess: show the real tree as the
@@ -435,7 +485,8 @@ When you are done and have no more actions to take, reply normally with a final 
     while (steps < MAX_STEPS) {
       steps++;
       this.compactHistory(messages);
-      const response = await this.llm.chat(messages, this.toolSchemas);
+      // Models without a tool template get no tools payload (they use fenced blocks).
+      const response = await this.llm.chat(messages, this.llm.nativeTools === false ? undefined : this.toolSchemas);
       const { calls, discarded, incompleteBlock } = this.extractCalls(response);
 
       if (!calls.length) {
@@ -538,7 +589,9 @@ When you are done and have no more actions to take, reply normally with a final 
         // twice: as reply text and as tool-call arguments).
         if (/^File (written|appended):/.test(rawResult)) {
           this.stripWrittenContent(calls[i]);
-          if (calls[i].id.startsWith("file-")) assistantMsg.content = "";
+          // Native-tool models re-read the history as structured tool calls, so the reply text can go.
+          // Fenced-block models must keep seeing the exact block format they are supposed to produce.
+          if (calls[i].id.startsWith("file-") && this.llm.nativeTools !== false) assistantMsg.content = "";
         }
 
         const notice =
@@ -824,12 +877,19 @@ When you are done and have no more actions to take, reply normally with a final 
       );
     }
 
-    const diff = renderDiff(p, oldContent, content);
-    console.log(`\n${pc.bold(exists ? "Proposed edit:" : "Proposed new file:")} ${p} (${newLines - 1} lines)\n`);
-    console.log(diff || pc.dim("(no textual diff — identical content)"));
+    if (this.autoWrite) {
+      // Auto-write mode: no diff, no prompt, just a log line.
+      console.log(
+        pc.green(exists ? `\n✎ Overwriting ${p} (${newLines - 1} lines)` : `\n✎ Creating new file ${p} (${newLines - 1} lines)`),
+      );
+    } else {
+      const diff = renderDiff(p, oldContent, content);
+      console.log(`\n${pc.bold(exists ? "Proposed edit:" : "Proposed new file:")} ${p} (${newLines - 1} lines)\n`);
+      console.log(diff || pc.dim("(no textual diff — identical content)"));
 
-    if (!(await confirm(`Apply this change to ${p}?`))) {
-      return "User rejected this file write. Do not repeat the same change; ask what to do differently or stop.";
+      if (!(await confirm(`Apply this change to ${p}?`))) {
+        return "User rejected this file write. Do not repeat the same change; ask what to do differently or stop.";
+      }
     }
 
     this.fs.commitWrite(p, content);
@@ -845,13 +905,17 @@ When you are done and have no more actions to take, reply normally with a final 
 
     const lines = content.split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
-    const preview = lines.slice(0, 40).map((l) => pc.green(`+${l}`));
-    console.log(`\n${pc.bold("Proposed append:")} ${p} (+${lines.length} lines)\n`);
-    console.log(preview.join("\n"));
-    if (lines.length > 40) console.log(pc.dim(`… (+${lines.length - 40} more lines)`));
+    if (this.autoWrite) {
+      console.log(pc.green(`\n✎ Appending ${lines.length} lines to ${p}`));
+    } else {
+      const preview = lines.slice(0, 40).map((l) => pc.green(`+${l}`));
+      console.log(`\n${pc.bold("Proposed append:")} ${p} (+${lines.length} lines)\n`);
+      console.log(preview.join("\n"));
+      if (lines.length > 40) console.log(pc.dim(`… (+${lines.length - 40} more lines)`));
 
-    if (!(await confirm(`Append these ${lines.length} lines to ${p}?`))) {
-      return "User rejected this append. Do not repeat the same change; ask what to do differently or stop.";
+      if (!(await confirm(`Append these ${lines.length} lines to ${p}?`))) {
+        return "User rejected this append. Do not repeat the same change; ask what to do differently or stop.";
+      }
     }
 
     this.fs.appendToFile(p, content);
