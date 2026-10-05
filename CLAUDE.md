@@ -20,6 +20,9 @@ npm run chat             # interactive session with .env.local (local Qwen)
 npm run chat:nim         # same, with .env.nim (cloud endpoint, optional)
 npx ts-node src/cli.ts run "task" -p /path/to/project [-a <agent>] [--no-mcp]
 npx ts-node src/cli.ts agents
+npm run models         # list models on the LM Studio server (+ native/fenced tool mode)
+npm run bench          # first-token time and tok/s of the model in .env.local
+npm run chat:qwen3     # profiles: chat:qwen3 | chat:devstral | chat:codestral (bench:* likewise)
 ```
 
 LM Studio prerequisites: local server running, model loaded, and the model's **context length** set larger than prompt + `AI_MAX_TOKENS` (prompt and output share the window). If context is too small, replies are cut off no matter what the agent does.
@@ -33,7 +36,8 @@ src/
     executor.ts          THE agent loop: prompt build, tool dispatch, safety gates, history compaction.
     diff.ts              colored diff shown before a write is approved.
   llm/
-    types.ts             LLMProvider / ChatMessage / ToolSchema / LLMResponse (finishReason).
+    types.ts             LLMProvider / ChatMessage / ToolSchema / LLMResponse (finishReason, stats).
+    models.ts            per-model profiles: native vs fenced tools, temperature, /no_think.
     factory.ts           createProvider(); wraps the provider in the cache.
     providers/lmstudio.ts  OpenAI-compatible provider: streaming, max_tokens, auto-continuation.
     cache.ts, cached-provider.ts   gzip response cache in .agent_cache/ (keyed by model + messages + tools).
@@ -84,6 +88,15 @@ mcp.config.json          MCP servers started at launch.
 - Secret env files (`.env`, `.env.*` except `*.example`) cannot be read or grepped by the agent.
 - The "claimed changes that were never made" guard and the nudge cap (`MAX_NUDGES`) protect against a model that narrates instead of acting.
 
+## Auto-write mode
+
+By default every `write_file` / `append_file` shows a diff and asks for approval. Auto-write mode skips that and prints one log line per write (`✎ Creating new file <path> (N lines)`, `✎ Overwriting <path> (N lines)`, `✎ Appending N lines to <path>`). Useful for long unattended jobs such as harvesting knowledge from a project.
+
+- `chat` asks at startup: "Let the agent write files automatically, without asking each time? (y/N)". `/auto-write` toggles it at any time; the prompt shows `[✎ auto-write]` while it is on.
+- `run` takes `-y` / `--auto-write`. `AGENT_AUTO_WRITE=1` turns it on by default.
+- Only file writes are affected. `run_command` and non-auto-approved MCP tools still ask. All safety gates (read-before-overwrite, directory inspection, placeholder refusal, shrink guard, secret-file block) stay active.
+- Implementation: `ExecutorOptions.autoWrite`, `Executor.setAutoWrite()/isAutoWrite()`, branches in `handleWrite` and `handleAppend` (`core/executor.ts`).
+
 ## Preventing cut-off files
 
 Three layers, all needed:
@@ -111,9 +124,19 @@ The agent's file tools are scoped to the **target** project, so the agent can ne
 - Add a file: keep it short and imperative (~1.5 KB), then reference it in an agent's list or in `STACK_PRIORITY`/`inspectDir` in `helpers.ts`.
 - `knowledge/uupm/` is a vendored UI/UX Pro Max skill pack (~35 KB of references, nested `src/knowledge/uupm/src/knowledge/uupm/...`). It is **not injected anywhere**; `10-design/design-standards.md` is the condensed version the design agent actually uses.
 
+## Models & speed
+
+See `docs/MODELS.md` for the model comparison, LM Studio settings and why numbers differ from reviews.
+
+- **Profiles** (`llm/models.ts`): the model id picks native tool calling vs fenced blocks, temperature and `/no_think`. Codestral, Phi-4, DeepSeek-Coder and R1 have no tool template, so for them the provider sends no `tools` payload, the system prompt lists the tools (`Executor.toolReference`), and the history is flattened to alternating user/assistant text (`LMStudioProvider.toPlainMessages`), because strict templates reject the `tool` role. Override with `AI_NATIVE_TOOLS=on|off`.
+- **Switching**: `--model <id>` on `run`/`chat`, `/model [id]` in chat (history kept), `npm run models` to list ids. The cache key includes model + tool protocol.
+- **Measuring**: every LLM call prints `first token Xs · N tok/s` (`AI_STATS=0` hides it); `npm run bench` runs a fixed prompt without tools or cache. Use it to compare models instead of trusting claims.
+- **Prefix stability**: LM Studio reuses work only for a byte-identical prompt prefix. Keep the system prompt and early history stable (no timestamps, no reordering); `compactHistory` is the one place that rewrites old messages.
+- **Dense vs MoE**: dense models are slow at prompt processing; the dense env profiles lower `AGENT_CONTEXT_CHARS` and `AGENT_SKILL_CHARS`.
+
 ## Configuration (env)
 
-`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
+`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
 
 ## Conventions
 

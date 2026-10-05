@@ -1,7 +1,7 @@
 {
   "name": "agent-cli",
   "version": "0.1.0",
-  "description": "Copilot-CLI-style local coding agent, backed by a local Qwen model via LM Studio (pluggable LLM backends, MCP tool servers).",
+  "description": "Copilot-CLI-style local coding agent, backed by a local model via LM Studio (pluggable LLM backends, MCP tool servers).",
   "private": true,
   "type": "commonjs",
   "bin": {
@@ -15,7 +15,15 @@
     "start": "node dist/cli.js",
     "chat": "dotenv -e .env.local -- ts-node src/cli.ts chat",
     "chat:local": "dotenv -e .env.local -- ts-node src/cli.ts chat",
-    "chat:nim": "dotenv -e .env.nim -- ts-node src/cli.ts chat"
+    "chat:qwen3": "dotenv -e .env.qwen3coder -- ts-node src/cli.ts chat",
+    "chat:devstral": "dotenv -e .env.devstral -- ts-node src/cli.ts chat",
+    "chat:codestral": "dotenv -e .env.codestral -- ts-node src/cli.ts chat",
+    "chat:nim": "dotenv -e .env.nim -- ts-node src/cli.ts chat",
+    "models": "dotenv -e .env.local -- ts-node src/cli.ts models",
+    "bench": "dotenv -e .env.local -- ts-node src/cli.ts bench",
+    "bench:qwen3": "dotenv -e .env.qwen3coder -- ts-node src/cli.ts bench",
+    "bench:devstral": "dotenv -e .env.devstral -- ts-node src/cli.ts bench",
+    "bench:codestral": "dotenv -e .env.codestral -- ts-node src/cli.ts bench"
   },
   "dependencies": {
     "commander": "^12.1.0",
