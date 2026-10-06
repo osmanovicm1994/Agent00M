@@ -1,4 +1,5 @@
 import type { LLMProvider } from "../llm/types";
+import { bus, truncate } from "../core/events";
 import { AGENTS, getAgent, type AgentDefinition } from "./definitions";
 
 // Cheap keyword scoring: when exactly one specialist clearly wins, route
@@ -11,6 +12,22 @@ const KEYWORDS: Record<string, RegExp[]> = {
   api: [/endpoint/i, /\brest(ful)?\b/i, /controller/i, /\bapi\b/i, /middleware/i, /\bdto\b/i, /openapi|swagger/i],
   design: [/\bcss\b/i, /tailwind/i, /\bui\b/i, /\bux\b/i, /layout/i, /responsive/i, /accessib/i, /design system/i, /styling/i],
   "kb-harvester": [/knowledge base/i, /document (the )?(project|codebase|architecture)/i, /architecture docs?/i, /reverse.?engineer/i],
+  // Failing commands and errors. Several patterns so a real failure report outscores the
+  // single keyword it often shares with another agent ("npm run dev:api failing" also matches api).
+  debug: [
+    /\bfail(s|ed|ing|ure|ures)\b/i,
+    /\bcrash(es|ed|ing)?\b/i,
+    /exception/i,
+    /stack ?trace/i,
+    /\b(doesn'?t|does not|won'?t|can'?t|cannot|isn'?t|not)\s+(start|work|working|run|running|build|compile|load|boot)/i,
+    /\bbroken\b/i,
+    /\bdebug(ging)?\b/i,
+    /cannot find module|can'?t resolve dependencies/i,
+    /\bE(NOENT|ADDRINUSE|CONNREFUSED|ACCES)\b|\bERR_[A-Z_]+|\bTS\d{4}\b|\bCS\d{4}\b/,
+    // A package-manager command together with a failure word, in either order. "npm run" alone is
+    // NOT a signal: "add an npm run script" is a normal dev task.
+    /\b(npm|pnpm|yarn|bun)\s+(run|start|test|build)\b.*\b(fail|error|crash|broke|not work|won'?t|doesn'?t)|\b(fail|error|crash|broke|won'?t|doesn'?t).*\b(npm|pnpm|yarn|bun)\s+(run|start|test|build)\b/i,
+  ],
   logic: [/decompos/i, /trade-?offs?/i, /edge cases?/i, /root cause/i, /\bplan\b.*\b(approach|architecture)\b/i, /distributed/i],
 };
 
@@ -26,15 +43,31 @@ function keywordRoute(task: string): AgentDefinition | undefined {
   return getAgent(scores[0].id);
 }
 
+type RouteMethod = "keyword" | "llm" | "default" | "forced";
+
+// Hands the baton to `agent` and tells any dashboard about it. The routing result is unchanged.
+function routed(agent: AgentDefinition, method: RouteMethod): AgentDefinition {
+  bus.setAgent(agent.id);
+  bus.emit("agent_routed", { agentId: agent.id, agentName: agent.name, method });
+  return agent;
+}
+
+// For callers that skip routing because the user picked the agent (-a / /use).
+export function announceForcedAgent(agent: AgentDefinition): void {
+  routed(agent, "forced");
+}
+
 // Asks the model to pick which specialist agent should handle a task.
 // Falls back to the "dev" agent if the model's answer doesn't match a known
 // agent id (keeps the router robust against a small/local model being sloppy).
 export async function routeTask(llm: LLMProvider, task: string): Promise<AgentDefinition> {
+  bus.emit("orchestrator_evaluating", { task: truncate(task, 500) });
+
   const quick = keywordRoute(task);
-  if (quick) return quick;
+  if (quick) return routed(quick, "keyword");
 
   // AGENT_ROUTER=keywords: never spend a model call on routing (unmatched tasks go to "dev").
-  if ((process.env.AGENT_ROUTER ?? "auto").toLowerCase() === "keywords") return getAgent("dev")!;
+  if ((process.env.AGENT_ROUTER ?? "auto").toLowerCase() === "keywords") return routed(getAgent("dev")!, "default");
 
   const agentList = AGENTS.map((a) => `- ${a.id}: ${a.description}`).join("\n");
 
@@ -59,5 +92,6 @@ Respond with ONLY the agent id (one of: ${AGENTS.map((a) => a.id).join(", ")}), 
   );
 
   const candidate = response.content.trim().toLowerCase().replace(/[^a-z-]/g, "");
-  return getAgent(candidate) ?? getAgent("dev")!;
+  const picked = getAgent(candidate);
+  return picked ? routed(picked, "llm") : routed(getAgent("dev")!, "default");
 }
