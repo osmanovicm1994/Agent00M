@@ -3,10 +3,11 @@ import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from
 import type { AgentDefinition } from "../agents/definitions";
 import { detectStackKnowledge, loadKnowledge } from "../agents/helpers";
 import { FsTools, fsToolSchemas } from "../tools/fs.tool";
-import { ShellTool, shellToolSchema } from "../tools/shell.tool";
+import { ShellTool, shellToolSchema, clampTimeoutMs, condenseOutput } from "../tools/shell.tool";
 import { SearchTool, searchToolSchemas } from "../tools/search.tool";
 import type { McpManager } from "../mcp/client";
 import { renderDiff } from "./diff";
+import { bus, truncate } from "./events";
 import prompts from "prompts";
 import pc from "picocolors";
 import { builtinModules } from "module";
@@ -22,6 +23,52 @@ const MAX_THINKING_CALLS = 8;
 const MAX_NUDGES = 6;
 const STACK_KNOWLEDGE_CHARS = 6000;
 const FENCE = "`".repeat(3);
+
+// Read-only diagnostic commands that need no approval for agents with autoDiagnostics
+// (the debug agent). Deliberately strict: no shell metacharacters can match, so nothing can be
+// chained or redirected, and only commands that cannot change anything are listed.
+const PATH_ARG = "[\\w.\\/@-]+";
+const SAFE_DIAGNOSTIC_RES: RegExp[] = [
+  /^(node|npm|npx|pnpm|yarn|bun|deno|python3?|pip3?|dotnet|java|go|rustc|cargo|tsc|git|docker)\s+(-v|--version|version)$/,
+  /^git (status|branch|remote -v|stash list)( (-s|-sb|--short|--porcelain|-a|-vv))*$/,
+  new RegExp(`^git rev-parse( --[a-z-]+)*( ${PATH_ARG})?$`),
+  /^git log( (-n ?\d{1,3}|-\d{1,3}|--oneline|--stat|--name-only|--decorate|--graph))*$/,
+  /^git diff( (--stat|--name-only|--staged|--cached|HEAD(~\d+)?))*$/,
+  /^pwd$/,
+  new RegExp(`^ls( -[alhR]+)?( ${PATH_ARG})?$`),
+  /^lsof( -nP)? -i(TCP|UDP)? ?:\d{2,5}( -sTCP:LISTEN)?$/,
+  new RegExp(`^which ${PATH_ARG}$`),
+  /^uname( -a)?$/,
+  new RegExp(`^npm (ls|list)( --depth=\\d)?( ${PATH_ARG})?$`),
+  /^npm run$/,
+];
+
+function isSafeDiagnostic(command: string): boolean {
+  const c = command.trim().replace(/\s+/g, " ");
+  return SAFE_DIAGNOSTIC_RES.some((re) => re.test(c));
+}
+
+// Commands that still ask for approval when auto mode is on. They delete or overwrite data,
+// rewrite git history, publish, change system state, or pipe a download into a shell. The test is
+// unanchored on purpose so a risky part of a chained command (a && rm -rf x) is caught too.
+const BOUNDARY = "(^|[\\s;&|(`])";
+const DANGEROUS_COMMAND_RES: RegExp[] = [
+  new RegExp(`${BOUNDARY}(sudo|su|rm|rmdir|unlink|shred|dd|mkfs\\w*|chown|kill|pkill|killall|shutdown|reboot|halt)\\b`),
+  /\bchmod\b.*\s-\w*R/,
+  /\bgit\s+(reset\s+--hard|clean|push|rebase|checkout\s+(--|\.)|restore|stash\s+(drop|clear)|branch\s+-D|filter-branch|update-ref|rm)\b/,
+  /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/,
+  /\b(npm|pnpm|yarn)\s+(publish|unpublish|login|adduser)\b/,
+  /\b(npm|pnpm)\s+(i|install|add)\b.*\s(-g|--global)\b|\byarn\s+global\b/,
+  /\bdocker\s+(system\s+prune|rm|rmi|volume\s+(rm|prune)|compose\s+down\b.*\s-v)/,
+  /\b(drop|truncate)\s+(database|table|schema)\b/i,
+  /\bprisma\s+(migrate\s+reset|db\s+push\s+--force-reset)\b|\bmigrate:fresh\b|\bdb:drop\b|\bschema:drop\b/,
+  /\b(brew|pip3?|gem)\s+(uninstall|remove)\b/,
+  />\s*\/dev\/(sd|disk|nvme)|:\(\)\s*\{/,
+];
+
+function isDangerousCommand(command: string): boolean {
+  return DANGEROUS_COMMAND_RES.some((re) => re.test(command));
+}
 
 // Tools that only read state. Several of these may be executed in one turn.
 const READ_ONLY_TOOLS = new Set([
@@ -215,13 +262,26 @@ function clip(s: string): string {
 }
 
 async function confirm(message: string): Promise<boolean> {
+  // The dashboard is read-only: it shows that the terminal is waiting for this answer.
+  bus.emit("approval_requested", { message });
   const response = await prompts({ type: "confirm", name: "ok", message, initial: false });
-  return Boolean(response.ok);
+  const approved = Boolean(response.ok);
+  bus.emit("approval_resolved", { approved });
+  return approved;
+}
+
+// Success flag for the dashboard: tool errors and user rejections are failures, and so is a
+// run_command that exited non-zero (a timed-out server counts as started, see run_command).
+function toolSucceeded(result: string): boolean {
+  if (/^(TOOL ERROR|User rejected)/.test(result)) return false;
+  const m = /^\{"exitCode":(-?\d+|null),"timedOut":(true|false)/.exec(result);
+  return m ? m[2] === "true" || m[1] === "0" : true;
 }
 
 export interface ExecutorOptions {
-  // Apply write_file / append_file without asking; a log line is printed instead.
-  // Commands (run_command) and non-auto-approved MCP tools still ask.
+  // Auto mode: apply write_file / append_file AND run_command without asking; a log line is printed
+  // for each instead. Risky commands (see isDangerousCommand) and non-auto-approved MCP tools still ask.
+  // AGENT_AUTO_RUN=0 keeps command approval on even in auto mode.
   autoWrite?: boolean;
 }
 
@@ -248,6 +308,13 @@ interface SessionState {
   // Lazily computed union of every package.json's dependencies.
   declaredDependencies: Set<string> | null;
   thinkingCalls: number;
+  // Per-agent settings, copied from the AgentDefinition at the start of a run.
+  thinkingBudget: number;
+  autoDiagnostics: boolean;
+  // Commands that were not auto-approved diagnostics, i.e. could have exercised the fix.
+  heavyRuns: number;
+  heavyRunsAtLastWrite: number;
+  verifyNudged: boolean;
 }
 
 function newSessionState(): SessionState {
@@ -261,6 +328,11 @@ function newSessionState(): SessionState {
     warnedShrink: new Set(),
     declaredDependencies: null,
     thinkingCalls: 0,
+    thinkingBudget: MAX_THINKING_CALLS,
+    autoDiagnostics: false,
+    heavyRuns: 0,
+    heavyRunsAtLastWrite: 0,
+    verifyNudged: false,
   };
 }
 
@@ -291,6 +363,11 @@ export class Executor {
 
   isAutoWrite(): boolean {
     return this.autoWrite;
+  }
+
+  // Auto mode also covers shell commands (unless AGENT_AUTO_RUN=0).
+  private autoRunEnabled(): boolean {
+    return this.autoWrite && process.env.AGENT_AUTO_RUN !== "0";
   }
 
   // Normalizes a model-supplied path: forward slashes, no leading "./",
@@ -457,7 +534,21 @@ When you are done and have no more actions to take, reply normally with a final 
   }
 
   async run(agent: AgentDefinition, task: string): Promise<ExecutorResult> {
+    bus.setAgent(agent.id);
+    const result = await this.runLoop(agent, task);
+    bus.emit("run_completed", {
+      steps: result.stepsTaken,
+      filesWritten: [...result.filesWritten],
+      commandsRun: [...result.commandsRun],
+      finalMessage: truncate(result.finalMessage, 4000),
+    });
+    return result;
+  }
+
+  private async runLoop(agent: AgentDefinition, task: string): Promise<ExecutorResult> {
     const state = newSessionState();
+    state.thinkingBudget = agent.thinkingBudget ?? MAX_THINKING_CALLS;
+    state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
 
     const stackPaths = detectStackKnowledge(this.workspaceRoot);
     if (stackPaths.length) {
@@ -468,6 +559,13 @@ When you are done and have no more actions to take, reply normally with a final 
         `Model: ${this.llm.model ?? "unknown"} · tool protocol: ${this.llm.nativeTools === false ? "fenced blocks (no native tools)" : "native tool calls"}`,
       ),
     );
+    bus.emit("executor_ready", {
+      agentId: agent.id,
+      model: this.llm.model ?? "unknown",
+      toolProtocol: this.llm.nativeTools === false ? "fenced" : "native",
+      stack: stackPaths.map((p) => basename(p)),
+      autoWrite: this.autoWrite,
+    });
     const systemPrompt = this.buildSystemPrompt(agent, stackPaths);
 
     // Ground the agent in reality before it can guess: show the real tree as the
@@ -486,7 +584,17 @@ When you are done and have no more actions to take, reply normally with a final 
       steps++;
       this.compactHistory(messages);
       // Models without a tool template get no tools payload (they use fenced blocks).
+      bus.emit("llm_request", { step: steps });
       const response = await this.llm.chat(messages, this.llm.nativeTools === false ? undefined : this.toolSchemas);
+      if (response.content.trim()) {
+        bus.emit("agent_thinking", {
+          source: "reply",
+          step: steps,
+          text: truncate(response.content.trim(), 1200),
+          ttftMs: response.stats?.ttftMs,
+          tokPerSec: response.stats?.tokPerSec,
+        });
+      }
       const { calls, discarded, incompleteBlock } = this.extractCalls(response);
 
       if (!calls.length) {
@@ -538,7 +646,30 @@ When you are done and have no more actions to take, reply normally with a final 
           continue;
         }
 
+        // 3b) Debug-style agents must prove a fix: files changed, but nothing was run since.
+        if (
+          agent.verifyFixes &&
+          state.filesWritten.length > 0 &&
+          state.heavyRuns === state.heavyRunsAtLastWrite &&
+          !state.verifyNudged &&
+          nudges < MAX_NUDGES
+        ) {
+          nudges++;
+          state.verifyNudged = true;
+          console.log(pc.dim("\n(Files were changed but nothing was re-run — asking the agent to verify the fix.)"));
+          messages.push({ role: "assistant", content: response.content });
+          messages.push({
+            role: "user",
+            content:
+              `You changed ${state.filesWritten.join(", ")} but have not run anything since. Re-run the command that was failing ` +
+              "now (run_command, same command) and base your answer on its real output. If you truly cannot run it, say " +
+              "UNVERIFIED in your final answer and explain why.",
+          });
+          continue;
+        }
+
         // 4) Hallucinated success: claims changes to files that were never written.
+
         const claimsCompletion = /\b(created|added|implemented|wrote|updated|modified|registered|wired|integrated)\b/i.test(
           response.content,
         );
@@ -581,7 +712,9 @@ When you are done and have no more actions to take, reply normally with a final 
       messages.push(assistantMsg);
 
       for (let i = 0; i < calls.length; i++) {
+        bus.emit("tool_running", { callId: calls[i].id, tool: calls[i].name, args: truncate(calls[i].arguments, 300) });
         const rawResult = await this.handleToolCall(calls[i], state, response.finishReason === "length");
+        bus.emit("tool_result", { callId: calls[i].id, ok: toolSucceeded(rawResult), preview: truncate(rawResult, 600) });
         const result = clip(rawResult);
 
         // Once a write has succeeded the content lives on disk. Drop it from the
@@ -662,13 +795,13 @@ When you are done and have no more actions to take, reply normally with a final 
     // Any unexpected throw must never crash the CLI; it goes back to the model
     // as a tool result so it can self-correct.
     try {
-      return await this.dispatchToolCall(call.name, args, state);
+      return await this.dispatchToolCall(call.name, args, state, call.id);
     } catch (err: any) {
       return `TOOL ERROR: ${call.name} failed — ${err?.message ?? "unknown error"}. Check the arguments match the tool's schema and try again.`;
     }
   }
 
-  private async dispatchToolCall(name: string, args: Record<string, any>, state: SessionState): Promise<string> {
+  private async dispatchToolCall(name: string, args: Record<string, any>, state: SessionState, callId: string): Promise<string> {
     // MCP tools (e.g. sequentialthinking)
     if (this.mcp?.has(name)) return this.handleMcpTool(name, args, state);
 
@@ -738,18 +871,41 @@ When you are done and have no more actions to take, reply normally with a final 
         console.log(`\n${pc.bold("Proposed command:")} ${pc.yellow(String(args.command))}`);
         if (args.reason) console.log(pc.dim(`Reason: ${args.reason}`));
 
-        const approved = await confirm("Run this command?");
-        if (!approved) {
-          return "User rejected running this command. Do not repeat it; ask what to do differently or stop.";
+        const command = String(args.command ?? "");
+        if (!command.trim()) return 'TOOL ERROR: run_command requires a non-empty "command".';
+
+        const diagnostic = state.autoDiagnostics && isSafeDiagnostic(command);
+        const autoRun = !diagnostic && this.autoRunEnabled() && !isDangerousCommand(command);
+        if (autoRun) {
+          console.log(pc.green(`▶ Auto-running: ${command}`));
+        } else if (!diagnostic) {
+          if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command: asking even though auto mode is on."));
+          const approved = await confirm("Run this command?");
+          if (!approved) {
+            return "User rejected running this command. Do not repeat it; ask what to do differently or stop.";
+          }
+        } else {
+          console.log(pc.green("🔎 read-only diagnostic, running without asking"));
         }
-        const result = this.shell.run(String(args.command));
-        state.commandsRun.push(String(args.command));
-        console.log(result.stdout);
-        if (result.stderr) console.log(pc.red(result.stderr));
+
+        const timeoutMs = clampTimeoutMs(args.timeout_seconds);
+        const result = await this.shell.runAsync(command, timeoutMs, (text) => {
+          process.stdout.write(pc.dim(text));
+          bus.emit("tool_output", { callId, chunk: truncate(text, 2000) });
+        });
+        console.log();
+        state.commandsRun.push(command);
+        if (!diagnostic) state.heavyRuns++;
+
         return JSON.stringify({
           exitCode: result.exitCode,
-          stdout: result.stdout.slice(0, 4000),
-          stderr: result.stderr.slice(0, 4000),
+          timedOut: result.timedOut,
+          ...(result.timedOut
+            ? {
+                note: `Still running after ${timeoutMs / 1000}s, so the process was stopped. For a server or watcher that is normal: it started successfully unless the output shows an error.`,
+              }
+            : {}),
+          output: condenseOutput(result.output) || "(no output)",
         });
       }
 
@@ -761,10 +917,15 @@ When you are done and have no more actions to take, reply normally with a final 
   private async handleMcpTool(name: string, args: Record<string, any>, state: SessionState): Promise<string> {
     if (/think/i.test(name)) {
       state.thinkingCalls++;
-      if (state.thinkingCalls > MAX_THINKING_CALLS) {
+      if (state.thinkingCalls > state.thinkingBudget) {
         return "NOTE: thinking budget for this task is used up. Stop planning and take the next concrete action now.";
       }
       const thought = typeof args.thought === "string" ? args.thought : "";
+      bus.emit("agent_thinking", {
+        source: "plan",
+        label: `thought ${args.thoughtNumber ?? "?"}/${args.totalThoughts ?? "?"}`,
+        text: truncate(thought, 800),
+      });
       console.log(pc.dim(`💭 thought ${args.thoughtNumber ?? "?"}/${args.totalThoughts ?? "?"}: ${thought.slice(0, 200)}`));
     } else if (!this.mcp!.autoApprove(name)) {
       console.log(`\n${pc.bold("Proposed MCP call:")} ${pc.yellow(name)} ${pc.dim(this.summarizeArgs(args))}`);
@@ -893,6 +1054,9 @@ When you are done and have no more actions to take, reply normally with a final 
     }
 
     this.fs.commitWrite(p, content);
+    bus.emit("artifact_generated", { path: p, action: exists ? "overwritten" : "created", lines: newLines - 1 });
+    state.heavyRunsAtLastWrite = state.heavyRuns;
+    state.verifyNudged = false;
     state.filesRead.add(p);
     if (!state.filesWritten.includes(p)) state.filesWritten.push(p);
     return `File written: ${p} (${newLines - 1} lines). The file now ends with:\n${this.tailOf(p)}\nIf this is only the first chunk of a longer file, continue with append_file starting right after these lines; otherwise move on.`;
@@ -919,6 +1083,9 @@ When you are done and have no more actions to take, reply normally with a final 
     }
 
     this.fs.appendToFile(p, content);
+    bus.emit("artifact_generated", { path: p, action: "appended", lines: lines.length });
+    state.heavyRunsAtLastWrite = state.heavyRuns;
+    state.verifyNudged = false;
     const total = this.fs.readFile(p).split("\n").length - 1;
     return `File appended: ${p} (+${lines.length} lines, ${total} lines total). The file now ends with:\n${this.tailOf(p)}\nIf more content remains, call append_file with the next chunk starting right after these lines; otherwise move on.`;
   }
