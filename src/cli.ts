@@ -10,10 +10,12 @@ import { createProvider } from "./llm/factory";
 import { LMStudioProvider } from "./llm/providers/lmstudio";
 import { getProfile } from "./llm/models";
 import type { LLMProvider } from "./llm/types";
-import { routeTask } from "./agents/router";
+import { routeTask, announceForcedAgent } from "./agents/router";
 import { getAgent, AGENTS } from "./agents/definitions";
 import { Executor } from "./core/executor";
 import { McpManager } from "./mcp/client";
+import { bus } from "./core/events";
+import { startServer, type DashboardServer } from "./server";
 
 dotenv.config();
 
@@ -29,6 +31,17 @@ async function setupMcp(disabled: boolean): Promise<McpManager | undefined> {
   }
   process.on("exit", () => mcp.close());
   return mcp;
+}
+
+// Starts the live dashboard socket (--serve). Never fatal, like MCP: the CLI works without it.
+async function setupUi(enabled?: boolean): Promise<DashboardServer | undefined> {
+  if (!enabled) return undefined;
+  try {
+    return await startServer();
+  } catch (err: any) {
+    console.log(pc.yellow(`⚠ Dashboard server failed to start: ${err?.message ?? err}`));
+    return undefined;
+  }
 }
 
 function describeModel(llm: LLMProvider): string {
@@ -135,17 +148,19 @@ program
   .option("-p, --project <path>", "Path to the target project (workspace root)", process.cwd())
   .option("-m, --model <id>", "Model id to use (default: AI_MODEL_NAME)")
   .option("--no-mcp", "Do not start MCP servers (e.g. sequential-thinking)")
-  .option("-y, --auto-write", "Write files without asking for approval (logs each write instead)")
+  .option("-y, --auto-write", "Auto mode: write files and run commands without asking (each action is logged; risky commands still ask)")
+  .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
   .action(
     async (
       task: string,
-      opts: { agent?: string; project: string; model?: string; mcp: boolean; autoWrite?: boolean },
+      opts: { agent?: string; project: string; model?: string; mcp: boolean; autoWrite?: boolean; serve?: boolean },
     ) => {
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
 
       const llm = makeProvider(opts.model);
       const mcp = await setupMcp(!opts.mcp);
+      const ui = await setupUi(opts.serve);
 
       try {
         const agent = opts.agent ? getAgent(opts.agent) : undefined;
@@ -153,19 +168,25 @@ program
           console.log(pc.red(`Agent '${opts.agent}' not found. Valid agents: ${AGENTS.map((a) => a.id).join(", ")}`));
           return;
         }
-        const resolvedAgent = agent ?? (await routeTask(llm, task));
+        // One observable run: routing + execution share a runId on the event bus.
+        const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
+          const resolvedAgent = agent ?? (await routeTask(llm, task));
 
-        if (!agent) {
-          console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
-        } else {
-          console.log(pc.dim(`Using forced agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
-        }
+          if (!agent) {
+            console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          } else {
+            announceForcedAgent(resolvedAgent);
+            console.log(pc.dim(`Using forced agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          }
 
-        const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
-        if (executor.isAutoWrite()) {
-          console.log(pc.yellow("Auto-write is ON: files are written without asking (commands still need approval)."));
-        }
-        const result = await executor.run(resolvedAgent, task);
+          const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
+          if (executor.isAutoWrite()) {
+            console.log(
+              pc.yellow("Auto mode is ON: files are written and commands are run without asking (risky commands still ask)."),
+            );
+          }
+          return executor.run(resolvedAgent, task);
+        });
 
         console.log(pc.dim(`\n(${result.stepsTaken} step(s) taken)`));
 
@@ -184,6 +205,7 @@ program
           }
         }
       } finally {
+        await ui?.close();
         mcp?.close();
       }
     },
@@ -293,7 +315,8 @@ program
   .option("-p, --project <path>", "Path to the target project (workspace root)", process.cwd())
   .option("-m, --model <id>", "Model id to use (default: AI_MODEL_NAME)")
   .option("--no-mcp", "Do not start MCP servers (e.g. sequential-thinking)")
-  .action(async (opts: { project: string; model?: string; mcp: boolean }) => {
+  .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
+  .action(async (opts: { project: string; model?: string; mcp: boolean; serve?: boolean }) => {
     console.log(pc.bold("🤖 Interactive Multi-Agent CLI Started.\n"));
 
     const rl = readline.createInterface({
@@ -323,23 +346,28 @@ program
     console.log(pc.dim(`Model: ${describeModel(llm)}   (type /model to list or switch)`));
 
     const autoAnswer = (
-      await questionAsync(pc.cyan("Let the agent write files automatically, without asking each time? (y/N): "))
+      await questionAsync(pc.cyan("Let the agent write files and run commands automatically, without asking each time? (y/N): "))
     )
       .trim()
       .toLowerCase();
     const autoWrite = autoAnswer === "y" || autoAnswer === "yes";
     console.log(
       autoWrite
-        ? pc.yellow("✎ Auto-write ON: files are written without asking (a log line is shown for each). Commands still need approval.")
-        : pc.dim("Auto-write OFF: you approve every file write. Type '/auto-write' any time to switch."),
+        ? pc.yellow(
+            "✎ Auto mode ON: files are written and commands are run without asking (a log line is shown for each). " +
+              "Risky commands (rm, sudo, git reset/push, kill, ...) still ask.",
+          )
+        : pc.dim("Auto mode OFF: you approve every file write and command. Type '/auto-write' any time to switch."),
     );
 
     const mcp = await setupMcp(!opts.mcp);
+    const ui = await setupUi(opts.serve);
     const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite });
 
     console.log(pc.bold("Type 'help' or '/help' for options, your task, or 'exit' to quit.\n"));
 
     const shutdown = () => {
+      void ui?.close();
       mcp?.close();
       rl.close();
       process.exit(0);
@@ -373,7 +401,7 @@ program
   ${pc.cyan("auto")}          | ${pc.cyan("/auto")}       - Return to automatic router
   ${pc.cyan("show project")} | ${pc.cyan("/project")}    - Display current workspace path
   ${pc.cyan("/model")}                       - List models on the server; ${pc.cyan("/model <id>")} switches
-  ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle writing files without asking
+  ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle auto mode (write files + run commands without asking)
   ${pc.cyan("clean")}         | ${pc.cyan("clear")}       - Clear terminal screen
   ${pc.cyan("exit")}                        - End session
           `);
@@ -436,8 +464,8 @@ program
           executor.setAutoWrite(!executor.isAutoWrite());
           console.log(
             executor.isAutoWrite()
-              ? pc.yellow("\n✎ Auto-write ON: files are written without asking.\n")
-              : pc.green("\n✔ Auto-write OFF: you approve every file write.\n"),
+              ? pc.yellow("\n✎ Auto mode ON: files are written and commands are run without asking (risky commands still ask).\n")
+              : pc.green("\n✔ Auto mode OFF: you approve every file write and command.\n"),
           );
           askQuestion();
           return;
@@ -479,19 +507,23 @@ program
         // `prompts`, so two readers never fight over stdin.
         rl.pause();
         try {
-          let resolvedAgent;
+          // One observable run: routing + execution share a runId on the event bus.
+          const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
+            let resolvedAgent;
 
-          if (lockedAgentId) {
-            resolvedAgent = getAgent(lockedAgentId)!;
-          } else {
-            console.log(pc.dim("... Routing task & analyzing ..."));
-            resolvedAgent = await routeTask(llm, task);
-            console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
-          }
+            if (lockedAgentId) {
+              resolvedAgent = getAgent(lockedAgentId)!;
+              announceForcedAgent(resolvedAgent);
+            } else {
+              console.log(pc.dim("... Routing task & analyzing ..."));
+              resolvedAgent = await routeTask(llm, task);
+              console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+            }
 
-          console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
+            console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
 
-          const result = await executor.run(resolvedAgent, task);
+            return executor.run(resolvedAgent, task);
+          });
 
           console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));
 
