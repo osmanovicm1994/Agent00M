@@ -5,10 +5,11 @@
       "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
       "autoApprove": true
     },
-    "command-runner": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-command-runner"],
-      "autoApprove": false
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "autoApprove": false,
+      "disabled": true
     }
   }
 }

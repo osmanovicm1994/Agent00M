@@ -23,12 +23,14 @@
     "web": "npm --prefix web run dev",
     "web:install": "npm --prefix web install",
     "models": "dotenv -e .env.local -- ts-node src/cli.ts models",
+    "triage:models": "ts-node src/cli.ts triage-models",
     "bench": "dotenv -e .env.local -- ts-node src/cli.ts bench",
     "bench:qwen3": "dotenv -e .env.qwen3coder -- ts-node src/cli.ts bench",
     "bench:devstral": "dotenv -e .env.devstral -- ts-node src/cli.ts bench",
     "bench:codestral": "dotenv -e .env.codestral -- ts-node src/cli.ts bench"
   },
   "dependencies": {
+    "@google/genai": "^2.27.0",
     "@fastify/websocket": "^11.0.0",
     "commander": "^12.1.0",
     "diff": "^5.2.0",
