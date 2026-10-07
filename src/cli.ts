@@ -16,6 +16,7 @@ import { Executor } from "./core/executor";
 import { McpManager } from "./mcp/client";
 import { bus } from "./core/events";
 import { startServer, type DashboardServer } from "./server";
+import { TriageGateway, GeminiTriageClient, confirmPlan, resolveModels } from "./gateway";
 
 dotenv.config();
 
@@ -42,6 +43,14 @@ async function setupUi(enabled?: boolean): Promise<DashboardServer | undefined> 
     console.log(pc.yellow(`⚠ Dashboard server failed to start: ${err?.message ?? err}`));
     return undefined;
   }
+}
+
+// Triage (Gemini) is opt-in because it is the only feature that sends data off the machine.
+function triageEnv(): "on" | "off" | undefined {
+  const v = (process.env.AGENT_TRIAGE ?? "").trim().toLowerCase();
+  if (["on", "1", "true", "yes"].includes(v)) return "on";
+  if (["off", "0", "false", "no"].includes(v)) return "off";
+  return undefined;
 }
 
 function describeModel(llm: LLMProvider): string {
@@ -149,11 +158,12 @@ program
   .option("-m, --model <id>", "Model id to use (default: AI_MODEL_NAME)")
   .option("--no-mcp", "Do not start MCP servers (e.g. sequential-thinking)")
   .option("-y, --auto-write", "Auto mode: write files and run commands without asking (each action is logged; risky commands still ask)")
+  .option("-t, --triage", "First let Gemini analyse the task and write a plan for the local agent (sends the query + a file-name overview to Google)")
   .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
   .action(
     async (
       task: string,
-      opts: { agent?: string; project: string; model?: string; mcp: boolean; autoWrite?: boolean; serve?: boolean },
+      opts: { agent?: string; project: string; model?: string; mcp: boolean; autoWrite?: boolean; serve?: boolean; triage?: boolean },
     ) => {
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
@@ -170,22 +180,40 @@ program
         }
         // One observable run: routing + execution share a runId on the event bus.
         const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
-          const resolvedAgent = agent ?? (await routeTask(llm, task));
+          const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
 
-          if (!agent) {
-            console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
-          } else {
-            announceForcedAgent(resolvedAgent);
-            console.log(pc.dim(`Using forced agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          // Optional Gemini triage: a plan for the local agent, plus a suggested agent.
+          let planContext: string | undefined;
+          let suggested: string | undefined;
+          if (opts.triage || triageEnv() === "on") {
+            const triage = new TriageGateway();
+            if (!triage.hasApiKey()) {
+              console.log(pc.yellow("⚠ Triage requested but GEMINI_API_KEY is not set (put it in .env). Continuing without it."));
+            } else {
+              const out = await triage.run(task, workspaceRoot, executor.toolNames());
+              if (out && (process.env.AGENT_TRIAGE_CONFIRM !== "1" || (await confirmPlan()))) {
+                planContext = out.agentContext;
+                suggested = out.recommendedAgent;
+              }
+            }
           }
 
-          const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
+          const resolvedAgent = agent ?? (suggested ? getAgent(suggested) : undefined) ?? (await routeTask(llm, task));
+
+          if (agent) {
+            announceForcedAgent(resolvedAgent);
+            console.log(pc.dim(`Using forced agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          } else if (suggested && resolvedAgent.id === suggested) {
+            console.log(pc.dim(`Triage selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          } else {
+            console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          }
           if (executor.isAutoWrite()) {
             console.log(
               pc.yellow("Auto mode is ON: files are written and commands are run without asking (risky commands still ask)."),
             );
           }
-          return executor.run(resolvedAgent, task);
+          return executor.run(resolvedAgent, task, planContext);
         });
 
         console.log(pc.dim(`\n(${result.stepsTaken} step(s) taken)`));
@@ -239,6 +267,27 @@ program
             "Select a model with AI_MODEL_NAME, `--model <id>`, or `/model <id>` inside `npm run chat`.",
         ),
       );
+    } catch (err: any) {
+      console.log(pc.red(err?.message ?? String(err)));
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("triage-models")
+  .description("List the Gemini models your API key can use, and the order the triage gateway tries them")
+  .action(async () => {
+    try {
+      console.log(pc.bold("Triage model order: ") + resolveModels().join(" → "));
+      const client = new GeminiTriageClient();
+      const ids = await client.listModels();
+      if (!ids.length) {
+        console.log(pc.yellow("The API returned no models that support generateContent."));
+        return;
+      }
+      console.log(pc.bold("\nAvailable to your key:"));
+      ids.forEach((id) => console.log(`  ${id}`));
+      console.log(pc.dim("\nPick one with GEMINI_MODEL=<id> (and optionally GEMINI_FALLBACK_MODELS=a,b) in .env."));
     } catch (err: any) {
       console.log(pc.red(err?.message ?? String(err)));
       process.exitCode = 1;
@@ -360,6 +409,31 @@ program
         : pc.dim("Auto mode OFF: you approve every file write and command. Type '/auto-write' any time to switch."),
     );
 
+    // Gemini triage: opt-in, because it sends the question and a file-name overview to Google.
+    const triage = new TriageGateway();
+    let triageOn = false;
+    const triageSetting = triageEnv();
+    if (triageSetting === "on") {
+      triageOn = triage.hasApiKey();
+      console.log(
+        triageOn
+          ? pc.yellow("🧭 Gemini triage ON (AGENT_TRIAGE=on): each task is analysed by Gemini first.")
+          : pc.yellow("⚠ AGENT_TRIAGE=on but GEMINI_API_KEY is not set (put it in .env). Triage stays off."),
+      );
+    } else if (triageSetting === undefined && triage.hasApiKey()) {
+      const ans = (
+        await questionAsync(
+          pc.cyan(
+            "Run every task through Gemini triage first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google. (y/N): ",
+          ),
+        )
+      )
+        .trim()
+        .toLowerCase();
+      triageOn = ans === "y" || ans === "yes";
+      console.log(triageOn ? pc.yellow("🧭 Gemini triage ON. Type '/triage' to switch.") : pc.dim("Triage OFF. Type '/triage' to switch."));
+    }
+
     const mcp = await setupMcp(!opts.mcp);
     const ui = await setupUi(opts.serve);
     const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite });
@@ -402,6 +476,7 @@ program
   ${pc.cyan("show project")} | ${pc.cyan("/project")}    - Display current workspace path
   ${pc.cyan("/model")}                       - List models on the server; ${pc.cyan("/model <id>")} switches
   ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle auto mode (write files + run commands without asking)
+  ${pc.cyan("/triage")}                      - Toggle Gemini triage; ${pc.cyan("/triage show")} prints the last plan given to the agent
   ${pc.cyan("clean")}         | ${pc.cyan("clear")}       - Clear terminal screen
   ${pc.cyan("exit")}                        - End session
           `);
@@ -471,6 +546,23 @@ program
           return;
         }
 
+        if (normalizedInput === "/triage" || normalizedInput === "/triage show") {
+          if (normalizedInput === "/triage show") {
+            console.log(triage.last ? `\n${triage.last.agentContext}\n` : pc.dim("\nNo triage plan yet.\n"));
+          } else if (!triage.hasApiKey()) {
+            console.log(pc.yellow("\n⚠ GEMINI_API_KEY is not set. Put it in .env (git-ignored) and restart.\n"));
+          } else {
+            triageOn = !triageOn;
+            console.log(
+              triageOn
+                ? pc.yellow("\n🧭 Gemini triage ON: the question and a file-name overview are sent to Google for each task.\n")
+                : pc.green("\n✔ Gemini triage OFF: everything stays local.\n"),
+            );
+          }
+          askQuestion();
+          return;
+        }
+
         if (["clear", "clean", "/clear"].includes(normalizedInput)) {
           console.clear();
           askQuestion();
@@ -510,10 +602,23 @@ program
           // One observable run: routing + execution share a runId on the event bus.
           const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
             let resolvedAgent;
+            let planContext: string | undefined;
+            let suggested: string | undefined;
+
+            if (triageOn) {
+              const out = await triage.run(task, workspaceRoot, executor.toolNames());
+              if (out && (process.env.AGENT_TRIAGE_CONFIRM !== "1" || (await confirmPlan()))) {
+                planContext = out.agentContext;
+                suggested = out.recommendedAgent;
+              }
+            }
 
             if (lockedAgentId) {
               resolvedAgent = getAgent(lockedAgentId)!;
               announceForcedAgent(resolvedAgent);
+            } else if (suggested) {
+              resolvedAgent = getAgent(suggested)!;
+              console.log(pc.dim(`Triage selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
             } else {
               console.log(pc.dim("... Routing task & analyzing ..."));
               resolvedAgent = await routeTask(llm, task);
@@ -522,7 +627,7 @@ program
 
             console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
 
-            return executor.run(resolvedAgent, task);
+            return executor.run(resolvedAgent, task, planContext);
           });
 
           console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));

@@ -150,7 +150,7 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 
 ## Configuration (env)
 
-`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
+`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`, and for the optional Gemini triage `GEMINI_API_KEY`, `AGENT_TRIAGE`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `AGENT_TRIAGE_TIMEOUT_MS`, `AGENT_TRIAGE_MAX_CHARS`, `AGENT_TRIAGE_CONFIRM`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
 
 ## Conventions
 
@@ -159,6 +159,17 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 - Keep tool results and prompts compact: local models are slow and context-limited, so prefer capping/eliding over sending more text.
 - New tools: add the schema next to its implementation, add a `case` in `Executor.dispatchToolCall`, and decide if it is read-only (add to `READ_ONLY_TOOLS`).
 - New agents: create `agents/list/<id>.ts`, register it in `definitions.ts`, and add keywords to `router.ts` only if they are specific (generic words like "test" or "fix" must fall through to the LLM router).
+
+## Gemini triage gateway (optional, off by default)
+
+`src/gateway/` puts a cloud "triage specialist" in front of the local agent. It is the ONLY feature that sends data off the machine, so it is opt-in: `run --triage`, `AGENT_TRIAGE=on`, the chat startup question, or `/triage` in chat (`/triage show` prints the plan last given to the agent).
+
+- Flow: query -> `redact.ts` masks secrets -> `workspace-probe.ts` builds a file-name fingerprint (no file contents, no `.env`) -> `gemini.ts` asks Gemini for a JSON plan (validated by zod in `types.ts`) -> `render.ts` shrinks it to a compact text -> passed as `extraContext` to `Executor.run`; `recommendedAgent` replaces the local routing call unless an agent is locked.
+- Failure never blocks: no key, no network, bad JSON -> a warning is printed and the local agent runs on the original query.
+- The system instruction (stack knowledge for iOS, Android, NestJS, Next.js, Playwright, Appium) lives in `instruction.ts`.
+- Models: `GEMINI_MODEL` then `GEMINI_FALLBACK_MODELS`; a "model not found" error moves to the next one. `npm run triage:models` lists what the key can use.
+- Key goes in `.env` (git-ignored). Never in `.env.local` or the committed profile files.
+- SDK `@google/genai` is ESM, so `gemini.ts` loads it with a native dynamic `import()` from this CommonJS project.
 
 ## Live web dashboard (read-only)
 

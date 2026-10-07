@@ -365,6 +365,11 @@ export class Executor {
     return this.autoWrite;
   }
 
+  /** Names of every tool the model can call (built-in and MCP). The triage gateway plans with exactly these. */
+  toolNames(): string[] {
+    return this.toolSchemas.map((t) => t.name);
+  }
+
   // Auto mode also covers shell commands (unless AGENT_AUTO_RUN=0).
   private autoRunEnabled(): boolean {
     return this.autoWrite && process.env.AGENT_AUTO_RUN !== "0";
@@ -533,9 +538,11 @@ When you are done and have no more actions to take, reply normally with a final 
     return { calls: [], discarded: 0 };
   }
 
-  async run(agent: AgentDefinition, task: string): Promise<ExecutorResult> {
+  // `extraContext` is optional material placed after the task in the first message, e.g. the plan
+  // from the Gemini triage gateway. It is guidance, not part of the task text.
+  async run(agent: AgentDefinition, task: string, extraContext?: string): Promise<ExecutorResult> {
     bus.setAgent(agent.id);
-    const result = await this.runLoop(agent, task);
+    const result = await this.runLoop(agent, task, extraContext);
     bus.emit("run_completed", {
       steps: result.stepsTaken,
       filesWritten: [...result.filesWritten],
@@ -545,7 +552,7 @@ When you are done and have no more actions to take, reply normally with a final 
     return result;
   }
 
-  private async runLoop(agent: AgentDefinition, task: string): Promise<ExecutorResult> {
+  private async runLoop(agent: AgentDefinition, task: string, extraContext?: string): Promise<ExecutorResult> {
     const state = newSessionState();
     state.thinkingBudget = agent.thinkingBudget ?? MAX_THINKING_CALLS;
     state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
@@ -574,7 +581,10 @@ When you are done and have no more actions to take, reply normally with a final 
 
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
-      { role: "user", content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}` },
+      {
+        role: "user",
+        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}`,
+      },
     ];
 
     let steps = 0;
