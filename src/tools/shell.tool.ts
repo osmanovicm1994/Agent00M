@@ -14,20 +14,47 @@ export interface ShellRunResult {
   // The process was still running when the time limit hit and was stopped.
   // For a dev server or watcher that usually means "it started and kept running".
   timedOut: boolean;
+  // The user pressed Ctrl+C while it ran; the process group was stopped on purpose.
+  interrupted: boolean;
 }
 
 const MIN_TIMEOUT_MS = 5_000;
-const MAX_TIMEOUT_MS = 180_000;
-const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 2 * 60 * 60_000; // 2 hours: hard ceiling for any single command
+// Builds, tests and installs (gradlew assembleDebug, xcodebuild, npm run build ...) legitimately run for many
+// minutes. They get this long by default; the user can still stop them with Ctrl+C at any time.
+const LONG_TIMEOUT_MS = Math.min((Number(process.env.AGENT_CMD_TIMEOUT_MIN) || 30) * 60_000, MAX_TIMEOUT_MS);
+const LONG_RUNNING_RE =
+  /\b(gradlew?|xcodebuild|mvnw?|fastlane|pod install|swift build|flutter build|cargo build|dotnet (build|publish|test)|docker (compose )?build|(npm|pnpm|yarn|bun) (run )?(build|test|ci|install)|npx playwright test|appium)\b/i;
+
+// Commands currently running; Ctrl+C stops them (see interruptRunningCommands).
+const running = new Set<() => void>();
+
+/** Stops every running command (whole process group). Returns how many were stopped. */
+export function interruptRunningCommands(): number {
+  const stops = [...running];
+  stops.forEach((stop) => stop());
+  return stops.length;
+}
+
+export function hasRunningCommand(): boolean {
+  return running.size > 0;
+}
 // Only the beginning and the end of a long output are kept: the root error is usually
 // near the start, the final failure and stack trace near the end.
 const HEAD_KEEP = 20_000;
 const TAIL_KEEP = 60_000;
 
-export function clampTimeoutMs(seconds: unknown): number {
+/**
+ * Time limit for a command. The model's timeout_seconds is a hint meant for servers and watchers that never exit;
+ * it is NOT allowed to cut a build or test run short. Without a hint every command gets the long limit,
+ * because the user can interrupt with Ctrl+C.
+ */
+export function clampTimeoutMs(seconds: unknown, command = ""): number {
   const n = typeof seconds === "number" ? seconds : Number(seconds);
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_MS;
-  return Math.min(Math.max(n * 1000, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
+  const longRunning = LONG_RUNNING_RE.test(command);
+  if (!Number.isFinite(n) || n <= 0) return LONG_TIMEOUT_MS;
+  const hinted = Math.min(Math.max(n * 1000, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
+  return longRunning ? Math.max(hinted, LONG_TIMEOUT_MS) : hinted;
 }
 
 /** Shortens a long command output to its head and tail for the model. */
@@ -87,7 +114,14 @@ export class ShellTool {
    *   the port and make the next attempt fail with EADDRINUSE.
    * - stdin is closed, so a command that asks a question fails fast instead of hanging.
    */
-  runAsync(command: string, timeoutMs = DEFAULT_TIMEOUT_MS, onChunk?: (text: string) => void): Promise<ShellRunResult> {
+  runAsync(
+    command: string,
+    timeoutMs = LONG_TIMEOUT_MS,
+    onChunk?: (text: string) => void,
+    // Called every `tickMs` with the elapsed seconds, so a quiet build does not look frozen.
+    onTick?: (elapsedSec: number) => void,
+    tickMs = 30_000,
+  ): Promise<ShellRunResult> {
     return new Promise((resolve) => {
       const isWindows = process.platform === "win32";
       const child = spawn(command, {
@@ -103,7 +137,9 @@ export class ShellTool {
       let tail = "";
       let total = 0;
       let timedOut = false;
+      let interrupted = false;
       let settled = false;
+      const startedAt = Date.now();
 
       const add = (buf: Buffer) => {
         const text = buf.toString("utf8");
@@ -137,8 +173,21 @@ export class ShellTool {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ output: collect(), exitCode, timedOut });
+        if (ticker) clearInterval(ticker);
+        running.delete(stop);
+        resolve({ output: collect(), exitCode: interrupted ? 130 : exitCode, timedOut, interrupted });
       };
+
+      const stop = () => {
+        if (interrupted || settled) return;
+        interrupted = true;
+        killGroup("SIGINT"); // like Ctrl+C in a terminal: gradle and npm shut down cleanly
+        setTimeout(() => killGroup("SIGTERM"), 2_000);
+        setTimeout(() => killGroup("SIGKILL"), 5_000);
+        setTimeout(() => finish(130), 7_000);
+      };
+      running.add(stop);
+      const ticker = onTick ? setInterval(() => onTick(Math.round((Date.now() - startedAt) / 1000)), tickMs) : undefined;
 
       const timer = setTimeout(() => {
         timedOut = true;
@@ -161,7 +210,8 @@ export const shellToolSchema: ToolSchema = {
   name: "run_command",
   description:
     "Propose running a shell command in the project root (e.g. npm test, tsc --noEmit, git diff, npm run dev). Requires explicit user approval before execution. " +
-    "Returns the combined output and exit code. For servers and watchers that never exit, set timeout_seconds (5-180): when it expires the process is stopped and timedOut is true.",
+    "Returns the combined output and exit code. Builds, tests and installs (gradlew, xcodebuild, npm run build, ...) can take many minutes: do NOT set timeout_seconds for them, they get up to 30 minutes and the user can interrupt with Ctrl+C. " +
+    "Only for servers and watchers that never exit, set timeout_seconds (5-600): when it expires the process is stopped and timedOut is true.",
   parameters: {
     type: "object",
     properties: {
@@ -169,7 +219,7 @@ export const shellToolSchema: ToolSchema = {
       reason: { type: "string", description: "Why this command is needed" },
       timeout_seconds: {
         type: "number",
-        description: "Max run time in seconds (default 30, max 180). Use 40-90 for dev servers and slow builds.",
+        description: "ONLY for servers/watchers that never exit: seconds to let them run (e.g. 40-90). Omit for builds, tests and installs.",
       },
     },
     required: ["command"],

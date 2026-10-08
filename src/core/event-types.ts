@@ -3,11 +3,12 @@
 
 export interface EventPayloads {
   // A top-level task started (opened by bus.withRun in the CLI).
-  run_started: { task: string; workspace: string };
+  run_started: { task: string; workspace: string; origin: "terminal" | "dashboard" };
   // The orchestrator (router) is choosing a specialist.
   orchestrator_evaluating: { task: string };
   // The baton moved to a specialist. "forced" = the user picked the agent (-a / /use).
-  agent_routed: { agentId: string; agentName: string; method: "keyword" | "llm" | "default" | "forced" };
+  // method "triage" = Gemini triage recommended the agent.
+  agent_routed: { agentId: string; agentName: string; method: "keyword" | "llm" | "default" | "forced" | "triage" };
   // The executor has built its prompt and is about to call the model.
   executor_ready: { agentId: string; model: string; toolProtocol: "native" | "fenced"; stack: string[]; autoWrite: boolean };
   // One LLM round-trip started.
@@ -25,9 +26,14 @@ export interface EventPayloads {
   // Streamed stdout/stderr of run_command.
   tool_output: { callId: string; chunk: string };
   tool_result: { callId: string; ok: boolean; preview: string };
-  // The terminal is waiting for a y/n answer. The dashboard is read-only; answer in the terminal.
-  approval_requested: { message: string };
+  // A y/n answer is needed. via="dashboard": answer with the buttons (run started from the browser);
+  // via="terminal": the terminal owns the prompt and the dashboard only displays it.
+  approval_requested: { message: string; via: "terminal" | "dashboard" };
   approval_resolved: { approved: boolean };
+  // Chat startup questions (project path, auto-write, auto-run, triage). Answerable in the terminal
+  // or the dashboard, whichever comes first. Emitted outside any run (runId "adhoc").
+  setup_question: { id: string; kind: "confirm" | "text"; question: string; defaultValue?: string };
+  setup_answered: { id: string; answer: string; via: "terminal" | "dashboard" };
   artifact_generated: { path: string; action: "created" | "overwritten" | "appended"; lines: number };
   run_completed: { steps: number; filesWritten: string[]; commandsRun: string[]; finalMessage: string };
   run_failed: { error: string };
@@ -56,5 +62,18 @@ export interface AgentInfo {
 
 // Messages the server sends over the WebSocket.
 export type ServerMessage =
-  | { kind: "hello"; version: 1; roster: AgentInfo[]; history: AgentEvent[] }
-  | { kind: "event"; event: AgentEvent };
+  // canControl: this connection presented the control token and may send ClientCommands.
+  // acceptsTasks: the session can take dashboard tasks (false during chat setup and in one-shot runs).
+  | { kind: "hello"; version: 1; roster: AgentInfo[]; history: AgentEvent[]; canControl: boolean; acceptsTasks: boolean; busy: boolean }
+  | { kind: "event"; event: AgentEvent }
+  | { kind: "busy"; busy: boolean }
+  | { kind: "session"; acceptsTasks: boolean }
+  // Feedback for a command (rejected task, bad token, ...).
+  | { kind: "notice"; level: "info" | "error"; text: string };
+
+// Commands the browser may send. Only accepted from connections that presented the token.
+export type ClientCommand =
+  | { kind: "submit_task"; task: string; agentId?: string }
+  | { kind: "answer_approval"; approved: boolean }
+  // Answer to a setup_question: "yes"/"no" for confirm, free text otherwise.
+  | { kind: "answer_question"; id: string; answer: string };

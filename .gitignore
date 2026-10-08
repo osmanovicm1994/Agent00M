@@ -1,8 +1,8 @@
 .env
 .env.nim
 .env.*
-!.env.example
-!.env.local
+.env.example
+.env.local
 !.env.qwen3coder
 !.env.devstral
 !.env.codestral

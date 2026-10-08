@@ -8,6 +8,7 @@ import { SearchTool, searchToolSchemas } from "../tools/search.tool";
 import type { McpManager } from "../mcp/client";
 import { renderDiff } from "./diff";
 import { bus, truncate } from "./events";
+import { control } from "./control";
 import prompts from "prompts";
 import pc from "picocolors";
 import { builtinModules } from "module";
@@ -262,10 +263,18 @@ function clip(s: string): string {
 }
 
 async function confirm(message: string): Promise<boolean> {
-  // The dashboard is read-only: it shows that the terminal is waiting for this answer.
-  bus.emit("approval_requested", { message });
-  const response = await prompts({ type: "confirm", name: "ok", message, initial: false });
-  const approved = Boolean(response.ok);
+  // Runs started from the dashboard are approved there; terminal runs keep the terminal prompt
+  // (the dashboard then only shows that an answer is pending).
+  const via = bus.origin();
+  bus.emit("approval_requested", { message, via });
+  let approved: boolean;
+  if (via === "dashboard") {
+    console.log(pc.yellow(`⏸ Waiting for approval in the dashboard: ${message}`));
+    approved = await control.requestApproval();
+  } else {
+    const response = await prompts({ type: "confirm", name: "ok", message, initial: false });
+    approved = Boolean(response.ok);
+  }
   bus.emit("approval_resolved", { approved });
   return approved;
 }
@@ -283,6 +292,9 @@ export interface ExecutorOptions {
   // for each instead. Risky commands (see isDangerousCommand) and non-auto-approved MCP tools still ask.
   // AGENT_AUTO_RUN=0 keeps command approval on even in auto mode.
   autoWrite?: boolean;
+  // Run shell commands without asking (risky ones still ask). Independent of autoWrite so the chat
+  // setup can ask about files and commands separately. Default: follows autoWrite (and AGENT_AUTO_RUN).
+  autoRun?: boolean;
 }
 
 export interface ExecutorResult {
@@ -342,6 +354,7 @@ export class Executor {
   private search: SearchTool;
   private toolSchemas: ToolSchema[];
   private autoWrite: boolean;
+  private autoRun: boolean;
 
   constructor(
     private readonly llm: LLMProvider,
@@ -350,6 +363,7 @@ export class Executor {
     options: ExecutorOptions = {},
   ) {
     this.autoWrite = options.autoWrite ?? process.env.AGENT_AUTO_WRITE === "1";
+    this.autoRun = options.autoRun ?? (this.autoWrite && process.env.AGENT_AUTO_RUN !== "0");
     this.workspaceRoot = path.resolve(workspaceRoot);
     this.fs = new FsTools(this.workspaceRoot);
     this.shell = new ShellTool(this.workspaceRoot);
@@ -357,8 +371,18 @@ export class Executor {
     this.toolSchemas = [...BUILTIN_TOOL_SCHEMAS, ...(mcp?.schemas() ?? [])];
   }
 
+  // Toggling auto mode (/auto-write) switches files and commands together, as before.
   setAutoWrite(value: boolean): void {
     this.autoWrite = value;
+    this.autoRun = value && process.env.AGENT_AUTO_RUN !== "0";
+  }
+
+  setAutoRun(value: boolean): void {
+    this.autoRun = value;
+  }
+
+  isAutoRun(): boolean {
+    return this.autoRun;
   }
 
   isAutoWrite(): boolean {
@@ -370,9 +394,9 @@ export class Executor {
     return this.toolSchemas.map((t) => t.name);
   }
 
-  // Auto mode also covers shell commands (unless AGENT_AUTO_RUN=0).
+  // Shell commands run without asking (risky ones still ask).
   private autoRunEnabled(): boolean {
-    return this.autoWrite && process.env.AGENT_AUTO_RUN !== "0";
+    return this.autoRun;
   }
 
   // Normalizes a model-supplied path: forward slashes, no leading "./",
