@@ -56,10 +56,19 @@ export interface DashboardState {
   lastAgent: string | null;
   run: RunInfo | null;
   feed: FeedItem[];
-  // The terminal is waiting for a y/n answer.
-  pendingApproval: string | null;
+  // A y/n answer is needed: via "dashboard" the buttons answer it, via "terminal" it is display-only.
+  pendingApproval: { message: string; via: "terminal" | "dashboard" } | null;
   // An LLM request is in flight.
   llmWaiting: boolean;
+  // True when this page presented the control token (it may answer questions and approvals).
+  canControl: boolean;
+  // The session can take tasks from the dashboard (false during chat setup and in one-shot runs).
+  acceptsTasks: boolean;
+  // An open chat startup question (project path, auto-write, auto-run, triage).
+  pendingQuestion: { id: string; kind: "confirm" | "text"; question: string; defaultValue?: string } | null;
+  // An agent run is in progress (started from the terminal or the dashboard).
+  busy: boolean;
+  notice: { level: "info" | "error"; text: string } | null;
 }
 
 export const initialState: DashboardState = {
@@ -71,12 +80,21 @@ export const initialState: DashboardState = {
   feed: [],
   pendingApproval: null,
   llmWaiting: false,
+  canControl: false,
+  acceptsTasks: false,
+  pendingQuestion: null,
+  busy: false,
+  notice: null,
 };
 
 export type Action =
   | { type: "connection"; connected: boolean }
-  | { type: "hello"; roster: AgentInfo[]; history: AgentEvent[] }
-  | { type: "event"; event: AgentEvent };
+  | { type: "hello"; roster: AgentInfo[]; history: AgentEvent[]; canControl: boolean; acceptsTasks: boolean; busy: boolean }
+  | { type: "session"; acceptsTasks: boolean }
+  | { type: "event"; event: AgentEvent }
+  | { type: "busy"; busy: boolean }
+  | { type: "notice"; level: "info" | "error"; text: string }
+  | { type: "dismiss_notice" };
 
 function patchRun(state: DashboardState, patch: Partial<RunInfo>): RunInfo | null {
   return state.run ? { ...state.run, ...patch } : null;
@@ -132,6 +150,9 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
     case "executor_ready":
       return {
         ...state,
+        // Safety net: whatever way the agent was chosen, the executor knows who is working now.
+        activeAgent: e.payload.agentId,
+        lastAgent: e.payload.agentId,
         run: patchRun(state, {
           model: e.payload.model,
           toolProtocol: e.payload.toolProtocol,
@@ -195,8 +216,22 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
         ),
       };
 
+    case "setup_question":
+      return { ...state, pendingQuestion: { id: e.payload.id, kind: e.payload.kind, question: e.payload.question, defaultValue: e.payload.defaultValue } };
+
+    case "setup_answered":
+      return {
+        ...state,
+        pendingQuestion: state.pendingQuestion?.id === e.payload.id ? null : state.pendingQuestion,
+        feed: push({
+          ...base,
+          kind: "note",
+          text: `Setup: ${state.pendingQuestion?.id === e.payload.id ? state.pendingQuestion.question : "question"} → ${e.payload.answer || "(default)"} (${e.payload.via})`,
+        }),
+      };
+
     case "approval_requested":
-      return { ...state, pendingApproval: e.payload.message };
+      return { ...state, pendingApproval: { message: e.payload.message, via: e.payload.via } };
 
     case "approval_resolved":
       return {
@@ -249,8 +284,23 @@ export function reducer(state: DashboardState, action: Action): DashboardState {
       return { ...state, connected: action.connected };
     case "hello":
       // A (re)connect replays the server's history from scratch, so start from a clean slate.
-      return action.history.reduce(applyEvent, { ...initialState, connected: true, roster: action.roster });
+      return action.history.reduce(applyEvent, {
+        ...initialState,
+        connected: true,
+        roster: action.roster,
+        canControl: action.canControl,
+        acceptsTasks: action.acceptsTasks,
+        busy: action.busy,
+      });
+    case "session":
+      return { ...state, acceptsTasks: action.acceptsTasks };
     case "event":
       return applyEvent(state, action.event);
+    case "busy":
+      return { ...state, busy: action.busy };
+    case "notice":
+      return { ...state, notice: { level: action.level, text: action.text } };
+    case "dismiss_notice":
+      return { ...state, notice: null };
   }
 }

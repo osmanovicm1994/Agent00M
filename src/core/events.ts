@@ -15,6 +15,8 @@ type Listener = (event: AgentEvent) => void;
 interface RunScope {
   runId: string;
   agent: string;
+  // Where the task came from: decides whether approvals are asked in the terminal or the dashboard.
+  origin: "terminal" | "dashboard";
 }
 
 // Late-joining dashboards replay this buffer. Keep it small: events carry text previews.
@@ -72,11 +74,20 @@ class EventBus {
     if (ctx) ctx.agent = agentId;
   }
 
+  // Origin of the current run ("terminal" outside any run).
+  origin(): "terminal" | "dashboard" {
+    return this.scope.getStore()?.origin ?? "terminal";
+  }
+
   // Opens one observable run: emits run_started, and run_failed if fn throws.
   // (run_completed is emitted by Executor.run, which knows the result.)
-  async withRun<T>(info: { task: string; workspace: string }, fn: () => Promise<T>): Promise<T> {
-    return this.scope.run({ runId: randomUUID(), agent: "orchestrator" }, async () => {
-      this.emit("run_started", { task: truncate(info.task, 2000), workspace: info.workspace });
+  async withRun<T>(
+    info: { task: string; workspace: string; origin?: "terminal" | "dashboard" },
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const origin = info.origin ?? "terminal";
+    return this.scope.run({ runId: randomUUID(), agent: "orchestrator", origin }, async () => {
+      this.emit("run_started", { task: truncate(info.task, 2000), workspace: info.workspace, origin });
       try {
         return await fn();
       } catch (err: any) {

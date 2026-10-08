@@ -150,7 +150,7 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 
 ## Configuration (env)
 
-`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
+`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`, and for the optional Gemini triage `GEMINI_API_KEY`, `AGENT_TRIAGE`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `AGENT_TRIAGE_TIMEOUT_MS`, `AGENT_TRIAGE_MAX_CHARS`, `AGENT_TRIAGE_CONFIRM`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
 
 ## Conventions
 
@@ -160,21 +160,41 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 - New tools: add the schema next to its implementation, add a `case` in `Executor.dispatchToolCall`, and decide if it is read-only (add to `READ_ONLY_TOOLS`).
 - New agents: create `agents/list/<id>.ts`, register it in `definitions.ts`, and add keywords to `router.ts` only if they are specific (generic words like "test" or "fix" must fall through to the LLM router).
 
-## Live web dashboard (read-only)
+## Gemini triage gateway (optional, off by default)
 
-`web/` is a separate Vite + React + Tailwind app (own `package.json`, not part of the root `tsc`). It shows which agent holds the baton and a live feed of thinking, tool calls, streamed command output and written files.
+`src/gateway/` puts a cloud "triage specialist" in front of the local agent. It is the ONLY feature that sends data off the machine, so it is opt-in: `run --triage`, `AGENT_TRIAGE=on`, the chat startup question, or `/triage` in chat (`/triage show` prints the plan last given to the agent).
+
+- Flow: query -> `redact.ts` masks secrets -> `workspace-probe.ts` builds a file-name fingerprint (no file contents, no `.env`) -> `gemini.ts` asks Gemini for a JSON plan (validated by zod in `types.ts`) -> `render.ts` shrinks it to a compact text -> passed as `extraContext` to `Executor.run`; `recommendedAgent` replaces the local routing call unless an agent is locked.
+- Failure never blocks: no key, no network, bad JSON -> a warning is printed and the local agent runs on the original query.
+- The system instruction (stack knowledge for iOS, Android, NestJS, Next.js, Playwright, Appium) lives in `instruction.ts`.
+- Models: `GEMINI_MODEL` then `GEMINI_FALLBACK_MODELS`; a "model not found" error moves to the next one. `npm run triage:models` lists what the key can use.
+- Key goes in `.env` (git-ignored). Never in `.env.local` or the committed profile files.
+- SDK `@google/genai` is ESM, so `gemini.ts` loads it with a native dynamic `import()` from this CommonJS project.
+
+## Live web dashboard (monitor + control)
+
+`web/` is a separate Vite + React + Tailwind app (own `package.json`, not part of the root `tsc`). It shows which agent holds the baton and a live feed of thinking, tool calls, streamed command output and written files. With a control token it can also send tasks and answer approvals.
 
 ```bash
 npm install && npm run web:install   # once: root deps (fastify, @fastify/websocket) + web deps
-npm run chat:ui                      # chat session that also serves ws://127.0.0.1:3001/ws
-npm run web                          # dashboard at http://localhost:5173
+npm run chat:ui                      # chat session + socket; starts the web app and opens the browser with the control token
+npm run web                          # only if you disabled the auto-start (AGENT_UI_WEB=0): dashboard at http://localhost:5173
 npx ts-node src/cli.ts run "task" -p /path --serve   # one-shot run, same socket
 ```
 
 - Flow: `cli.ts` wraps routing + execution in `bus.withRun()`; `router.ts` and `executor.ts` call `bus.emit()`; `server.ts` subscribes and forwards. Events: run_started, orchestrator_evaluating, agent_routed, executor_ready, llm_request, agent_thinking, tool_running, tool_output, tool_result, approval_requested/resolved, artifact_generated, run_completed, run_failed.
 - Adding an event: add its payload to `EventPayloads` in `core/event-types.ts`, emit it, then handle it in `web/src/state.ts` (the `switch` is exhaustive, so `web` typecheck tells you what is missing).
-- The dashboard cannot start runs or answer prompts: approvals stay in the terminal (`prompts`), the UI only shows that one is pending.
-- Security: the socket binds to 127.0.0.1 and rejects browser origins other than localhost:5173 (`AGENT_UI_ORIGINS` adds more). It streams commands, file paths and model text, so keep it local. Env: `AGENT_UI_PORT` (3001), `AGENT_UI_HISTORY` (400 replayed events), `VITE_AGENT_WS` (frontend socket URL).
+- Control path: `core/control.ts` (`control` singleton) is the UI-agnostic hook. `server.ts` calls `control.submitTask()` / `control.answerApproval()`; `cli.ts` (chat mode only) registers the task handler via `control.setTaskHandler()`; `Executor`'s `confirm()` asks `control.requestApproval()` when `bus.origin() === "dashboard"`. Runs started from the terminal keep the terminal `prompts` approval (the dashboard only displays it). One run at a time: `control.tryAcquire()/release()` guards both terminal and dashboard tasks.
+- `src/ui-launcher.ts` (called from `setupUi` in `cli.ts`) starts `web/` (Vite) if port 5173 is free, waits for it, opens the tokenised URL, and stops Vite on exit. `AGENT_UI_WEB=0` / `AGENT_UI_OPEN=0` turn the two steps off. It needs `npm run web:install` once.
+- Chat startup questions (existing project?, project path, auto-write, auto-run, Gemini triage) go through `control.ask()`: asked in the terminal (readline with an AbortSignal) and in the dashboard (`setup_question` / `setup_answered` events, `answer_question` command); the first answer wins and cancels the other prompt. The dashboard server starts BEFORE these questions. Open questions are replayed to late-joining dashboards via the event history.
+- Workspace: answering "no" to "existing project?" uses `AGENT_DEFAULT_WORKSPACE` (set in `.env.local`; unset = the current folder). Answering "yes" asks for a path (Enter = the default, invalid folders re-ask up to 3 times, then the default is used).
+- Auto-write and auto-run are separate: `Executor` has `autoWrite` and `autoRun` (`/auto-write` toggles both, `/auto-run` only commands, `AGENT_AUTO_RUN=0` forces commands to always ask).
+- Baton display: `router.ts` emits `agent_routed` (methods keyword, llm, default, forced, triage); `Executor` also reports its agent in `executor_ready`, which the dashboard uses as a safety net. Any new code path that picks an agent must call one of the `announce*` helpers or go through `routeTask`.
+- `run --serve` (one-shot) is watch-only: no task handler is registered.
+- If the controlling browser disconnects while an approval is pending, it is rejected.
+- The approval banner shows the message only; the file diff is printed in the terminal, and commands/args are visible in the feed.
+- Security: the socket binds to 127.0.0.1, rejects browser origins other than localhost:5173 (`AGENT_UI_ORIGINS` adds more), and commands (submit_task, answer_approval) are only accepted from connections that present the random token (`?token=`, constant-time compared). Without the token a page is read-only. The agent can write files and run commands, so keep the token URL private. Env: `AGENT_UI_PORT` (3001), `AGENT_UI_TOKEN` (fixed token instead of random), `AGENT_UI_URL` (UI base URL printed with the token), `AGENT_UI_HISTORY` (400 replayed events), `VITE_AGENT_WS` (frontend socket URL).
+- Wire protocol additions: client commands `ClientCommand` in `core/event-types.ts`; server messages `hello` (with `canControl`, `busy`), `event`, `busy`, `notice`.
 
 ## Known gaps
 

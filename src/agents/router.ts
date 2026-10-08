@@ -43,7 +43,7 @@ function keywordRoute(task: string): AgentDefinition | undefined {
   return getAgent(scores[0].id);
 }
 
-type RouteMethod = "keyword" | "llm" | "default" | "forced";
+type RouteMethod = "keyword" | "llm" | "default" | "forced" | "triage";
 
 // Hands the baton to `agent` and tells any dashboard about it. The routing result is unchanged.
 function routed(agent: AgentDefinition, method: RouteMethod): AgentDefinition {
@@ -55,6 +55,11 @@ function routed(agent: AgentDefinition, method: RouteMethod): AgentDefinition {
 // For callers that skip routing because the user picked the agent (-a / /use).
 export function announceForcedAgent(agent: AgentDefinition): void {
   routed(agent, "forced");
+}
+
+// For callers that take the agent Gemini triage recommended instead of routing.
+export function announceTriageAgent(agent: AgentDefinition): void {
+  routed(agent, "triage");
 }
 
 // Asks the model to pick which specialist agent should handle a task.
