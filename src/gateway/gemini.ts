@@ -42,7 +42,31 @@ const nativeImport = new Function("specifier", "return import(specifier)") as un
  * Candidate models, best first. Override with GEMINI_MODEL (and GEMINI_FALLBACK_MODELS, comma separated).
  * Model ids are retired over time: `npm run triage:models` lists what your key can use.
  */
-export const DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash"];
+// gemini-2.5-flash answers 404 "no longer available to new users", so it is not in the default chain.
+// Several ids because each model is overloaded (503) at different times; "-latest" aliases survive retirements.
+// Order: the one that answered reliably in testing first; the newest ones are often overloaded.
+export const DEFAULT_MODELS = [
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.8-flash",
+  "gemini-flash-latest",
+];
+
+/**
+ * Optional limit on the model's hidden reasoning, the main cause of slow answers.
+ *  - GEMINI_THINKING_LEVEL=minimal|low|medium|high  (Gemini 3.x)
+ *  - GEMINI_THINKING_BUDGET=<tokens>                (Gemini 2.5 style; 0 = off)
+ * Unset = the model's default. If the API rejects the setting, unset it.
+ */
+function thinkingConfig(): Record<string, unknown> {
+  const level = process.env.GEMINI_THINKING_LEVEL?.trim().toLowerCase();
+  if (level) return { thinkingConfig: { thinkingLevel: level } };
+  const budget = process.env.GEMINI_THINKING_BUDGET?.trim();
+  if (budget && Number.isFinite(Number(budget))) return { thinkingConfig: { thinkingBudget: Number(budget) } };
+  return {};
+}
 
 export function resolveModels(): string[] {
   const primary = process.env.GEMINI_MODEL?.trim();
@@ -54,13 +78,14 @@ export function resolveModels(): string[] {
   return [...new Set(chain)];
 }
 
-type ErrorKind = "fatal" | "model" | "schema" | "transient" | "parse" | "unknown";
+type ErrorKind = "fatal" | "model" | "schema" | "transient" | "timeout" | "parse" | "unknown";
 
 function classify(err: any): ErrorKind {
   const status: number | undefined = typeof err?.status === "number" ? err.status : typeof err?.code === "number" ? err.code : undefined;
   const msg = String(err?.message ?? err);
 
   if (err?.name === "TriageParseError" || err?.name === "ZodError" || err instanceof SyntaxError) return "parse";
+  if (err?.name === "TriageTimeout") return "timeout";
   if (err?.name === "AbortError" || /\baborted\b|timed? ?out|ETIMEDOUT|ECONNRESET|fetch failed|ENOTFOUND|EAI_AGAIN/i.test(msg)) return "transient";
   if (status === 401 || status === 403 || /API key not valid|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED/i.test(msg)) return "fatal";
   if (status === 404 || /\bnot found\b|no longer available|not supported for generateContent|has been deprecated|is not available/i.test(msg)) return "model";
@@ -126,7 +151,11 @@ export class GeminiTriageClient {
     schema?: Record<string, unknown>,
   ): Promise<string> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.timeoutMs);
     try {
       const response = await client.models.generateContent({
         model,
@@ -137,10 +166,20 @@ export class GeminiTriageClient {
           ...(schema ? { responseJsonSchema: schema } : {}),
           // Room for the model's own reasoning plus the plan; a plan cut off mid-JSON is useless.
           maxOutputTokens: 8192,
+          ...thinkingConfig(),
           abortSignal: controller.signal,
         },
       });
       return response.text ?? "";
+    } catch (err: any) {
+      if (timedOut) {
+        const e = new Error(
+          `no answer within ${Math.round(this.timeoutMs / 1000)}s (raise AGENT_TRIAGE_TIMEOUT_MS, check your network/proxy, or run: npm run triage:models -- --test)`,
+        );
+        e.name = "TriageTimeout";
+        throw e;
+      }
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -160,7 +199,7 @@ export class GeminiTriageClient {
 
     for (const model of order) {
       let attempts = 0;
-      while (attempts < 2) {
+      while (attempts < 3) {
         attempts++;
         try {
           const raw = await this.callOnce(client, model, systemInstruction, userContent, this.schemaSupported ? schema : undefined);
@@ -173,15 +212,16 @@ export class GeminiTriageClient {
           const kind = classify(err);
 
           if (kind === "fatal") throw new TriageError(`Gemini rejected the request (${message}). Check GEMINI_API_KEY and that the API is enabled for it.`, true);
-          if (kind === "model") break; // retired or unavailable model: next candidate
+          if (kind === "model" || kind === "timeout") break; // retired, unavailable or too slow: next candidate (no second wait)
           if (kind === "schema" && this.schemaSupported) {
             // The API did not accept the response schema: ask again with the JSON instruction only.
             this.schemaSupported = false;
             attempts--;
             continue;
           }
-          if (kind === "transient" && attempts < 2) {
-            await sleep(1500);
+          if (kind === "transient" && attempts < 3) {
+            // 503 "high demand" spikes are usually short: back off 2s, then 4s.
+            await sleep(2000 * attempts);
             continue;
           }
           if (kind === "parse" && attempts < 2) continue;
@@ -191,6 +231,27 @@ export class GeminiTriageClient {
       }
     }
     throw new TriageError(`No Gemini model produced a usable plan (tried ${order.join(", ")}). Last error: ${lastError}`);
+  }
+
+  /** Tiny real request per model: tells you which ids work and how long they take (for `triage-models --test`). */
+  async ping(model: string, timeoutMs = 30_000): Promise<{ ok: boolean; ms: number; detail: string }> {
+    const client = await this.getClient();
+    const started = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await client.models.generateContent({
+        model,
+        contents: "Reply with the single word: ready",
+        config: { maxOutputTokens: 256, ...thinkingConfig(), abortSignal: controller.signal },
+      });
+      return { ok: true, ms: Date.now() - started, detail: String(res.text ?? "").trim().slice(0, 40) };
+    } catch (err: any) {
+      const detail = controller.signal.aborted ? `no answer within ${timeoutMs / 1000}s` : String(err?.message ?? err).split("\n")[0].slice(0, 200);
+      return { ok: false, ms: Date.now() - started, detail };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Model ids the key can call generateContent on (for `triage-models`). */

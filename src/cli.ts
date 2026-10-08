@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // src/cli.ts
 import "dotenv/config"; // must run first: some modules read AGENT_* settings when they are imported
+import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as dotenv from "dotenv";
 import * as readline from "readline";
@@ -10,12 +12,14 @@ import { createProvider } from "./llm/factory";
 import { LMStudioProvider } from "./llm/providers/lmstudio";
 import { getProfile } from "./llm/models";
 import type { LLMProvider } from "./llm/types";
-import { routeTask, announceForcedAgent } from "./agents/router";
+import { routeTask, announceForcedAgent, announceTriageAgent } from "./agents/router";
 import { getAgent, AGENTS } from "./agents/definitions";
 import { Executor } from "./core/executor";
 import { McpManager } from "./mcp/client";
 import { bus } from "./core/events";
+import { control } from "./core/control";
 import { startServer, type DashboardServer } from "./server";
+import { launchDashboard, stopDashboard } from "./ui-launcher";
 import { TriageGateway, GeminiTriageClient, confirmPlan, resolveModels } from "./gateway";
 
 dotenv.config();
@@ -38,11 +42,37 @@ async function setupMcp(disabled: boolean): Promise<McpManager | undefined> {
 async function setupUi(enabled?: boolean): Promise<DashboardServer | undefined> {
   if (!enabled) return undefined;
   try {
-    return await startServer();
+    const server = await startServer();
+    // Starts the web app and opens the browser in the background (AGENT_UI_WEB=0 / AGENT_UI_OPEN=0 turn it off).
+    void launchDashboard(server.url);
+    return server;
   } catch (err: any) {
     console.log(pc.yellow(`⚠ Dashboard server failed to start: ${err?.message ?? err}`));
     return undefined;
   }
+}
+
+function expandHome(p: string): string {
+  return p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p;
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// Where the agent works when you answer "no" to "existing project?" (AGENT_DEFAULT_WORKSPACE).
+// Falls back to --project / the current folder, with a warning if the configured folder is missing.
+function resolveDefaultWorkspace(fallback: string): string {
+  const configured = (process.env.AGENT_DEFAULT_WORKSPACE ?? "").trim();
+  if (!configured) return path.resolve(fallback);
+  const resolved = path.resolve(expandHome(configured));
+  if (isDirectory(resolved)) return resolved;
+  console.log(pc.yellow(`⚠ AGENT_DEFAULT_WORKSPACE (${resolved}) is not a folder. Using ${path.resolve(fallback)} instead.`));
+  return path.resolve(fallback);
 }
 
 // Triage (Gemini) is opt-in because it is the only feature that sends data off the machine.
@@ -204,6 +234,7 @@ program
             announceForcedAgent(resolvedAgent);
             console.log(pc.dim(`Using forced agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
           } else if (suggested && resolvedAgent.id === suggested) {
+            announceTriageAgent(resolvedAgent);
             console.log(pc.dim(`Triage selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
           } else {
             console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
@@ -276,7 +307,8 @@ program
 program
   .command("triage-models")
   .description("List the Gemini models your API key can use, and the order the triage gateway tries them")
-  .action(async () => {
+  .option("--test", "Also send a tiny real request to each model in the chain and report latency")
+  .action(async (opts: { test?: boolean }) => {
     try {
       console.log(pc.bold("Triage model order: ") + resolveModels().join(" → "));
       const client = new GeminiTriageClient();
@@ -288,6 +320,14 @@ program
       console.log(pc.bold("\nAvailable to your key:"));
       ids.forEach((id) => console.log(`  ${id}`));
       console.log(pc.dim("\nPick one with GEMINI_MODEL=<id> (and optionally GEMINI_FALLBACK_MODELS=a,b) in .env."));
+
+      if (opts.test) {
+        console.log(pc.bold("\nLive test (tiny request per model):"));
+        for (const m of resolveModels()) {
+          const r = await client.ping(m);
+          console.log(`  ${r.ok ? pc.green("ok  ") : pc.red("FAIL")} ${m}  ${(r.ms / 1000).toFixed(1)}s  ${pc.dim(r.detail)}`);
+        }
+      }
     } catch (err: any) {
       console.log(pc.red(err?.message ?? String(err)));
       process.exitCode = 1;
@@ -373,20 +413,53 @@ program
       output: process.stdout,
     });
 
-    const questionAsync = (query: string): Promise<string> => {
-      return new Promise((resolve) => rl.question(query, resolve));
+    // Dashboard first, so every startup question below can be answered there as well.
+    const ui = await setupUi(opts.serve);
+
+    // Asks in the terminal AND in the dashboard. The first answer wins and cancels the other prompt.
+    const ask = async (kind: "confirm" | "text", question: string, terminalPrompt: string, defaultValue?: string): Promise<string> => {
+      const { answer, via } = await control.ask({ kind, question, defaultValue }, (signal) =>
+        new Promise<string>((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("answered elsewhere")), { once: true });
+          rl.question(terminalPrompt, { signal }, resolve);
+        }),
+      );
+      if (via === "dashboard") console.log(pc.dim(`\n   ↳ answered in the dashboard: ${answer || "(default)"}`));
+      return answer;
+    };
+    const askYesNo = async (question: string, terminalPrompt: string, defaultYes = false): Promise<boolean> => {
+      const answer = (await ask("confirm", question, terminalPrompt, defaultYes ? "yes" : "no")).trim().toLowerCase();
+      if (answer === "") return defaultYes;
+      return ["y", "yes", "j", "ja", "true", "1"].includes(answer);
     };
 
-    let workspaceRoot = path.resolve(opts.project);
+    // 1. Initial questionnaire. Answering "no" uses the default workspace (AGENT_DEFAULT_WORKSPACE).
+    const defaultWorkspace = resolveDefaultWorkspace(opts.project);
+    let workspaceRoot = defaultWorkspace;
 
-    // 1. Initial Questionnaire
-    const isExisting = await questionAsync(pc.cyan("Are you working on an existing project? (y/N): "));
-
-    if (isExisting.trim().toLowerCase() === "y" || isExisting.trim().toLowerCase() === "yes") {
-      const projectPath = await questionAsync(pc.cyan("Enter the absolute path to the project: "));
-      if (projectPath.trim()) {
-        workspaceRoot = path.resolve(projectPath.trim());
+    const isExisting = await askYesNo("Are you working on an existing project?", pc.cyan("Are you working on an existing project? (y/N): "));
+    if (isExisting) {
+      let chosen: string | undefined;
+      for (let attempt = 0; attempt < 3 && !chosen; attempt++) {
+        const typed = (
+          await ask(
+            "text",
+            "Absolute path to the project (empty = default workspace)",
+            pc.cyan(`Enter the absolute path to the project (Enter = ${defaultWorkspace}): `),
+            defaultWorkspace,
+          )
+        ).trim();
+        const candidate = path.resolve(expandHome(typed || defaultWorkspace));
+        if (isDirectory(candidate)) chosen = candidate;
+        else console.log(pc.red(`❌ Not a folder: ${candidate}`));
       }
+      if (chosen) {
+        workspaceRoot = chosen;
+      } else {
+        console.log(pc.yellow("⚠ No valid folder given. Using the default workspace."));
+      }
+    } else {
+      console.log(pc.dim("Using the default workspace (set AGENT_DEFAULT_WORKSPACE to change it)."));
     }
 
     console.log(pc.dim(`\n✅ Workspace locked to: ${workspaceRoot}`));
@@ -394,19 +467,28 @@ program
     const llm = makeProvider(opts.model);
     console.log(pc.dim(`Model: ${describeModel(llm)}   (type /model to list or switch)`));
 
-    const autoAnswer = (
-      await questionAsync(pc.cyan("Let the agent write files and run commands automatically, without asking each time? (y/N): "))
-    )
-      .trim()
-      .toLowerCase();
-    const autoWrite = autoAnswer === "y" || autoAnswer === "yes";
+    const autoWrite = await askYesNo(
+      "Auto-write: let the agent write files without asking each time?",
+      pc.cyan("Auto-write: let the agent write files without asking each time? (y/N): "),
+    );
+    let autoRun = false;
+    if (process.env.AGENT_AUTO_RUN === "0") {
+      console.log(pc.dim("Auto-run is disabled by AGENT_AUTO_RUN=0: every command asks."));
+    } else {
+      autoRun = await askYesNo(
+        "Auto-run: let the agent run shell commands without asking each time? (risky ones like rm, sudo, git push still ask)",
+        pc.cyan("Auto-run: let the agent run commands without asking each time? Risky ones still ask. (y/N): "),
+      );
+    }
     console.log(
       autoWrite
-        ? pc.yellow(
-            "✎ Auto mode ON: files are written and commands are run without asking (a log line is shown for each). " +
-              "Risky commands (rm, sudo, git reset/push, kill, ...) still ask.",
-          )
-        : pc.dim("Auto mode OFF: you approve every file write and command. Type '/auto-write' any time to switch."),
+        ? pc.yellow("✎ Auto-write ON: files are written without asking (a log line is shown for each).")
+        : pc.dim("Auto-write OFF: you approve every file write. Type '/auto-write' any time to switch."),
+    );
+    console.log(
+      autoRun
+        ? pc.yellow("⚡ Auto-run ON: commands run without asking (risky ones: rm, sudo, git reset/push, kill, ... still ask).")
+        : pc.dim("Auto-run OFF: you approve every command. Type '/auto-run' any time to switch."),
     );
 
     // Gemini triage: opt-in, because it sends the question and a file-name overview to Google.
@@ -421,27 +503,25 @@ program
           : pc.yellow("⚠ AGENT_TRIAGE=on but GEMINI_API_KEY is not set (put it in .env). Triage stays off."),
       );
     } else if (triageSetting === undefined && triage.hasApiKey()) {
-      const ans = (
-        await questionAsync(
-          pc.cyan(
-            "Run every task through Gemini triage first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google. (y/N): ",
-          ),
-        )
-      )
-        .trim()
-        .toLowerCase();
-      triageOn = ans === "y" || ans === "yes";
+      triageOn = await askYesNo(
+        "Gemini triage: run every task through Gemini first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google.",
+        pc.cyan(
+          "Run every task through Gemini triage first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google. (y/N): ",
+        ),
+      );
       console.log(triageOn ? pc.yellow("🧭 Gemini triage ON. Type '/triage' to switch.") : pc.dim("Triage OFF. Type '/triage' to switch."));
     }
 
     const mcp = await setupMcp(!opts.mcp);
-    const ui = await setupUi(opts.serve);
-    const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite });
+    const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite, autoRun });
 
     console.log(pc.bold("Type 'help' or '/help' for options, your task, or 'exit' to quit.\n"));
 
     const shutdown = () => {
+      control.setTaskHandler(undefined);
+      control.cancelPendingApproval();
       void ui?.close();
+      stopDashboard();
       mcp?.close();
       rl.close();
       process.exit(0);
@@ -451,10 +531,65 @@ program
     // State for manual agent locking
     let lockedAgentId: string | undefined = undefined;
 
+    // Routes and runs one task as one observable run. Used by the terminal and the dashboard.
+    // `origin` decides where approvals are asked; `forcedAgentId` (dashboard picker) beats the
+    // session lock and the router.
+    const executeTask = async (task: string, origin: "terminal" | "dashboard", forcedAgentId?: string): Promise<void> => {
+      try {
+        const result = await bus.withRun({ task, workspace: workspaceRoot, origin }, async () => {
+          let resolvedAgent;
+          let planContext: string | undefined;
+          let suggested: string | undefined;
+          const forcedId = forcedAgentId ?? lockedAgentId;
+
+          if (triageOn) {
+            if (origin === "dashboard" && process.env.AGENT_TRIAGE_CONFIRM === "1") {
+              // The plan confirmation is a terminal prompt; do not block a browser-started run on it.
+              console.log(pc.dim("Triage skipped: AGENT_TRIAGE_CONFIRM=1 needs the terminal."));
+            } else {
+              const out = await triage.run(task, workspaceRoot, executor.toolNames());
+              if (out && (process.env.AGENT_TRIAGE_CONFIRM !== "1" || (await confirmPlan()))) {
+                planContext = out.agentContext;
+                suggested = out.recommendedAgent;
+              }
+            }
+          }
+
+          const suggestedAgent = suggested ? getAgent(suggested) : undefined;
+          if (forcedId) {
+            resolvedAgent = getAgent(forcedId)!;
+            announceForcedAgent(resolvedAgent);
+          } else if (suggestedAgent) {
+            resolvedAgent = suggestedAgent;
+            announceTriageAgent(resolvedAgent);
+            console.log(pc.dim(`Triage selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          } else {
+            console.log(pc.dim("... Routing task & analyzing ..."));
+            resolvedAgent = await routeTask(llm, task);
+            console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
+          }
+
+          console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
+
+          return executor.run(resolvedAgent, task, planContext);
+        });
+
+        console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));
+
+        if (result.filesWritten.length > 0) {
+          console.log(pc.cyan("Files written this session:"));
+          result.filesWritten.forEach((f) => console.log(`  - ${f}`));
+        }
+      } catch (err: any) {
+        console.error(pc.red("\nExecution error:"), err?.message ?? err);
+      }
+    };
+
     // 3. Main Chat Loop
     const askQuestion = () => {
       const agentTag = lockedAgentId ? pc.magenta(`[${lockedAgentId}]`) : pc.gray("[auto]");
-      const promptPrefix = executor.isAutoWrite() ? `${agentTag}${pc.yellow("[✎ auto-write]")}` : agentTag;
+      const tags = `${executor.isAutoWrite() ? pc.yellow("[✎ auto-write]") : ""}${executor.isAutoRun() ? pc.yellow("[⚡ auto-run]") : ""}`;
+      const promptPrefix = `${agentTag}${tags}`;
 
       rl.question(`${promptPrefix} ${pc.cyan("User > ")}`, async (taskInput) => {
         const task = taskInput.trim();
@@ -475,7 +610,8 @@ program
   ${pc.cyan("auto")}          | ${pc.cyan("/auto")}       - Return to automatic router
   ${pc.cyan("show project")} | ${pc.cyan("/project")}    - Display current workspace path
   ${pc.cyan("/model")}                       - List models on the server; ${pc.cyan("/model <id>")} switches
-  ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle auto mode (write files + run commands without asking)
+  ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle auto-write and auto-run together (files + commands without asking)
+  ${pc.cyan("/auto-run")}                   - Toggle auto-run only (commands without asking; risky ones still ask)
   ${pc.cyan("/triage")}                      - Toggle Gemini triage; ${pc.cyan("/triage show")} prints the last plan given to the agent
   ${pc.cyan("clean")}         | ${pc.cyan("clear")}       - Clear terminal screen
   ${pc.cyan("exit")}                        - End session
@@ -546,6 +682,21 @@ program
           return;
         }
 
+        if (["auto-run", "/auto-run", "autorun", "/autorun"].includes(normalizedInput)) {
+          if (process.env.AGENT_AUTO_RUN === "0") {
+            console.log(pc.yellow("\n⚠ Auto-run is disabled by AGENT_AUTO_RUN=0 in your env file.\n"));
+          } else {
+            executor.setAutoRun(!executor.isAutoRun());
+            console.log(
+              executor.isAutoRun()
+                ? pc.yellow("\n⚡ Auto-run ON: commands run without asking (risky ones still ask).\n")
+                : pc.green("\n✔ Auto-run OFF: you approve every command.\n"),
+            );
+          }
+          askQuestion();
+          return;
+        }
+
         if (normalizedInput === "/triage" || normalizedInput === "/triage show") {
           if (normalizedInput === "/triage show") {
             console.log(triage.last ? `\n${triage.last.agentContext}\n` : pc.dim("\nNo triage plan yet.\n"));
@@ -595,56 +746,34 @@ program
         }
 
         // --- LLM EXECUTION ---
+        // One run at a time: a task started from the dashboard holds the same lock.
+        if (!control.tryAcquire()) {
+          console.log(pc.yellow("\n⏳ The agent is busy with a task from the dashboard. Try again when it finishes.\n"));
+          askQuestion();
+          return;
+        }
         // Pause our readline while the executor asks y/n questions through
         // `prompts`, so two readers never fight over stdin.
         rl.pause();
         try {
-          // One observable run: routing + execution share a runId on the event bus.
-          const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
-            let resolvedAgent;
-            let planContext: string | undefined;
-            let suggested: string | undefined;
-
-            if (triageOn) {
-              const out = await triage.run(task, workspaceRoot, executor.toolNames());
-              if (out && (process.env.AGENT_TRIAGE_CONFIRM !== "1" || (await confirmPlan()))) {
-                planContext = out.agentContext;
-                suggested = out.recommendedAgent;
-              }
-            }
-
-            if (lockedAgentId) {
-              resolvedAgent = getAgent(lockedAgentId)!;
-              announceForcedAgent(resolvedAgent);
-            } else if (suggested) {
-              resolvedAgent = getAgent(suggested)!;
-              console.log(pc.dim(`Triage selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
-            } else {
-              console.log(pc.dim("... Routing task & analyzing ..."));
-              resolvedAgent = await routeTask(llm, task);
-              console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
-            }
-
-            console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
-
-            return executor.run(resolvedAgent, task, planContext);
-          });
-
-          console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));
-
-          if (result.filesWritten.length > 0) {
-            console.log(pc.cyan("Files written this session:"));
-            result.filesWritten.forEach((f) => console.log(`  - ${f}`));
-          }
-        } catch (err: any) {
-          console.error(pc.red("\nExecution error:"), err?.message ?? err);
+          await executeTask(task, "terminal");
         } finally {
           rl.resume();
+          control.release();
         }
 
         askQuestion();
       });
     };
+
+    // Tasks sent from the dashboard (only with a valid control token, see server.ts). The lock was
+    // already taken by control.submitTask(). Approvals for these runs are answered in the browser.
+    if (ui) {
+      control.setTaskHandler(async (task, agentId) => {
+        console.log(pc.cyan(`\n🖥  Task from the dashboard: ${task}`));
+        await executeTask(task, "dashboard", agentId);
+      });
+    }
 
     askQuestion();
   });
