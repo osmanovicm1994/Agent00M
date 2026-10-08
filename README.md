@@ -1,156 +1,230 @@
-# Local AI Agent System
+```markdown
+# agent-cli
 
-A sophisticated local AI agent system that combines command-line interface with a web dashboard for task execution and monitoring.
+Local Copilot-CLI / Claude-Code-style multi-agent coding system backed by DeepSeek R1 via LM Studio or cloud LLM providers (e.g., NVIDIA NIM). 
 
-## Overview
+Built as a standalone CLI tool that operates safely against any target project directory with session workspace locking, fast local command interceptors, dynamic domain skill injection, and a modular registry architecture.
 
-This project provides a local AI coding assistant that can:
-- Execute tasks through natural language commands
-- Run in both interactive chat mode and automated run mode  
-- Integrate with local LLM servers (like LM Studio)
-- Provide real-time visualization of agent activities via web dashboard
-- Support multiple specialized agents for different types of tasks
+---
 
-## Features
+## Directory Layout
 
-- **CLI Interface**: Command-line interface for running tasks and chatting with the AI assistant
-- **Web Dashboard**: Real-time monitoring of agent activities through a browser-based UI  
-- **Agent Specialization**: Multiple specialist agents for different programming tasks
-- **MCP Integration**: Support for Model Context Protocol servers (e.g., sequential-thinking)
-- **Local Execution**: All processing happens locally without sending data to external services
+```text
+agent-cli/
+├── src/
+│   ├── cli.ts                  # Main CLI entry point (Commander setup & chat loop)
+│   ├── agents/
+│   │   ├── helpers.ts          # Utility functions (e.g., loadSkill for prompt enrichment)
+│   │   ├── definitions.ts      # Agent registry & lookup dispatcher
+│   │   ├── router.ts           # Automatic task router selecting specialist agents
+│   │   └── list/               # Individual agent definitions (Registry Pattern)
+│   │       ├── dev.ts          # Development Agent
+│   │       ├── api.ts          # API & Backend Agent
+│   │       ├── db.ts           # Database Architect Agent
+│   │       ├── design.ts       # UI/UX Design Agent
+│   │       ├── logic.ts        # Logical Architecture Strategist
+│   │       └── kb-harvester.ts # Knowledge Base Harvester Agent
+│   │       └── debug.ts        # Problem solving Agent
+│   ├── core/
+│   │   ├── executor.ts         # Plan-act execution loop & safety guardrails
+│   │   └── tools/              # File system & shell command tool execution
+│   ├── knowledge/              # Markdown-based domain skill guidelines
+│   │   ├── 00-agent-core/      # Standard coding rules loaded via loadSkill()
+│   │   ├── 01-arhitecture/
+│   │   ├── 02-qa-automation/
+│   │   ├── 03-mobile/
+│   │   └── 04-frontend/
+│   │   └── 05-backend/
+│   │   └── 06-database/
+│   │   └── 07-api/
+│   │   └── 08-logic/
+│   │   └── 09-ai-agents/
+│   │   └── 10-design/
+│   │   └── 11-kb/
+│   │   └── uupm/
+│   └── llm/
+│       ├── factory.ts          # LLM provider initialization
+│       └── providers/          # Provider adapters (LM Studio, NVIDIA NIM, OpenAI)
+├── .env.example
+├── package.json
+├── tsconfig.json
+└── README.md
 
-## Prerequisites
+```
 
-- Node.js 18+ 
-- Local LLM server (like LM Studio) running on default port
-- For web dashboard: Vite development server
+---
+
+## Key Features
+
+* **Session Workspace Locking:** Prompts for the target project path on startup and locks all file execution tools (`read_file`, `write_file`, `list_directory`, `grep`) strictly to that target workspace root.
+* **Registry Pattern Architecture:** Specialist agents live in isolated files under `src/agents/list/`, keeping definitions clean, scalable, and independent.
+* **Dynamic Skill Injection (`loadSkill`):** System prompts dynamically import markdown guidelines from `src/knowledge/` to inject domain expertise into agents without hardcoding large prompt strings.
+* **Zero-Latency Local Interceptors:** System queries like listing agents, manual agent locking, clearing output, or displaying workspace paths bypass LLM API calls entirely.
+* **Safety-First Execution:** Read-only operations proceed automatically, while state-changing disk writes (`write_file`) and shell executions (`run_command`) require explicit user confirmation.
+
+---
 
 ## Setup
 
-### Install Dependencies
+### 1. Configure Your LLM Provider
 
-```bash
-npm install
-```
+* **LM Studio (Local):** Start LM Studio, load your model (e.g., Qwen3 Coder), and start the local server (default port `1234`). Note the exact model identifier.
+* **NVIDIA NIM / Cloud APIs:** Set your provider base URL and API keys in your `.env` file.
 
-### Configure Environment Variables
+### 2. Environment Configuration
 
-Copy the example environment file:
+Copy `.env.example` to `.env` and set your runtime options:
 
 ```bash
 cp .env.example .env
+
 ```
 
-Edit `.env` to set your preferred LLM provider and configuration options.
+Example `.env`:
+
+```env
+AI_PROVIDER=lmstudio
+AI_MODEL_NAME=qwen/qwen3-coder-30b
+LMSTUDIO_BASE_URL=http://localhost:1234/v1
+
+```
+
+### 3. Install & Build
+
+```bash
+npm install
+npm run build
+
+```
+
+---
 
 ## Usage
 
-### CLI Commands
+### Interactive Multi-Agent Session (Recommended)
 
-The main agent is run through `npm run dev` or directly with `tsx src/cli.ts`.
-
-#### Available Commands
-
-- **run** - Execute a task using the local AI assistant  
-  ```bash
-  npm run run "Implement user authentication system"
-  ```
-
-- **chat** - Start an interactive multi-agent chat session  
-  ```bash
-  npm run chat
-  ```
-
-- **agents** - List available specialist agents  
-  ```bash
-  npm run agents
-  ```
-
-- **models** - List models available on the LLM server  
-  ```bash
-  npm run models
-  ```
-
-- **triage-models** - List Gemini models for triage functionality  
-  ```bash
-  npm run triage-models
-  ```
-
-### Web Dashboard
-
-The system supports a real-time web dashboard that shows agent activities:
-
-1. Start the agent with `--serve` flag to enable the dashboard:
-   ```bash
-   npm run dev -- --serve
-   ```
-
-2. The dashboard will be accessible at: http://localhost:5173/?token=[generated-token]
-
-### Web UI Setup
-
-The web interface is located in `/web` directory and uses Vite:
+Launch the interactive chat interface:
 
 ```bash
-cd web
-npm install
-```
-
-#### Available Scripts (in web/package.json)
-
-- `dev`: Start the development server 
-- `build`: Build for production
-- `preview`: Preview the production build
-- `typecheck`: Run TypeScript checks
-
-## Configuration
-
-### Environment Variables
-
-Key environment variables:
-- `AI_PROVIDER` - LLM provider to use (default: lmstudio)
-- `AI_MODEL_NAME` - Specific model name to use  
-- `AGENT_DEFAULT_WORKSPACE` - Default project directory for tasks
-- `AGENT_UI_PORT` - Port for the dashboard WebSocket server (default: 3001)
-- `GEMINI_API_KEY` - For triage functionality (optional)
-
-### MCP Configuration
-
-The system uses MCP configuration defined in `mcp.config.json`. This file defines which servers to start and how they should be configured.
-
-## Development
-
-### Running the Agent
-
-```bash
-# Run a single task  
-npm run dev -- "Implement user authentication"
-
-# Start interactive chat session  
 npm run chat
 
-# Run with dashboard monitoring
-npm run dev -- --serve
 ```
 
-### Project Structure
+On startup, lock your session to your target workspace path:
 
-- `src/` - Core agent implementation including:
-  - `cli.ts` - Main CLI entry point
-  - `agents/` - Specialist agent implementations
-  - `llm/` - LLM provider integrations  
-  - `gateway/` - Triage and external service integrations
-  - `core/` - Core execution logic
+```text
+🤖 Interactive Multi-Agent CLI Started.
 
-- `web/` - Web dashboard UI (Vite-based)
+Are you working on an existing project? (y/N): y
+Enter the absolute path to the project: /Users/mustafaosmanovic/testLocalMustafa/WEB PROJECT/PREOBUCI
 
-## Contributing
+✅ Workspace locked to: /Users/mustafaosmanovic/testLocalMustafa/WEB PROJECT/PREOBUCI
+Type 'help' or '/help' for options, your task, or 'exit' to quit.
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes 
-4. Submit a pull request
+[auto] User > 
 
-## License
+```
 
-This project is licensed under the MIT License.
+### Local Commands Reference
+
+Intercepted locally at zero cost without invoking LLM API calls:
+
+| Command | Slash Alias | Description |
+| --- | --- | --- |
+| `show agents` | `/agents` | List all available specialist agents with descriptions |
+| `use <agent_id>` | `/use <id>` | Lock session directly to a specific agent (e.g., `use kb-harvester`) |
+| `auto` | `/auto` | Unlock agent and return to automatic task routing |
+| `show project` | `/project` | Display the currently locked workspace path |
+| `clean` / `clear` | `/clear` | Clear the terminal screen |
+| `help` | `/help` | Print the command cheatsheet |
+| `exit` / `quit` | `/exit` | Terminate the CLI session |
+
+---
+
+### Direct Task Execution
+
+Run single, standalone tasks from the terminal:
+
+```bash
+# Auto-route task in the current workspace
+npm run dev -- run "add a health check endpoint"
+
+# Target a specific workspace and force an agent
+npm run dev -- run "Scan project and build architecture docs" \
+  --project "/Users/mustafaosmanovic/testLocalMustafa/WEB PROJECT/PREOBUCI" \
+  --agent kb-harvester
+
+```
+
+List registered agents from the CLI:
+
+```bash
+npm run dev -- agents
+
+```
+
+---
+
+## How It Works
+
+1. **Workspace Binding:** The target directory is captured during launch and passed to the `Executor` instance. All tool file paths are validated and resolved against this target root.
+2. **Task Routing & Agent Lock:**
+* In **Auto Mode** (`[auto]`), `router.ts` evaluates the task description against registered agent capabilities and selects the appropriate specialist.
+* In **Locked Mode** (`[agent-id]`), task routing is bypassed to eliminate latency.
+
+
+3. **Dynamic Prompt Assembly:** The agent's base system prompt is loaded alongside domain-specific standards via `loadSkill()` from `src/knowledge/`.
+4. **Plan-Act Loop:** The agent generates tool calls (`list_directory`, `read_file`, `write_file`, `run_command`). Read-only actions run immediately; write or shell operations require manual `y/n` approval.
+
+---
+
+## Adding a New Agent
+
+1. Create a file under `src/agents/list/` (e.g., `src/agents/list/tester.ts`):
+```typescript
+import { AgentDefinition } from "../definitions";
+import { loadSkill } from "../helpers";
+
+export const testerAgent: AgentDefinition = {
+  id: "tester",
+  name: "Test Automation Agent",
+  description: "Writes, refactors, and runs unit, integration, and E2E test suites.",
+  systemPrompt: `You are a QA and test automation specialist...` + loadSkill("testing-standards"),
+};
+
+```
+
+
+2. Register the agent in `src/agents/definitions.ts`:
+```typescript
+import { testerAgent } from "./list/tester";
+
+export const AGENTS: AgentDefinition[] = [
+  devAgent,
+  apiAgent,
+  dbAgent,
+  designAgent,
+  logicAgent,
+  kbHarvesterAgent,
+  testerAgent, // <-- Registered here
+];
+
+```
+
+
+
+---
+
+## Adding a New LLM Provider
+
+To integrate a new model provider (e.g., Anthropic, Ollama, OpenAI):
+
+1. Implement the `LLMProvider` interface in `src/llm/types.ts`.
+2. Create the provider adapter under `src/llm/providers/` (e.g., `src/llm/providers/anthropic.ts`).
+3. Add a creation case in `src/llm/factory.ts`.
+
+No modifications to agent definitions, core tool execution, or routing logic are required.
+
+```
+
+```
