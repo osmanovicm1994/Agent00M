@@ -19,8 +19,11 @@ import { McpManager } from "./mcp/client";
 import { bus } from "./core/events";
 import { control } from "./core/control";
 import { startServer, type DashboardServer } from "./server";
+import { interruptRunningCommands } from "./tools/shell.tool";
 import { launchDashboard, stopDashboard } from "./ui-launcher";
 import { TriageGateway, GeminiTriageClient, confirmPlan, resolveModels } from "./gateway";
+import { runTeam } from "./team/orchestrator";
+import { describeImage, renderBriefForAgents, type DesignBrief } from "./vision/describe";
 
 dotenv.config();
 
@@ -189,11 +192,23 @@ program
   .option("--no-mcp", "Do not start MCP servers (e.g. sequential-thinking)")
   .option("-y, --auto-write", "Auto mode: write files and run commands without asking (each action is logged; risky commands still ask)")
   .option("-t, --triage", "First let Gemini analyse the task and write a plan for the local agent (sends the query + a file-name overview to Google)")
+  .option("--team", "Team mode: Project Manager plans, engineers build, Safety Reviewer checks the result")
+  .option("-i, --image <path>", "A picture of what you want (png/jpg/webp); it is read into a design brief the agents build from")
   .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
   .action(
     async (
       task: string,
-      opts: { agent?: string; project: string; model?: string; mcp: boolean; autoWrite?: boolean; serve?: boolean; triage?: boolean },
+      opts: {
+        agent?: string;
+        project: string;
+        model?: string;
+        mcp: boolean;
+        autoWrite?: boolean;
+        serve?: boolean;
+        triage?: boolean;
+        team?: boolean;
+        image?: string;
+      },
     ) => {
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
@@ -202,12 +217,35 @@ program
       const mcp = await setupMcp(!opts.mcp);
       const ui = await setupUi(opts.serve);
 
+      // Ctrl+C stops a running command; with nothing running it exits.
+      process.on("SIGINT", () => {
+        if (interruptRunningCommands() > 0) {
+          console.log(pc.yellow("\n⏹ Stopping the running command."));
+          return;
+        }
+        mcp?.close();
+        process.exit(130);
+      });
+
       try {
         const agent = opts.agent ? getAgent(opts.agent) : undefined;
         if (opts.agent && !agent) {
           console.log(pc.red(`Agent '${opts.agent}' not found. Valid agents: ${AGENTS.map((a) => a.id).join(", ")}`));
           return;
         }
+        // A reference picture is read once into text; every agent then builds from the same brief.
+        let briefText = "";
+        if (opts.image) {
+          try {
+            const b = await describeImage(opts.image);
+            briefText = renderBriefForAgents(b);
+            console.log(pc.green(`✔ Design brief ready (${b.source}).`));
+          } catch (err: any) {
+            console.log(pc.red(`${err?.message ?? err}`));
+            return;
+          }
+        }
+
         // One observable run: routing + execution share a runId on the event bus.
         const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
           const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
@@ -228,6 +266,28 @@ program
             }
           }
 
+          const combinedContext = [planContext, briefText].filter(Boolean).join("\n\n") || undefined;
+
+          if (opts.team) {
+            const team = await runTeam({
+              llm,
+              executor,
+              task,
+              workspaceRoot,
+              context: combinedContext,
+              approvePlan: !executor.isAutoWrite(),
+            });
+            if (team) {
+              return {
+                finalMessage: team.report,
+                stepsTaken: team.tasks.length,
+                filesWritten: team.filesWritten,
+                commandsRun: team.commandsRun,
+              };
+            }
+            console.log(pc.dim("Continuing with a single agent.\n"));
+          }
+
           const resolvedAgent = agent ?? (suggested ? getAgent(suggested) : undefined) ?? (await routeTask(llm, task));
 
           if (agent) {
@@ -244,7 +304,7 @@ program
               pc.yellow("Auto mode is ON: files are written and commands are run without asking (risky commands still ask)."),
             );
           }
-          return executor.run(resolvedAgent, task, planContext);
+          return executor.run(resolvedAgent, task, combinedContext);
         });
 
         console.log(pc.dim(`\n(${result.stepsTaken} step(s) taken)`));
@@ -526,15 +586,32 @@ program
       rl.close();
       process.exit(0);
     };
-    process.on("SIGINT", shutdown);
+    // Ctrl+C while a command runs stops that command only; when nothing runs it ends the session.
+    const onCtrlC = () => {
+      if (interruptRunningCommands() > 0) {
+        console.log(pc.yellow("\n⏹ Stopping the running command (Ctrl+C again when idle exits)."));
+        return;
+      }
+      shutdown();
+    };
+    process.on("SIGINT", onCtrlC);
+    rl.on("SIGINT", onCtrlC);
 
     // State for manual agent locking
     let lockedAgentId: string | undefined = undefined;
+    // Team mode (PM plans, engineers build, Safety Reviewer checks) and a reference picture read into a design brief.
+    let teamOn = false;
+    let brief: DesignBrief | undefined;
 
     // Routes and runs one task as one observable run. Used by the terminal and the dashboard.
     // `origin` decides where approvals are asked; `forcedAgentId` (dashboard picker) beats the
     // session lock and the router.
-    const executeTask = async (task: string, origin: "terminal" | "dashboard", forcedAgentId?: string): Promise<void> => {
+    const executeTask = async (rawTask: string, origin: "terminal" | "dashboard", forcedAgentId?: string): Promise<void> => {
+      // `/team <task>` runs just this task with the team; `/team` alone toggles it for every task.
+      const teamRequest = /^\/team\s+\S/i.test(rawTask);
+      const useTeam = teamOn || teamRequest;
+      const task = teamRequest ? rawTask.replace(/^\/team\s+/i, "").trim() : rawTask;
+      const briefText = brief ? renderBriefForAgents(brief) : "";
       try {
         const result = await bus.withRun({ task, workspace: workspaceRoot, origin }, async () => {
           let resolvedAgent;
@@ -555,6 +632,29 @@ program
             }
           }
 
+          const combinedContext = [planContext, briefText].filter(Boolean).join("\n\n") || undefined;
+
+          if (useTeam) {
+            const team = await runTeam({
+              llm,
+              executor,
+              task,
+              workspaceRoot,
+              context: combinedContext,
+              // You approve the plan in the terminal; auto-write mode and dashboard runs start without asking.
+              approvePlan: origin === "terminal" && !executor.isAutoWrite(),
+            });
+            if (team) {
+              return {
+                finalMessage: team.report,
+                stepsTaken: team.tasks.length,
+                filesWritten: team.filesWritten,
+                commandsRun: team.commandsRun,
+              };
+            }
+            console.log(pc.dim("Continuing with a single agent.\n"));
+          }
+
           const suggestedAgent = suggested ? getAgent(suggested) : undefined;
           if (forcedId) {
             resolvedAgent = getAgent(forcedId)!;
@@ -571,7 +671,7 @@ program
 
           console.log(pc.gray("🤖 Agent is thinking and executing steps...\n"));
 
-          return executor.run(resolvedAgent, task, planContext);
+          return executor.run(resolvedAgent, task, combinedContext);
         });
 
         console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));
@@ -613,6 +713,11 @@ program
   ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle auto-write and auto-run together (files + commands without asking)
   ${pc.cyan("/auto-run")}                   - Toggle auto-run only (commands without asking; risky ones still ask)
   ${pc.cyan("/triage")}                      - Toggle Gemini triage; ${pc.cyan("/triage show")} prints the last plan given to the agent
+  ${pc.cyan("/team <task>")}                 - Run one task with the team: Project Manager plans, engineers build, Safety Reviewer checks
+  ${pc.cyan("/team")}                        - Toggle team mode for every task
+  ${pc.cyan("/image <path> [note]")}         - Show a picture of what you want; it is read into a design brief the agents build from
+  ${pc.cyan("/image show")} | ${pc.cyan("/image clear")} - Print or drop the current design brief
+  ${pc.cyan("Ctrl+C")}                       - Stops a running command (a second Ctrl+C when idle exits)
   ${pc.cyan("clean")}         | ${pc.cyan("clear")}       - Clear terminal screen
   ${pc.cyan("exit")}                        - End session
           `);
@@ -709,6 +814,51 @@ program
                 ? pc.yellow("\n🧭 Gemini triage ON: the question and a file-name overview are sent to Google for each task.\n")
                 : pc.green("\n✔ Gemini triage OFF: everything stays local.\n"),
             );
+          }
+          askQuestion();
+          return;
+        }
+
+        if (normalizedInput === "/team") {
+          teamOn = !teamOn;
+          console.log(
+            teamOn
+              ? pc.yellow("\n🏢 Team mode ON: every task is planned by the Project Manager, built by engineers and checked by the Safety Reviewer.\n")
+              : pc.green("\n✔ Team mode OFF: tasks go to a single agent.\n"),
+          );
+          askQuestion();
+          return;
+        }
+
+        if (normalizedInput === "/image" || normalizedInput.startsWith("/image ")) {
+          const arg = task.replace(/^\/image\s*/i, "").trim();
+          if (arg === "show") {
+            console.log(
+              brief
+                ? `\n${brief.brief}\n\n${pc.dim(`(from ${brief.imagePath}, read by ${brief.source})`)}\n`
+                : pc.dim("\nNo reference image yet. Use: /image <path>\n"),
+            );
+          } else if (arg === "clear") {
+            brief = undefined;
+            console.log(pc.green("\n✔ Reference design dropped.\n"));
+          } else if (!arg) {
+            console.log(pc.dim("\nUsage: /image <path to png/jpg/webp> [what to build from it]\n"));
+          } else {
+            // The first token (or a quoted path) is the file; the rest is a note for the reader.
+            // A path dragged into the terminal has spaces escaped as "\ ": those stay part of the file name.
+            const m = /^(?:"([^"]+)"|'([^']+)'|((?:\\ |\S)+))\s*(.*)$/.exec(arg);
+            const file = m ? (m[1] ?? m[2] ?? m[3]) : arg;
+            const note = m?.[4]?.trim() || undefined;
+            rl.pause(); // the reader may ask for confirmation through `prompts`
+            try {
+              brief = await describeImage(file, note);
+              console.log(pc.green(`\n✔ Design brief ready (${brief.source}). It is added to your next tasks. '/image show' prints it, '/image clear' drops it.\n`));
+              console.log(pc.dim(`${brief.brief.split("\n").slice(0, 8).join("\n")}\n…\n`));
+            } catch (err: any) {
+              console.log(pc.red(`\n${err?.message ?? err}\n`));
+            } finally {
+              rl.resume();
+            }
           }
           askQuestion();
           return;

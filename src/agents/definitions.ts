@@ -20,6 +20,8 @@ export interface AgentDefinition {
   autoDiagnostics?: boolean;
   // Before finishing, require that the agent re-ran a command after its last file change.
   verifyFixes?: boolean;
+  // Review role: file writes are refused and only read-only diagnostic commands run (see Executor).
+  readOnly?: boolean;
 }
 
 // 1. Register all imported agents here

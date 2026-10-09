@@ -57,11 +57,28 @@ function openInBrowser(url: string): void {
 // Fire and forget: do not await this, the chat questions should appear immediately.
 export async function launchDashboard(url: string): Promise<void> {
   try {
-    if (!flagOff("AGENT_UI_WEB") && !(await portOpen(WEB_PORT))) {
+    // Always start a new web server process when requested
+    if (!flagOff("AGENT_UI_WEB")) {
+      // Force restart of web server to ensure fresh state and always open in new tab
+      if (webProcess) {
+        try {
+          // Kill existing process before starting new one  
+          if (process.platform !== "win32" && webProcess.pid) {
+            process.kill(-webProcess.pid, "SIGTERM");
+          } else {
+            webProcess.kill();
+          }
+        } catch {
+          // Process might already be dead
+        }
+        webProcess = undefined;
+      }
+
       if (!fs.existsSync(path.join(WEB_DIR, "node_modules"))) {
         console.log(pc.yellow("⚠ Dashboard dependencies are missing. Run `npm run web:install` once, then restart."));
         return;
       }
+      
       const npm = process.platform === "win32" ? "npm.cmd" : "npm";
       // Own process group (non-Windows) so stopDashboard() also ends the vite child of npm.
       webProcess = spawn(npm, ["--prefix", WEB_DIR, "run", "dev"], { stdio: "ignore", detached: process.platform !== "win32" });

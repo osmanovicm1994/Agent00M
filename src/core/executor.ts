@@ -9,6 +9,7 @@ import type { McpManager } from "../mcp/client";
 import { renderDiff } from "./diff";
 import { bus, truncate } from "./events";
 import { control } from "./control";
+import { watchForInterrupt, formatElapsed } from "./interrupt";
 import prompts from "prompts";
 import pc from "picocolors";
 import { builtinModules } from "module";
@@ -22,8 +23,10 @@ const CONTEXT_CHAR_BUDGET = Number(process.env.AGENT_CONTEXT_CHARS) || 60_000;
 const TOOL_OUTPUT_LIMIT = 30_000;
 const MAX_THINKING_CALLS = 8;
 const MAX_NUDGES = 6;
-const STACK_KNOWLEDGE_CHARS = 6000;
+// Budget for the auto-detected stack standards in the system prompt (mobile adds role-specific detail files).
+const STACK_KNOWLEDGE_CHARS = Number(process.env.AGENT_STACK_CHARS) || 9000;
 const FENCE = "`".repeat(3);
+const READ_ONLY_REFUSAL = "TOOL ERROR: this is a review role and cannot write files. Report findings instead; another role makes the changes.";
 
 // Read-only diagnostic commands that need no approval for agents with autoDiagnostics
 // (the debug agent). Deliberately strict: no shell metacharacters can match, so nothing can be
@@ -302,6 +305,8 @@ export interface ExecutorResult {
   stepsTaken: number;
   filesWritten: string[];
   commandsRun: string[];
+  // The user pressed Ctrl+C during a command; the team orchestrator stops instead of moving on.
+  interrupted?: boolean;
 }
 
 // Per-run bookkeeping used to catch a model's bad behavior (guessing paths,
@@ -327,6 +332,10 @@ interface SessionState {
   heavyRuns: number;
   heavyRunsAtLastWrite: number;
   verifyNudged: boolean;
+  // Review roles (AgentDefinition.readOnly): no file writes, only read-only diagnostic commands.
+  readOnly: boolean;
+  // The user stopped a running command with Ctrl+C: the loop ends right away.
+  interrupted: boolean;
 }
 
 function newSessionState(): SessionState {
@@ -345,6 +354,8 @@ function newSessionState(): SessionState {
     heavyRuns: 0,
     heavyRunsAtLastWrite: 0,
     verifyNudged: false,
+    readOnly: false,
+    interrupted: false,
   };
 }
 
@@ -580,8 +591,9 @@ When you are done and have no more actions to take, reply normally with a final 
     const state = newSessionState();
     state.thinkingBudget = agent.thinkingBudget ?? MAX_THINKING_CALLS;
     state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
+    state.readOnly = Boolean(agent.readOnly);
 
-    const stackPaths = detectStackKnowledge(this.workspaceRoot);
+    const stackPaths = detectStackKnowledge(this.workspaceRoot, agent.id);
     if (stackPaths.length) {
       console.log(pc.dim(`Detected stack standards: ${stackPaths.map((p) => basename(p)).join(", ")}`));
     }
@@ -738,6 +750,7 @@ When you are done and have no more actions to take, reply normally with a final 
           stepsTaken: steps,
           filesWritten: state.filesWritten,
           commandsRun: state.commandsRun,
+          interrupted: state.interrupted,
         };
       }
 
@@ -767,6 +780,17 @@ When you are done and have no more actions to take, reply normally with a final 
               "Read-only tools can be batched, but write_file, append_file and run_command must be one per turn.)"
             : "";
         messages.push({ role: "tool", content: result + notice, toolCallId: calls[i].id });
+
+        if (state.interrupted) {
+          console.log(pc.yellow("\n⏹ Stopped: you interrupted the running command. Tell the agent how to continue."));
+          return {
+            finalMessage: "Stopped by the user (Ctrl+C) while a command was running.",
+            stepsTaken: steps,
+            filesWritten: state.filesWritten,
+            commandsRun: state.commandsRun,
+            interrupted: true,
+          };
+        }
       }
     }
 
@@ -775,6 +799,7 @@ When you are done and have no more actions to take, reply normally with a final 
       stepsTaken: steps,
       filesWritten: state.filesWritten,
       commandsRun: state.commandsRun,
+      interrupted: state.interrupted,
     };
   }
 
@@ -896,9 +921,11 @@ When you are done and have no more actions to take, reply normally with a final 
       }
 
       case "write_file":
+        if (state.readOnly) return READ_ONLY_REFUSAL;
         return this.handleWrite(false, args, state);
 
       case "append_file":
+        if (state.readOnly) return READ_ONLY_REFUSAL;
         return this.handleWrite(true, args, state);
 
       case "run_command": {
@@ -909,6 +936,9 @@ When you are done and have no more actions to take, reply normally with a final 
         if (!command.trim()) return 'TOOL ERROR: run_command requires a non-empty "command".';
 
         const diagnostic = state.autoDiagnostics && isSafeDiagnostic(command);
+        if (state.readOnly && !diagnostic) {
+          return "TOOL ERROR: this is a review role: only read-only commands (git status, git diff, git log, ls, ...) are allowed. Do not try to change anything; report what you find.";
+        }
         const autoRun = !diagnostic && this.autoRunEnabled() && !isDangerousCommand(command);
         if (autoRun) {
           console.log(pc.green(`▶ Auto-running: ${command}`));
@@ -922,18 +952,37 @@ When you are done and have no more actions to take, reply normally with a final 
           console.log(pc.green("🔎 read-only diagnostic, running without asking"));
         }
 
-        const timeoutMs = clampTimeoutMs(args.timeout_seconds);
-        const result = await this.shell.runAsync(command, timeoutMs, (text) => {
-          process.stdout.write(pc.dim(text));
-          bus.emit("tool_output", { callId, chunk: truncate(text, 2000) });
-        });
+        const timeoutMs = clampTimeoutMs(args.timeout_seconds, command);
+        console.log(pc.dim(`(Ctrl+C stops this command; limit ${formatElapsed(Math.round(timeoutMs / 1000))})`));
+        const stopWatching = watchForInterrupt();
+        let result: Awaited<ReturnType<ShellTool["runAsync"]>>;
+        try {
+          result = await this.shell.runAsync(
+            command,
+            timeoutMs,
+            (text) => {
+              process.stdout.write(pc.dim(text));
+              bus.emit("tool_output", { callId, chunk: truncate(text, 2000) });
+            },
+            (sec) => console.log(pc.dim(`\n⏳ still running, ${formatElapsed(sec)} so far (Ctrl+C stops it)`)),
+          );
+        } finally {
+          stopWatching();
+        }
         console.log();
+        if (result.interrupted) state.interrupted = true;
         state.commandsRun.push(command);
         if (!diagnostic) state.heavyRuns++;
 
         return JSON.stringify({
           exitCode: result.exitCode,
           timedOut: result.timedOut,
+          ...(result.interrupted
+            ? {
+                interrupted: true,
+                note: "The USER stopped this command with Ctrl+C. Do not run it again. Say what you saw so far and ask the user how to continue.",
+              }
+            : {}),
           ...(result.timedOut
             ? {
                 note: `Still running after ${timeoutMs / 1000}s, so the process was stopped. For a server or watcher that is normal: it started successfully unless the output shows an error.`,

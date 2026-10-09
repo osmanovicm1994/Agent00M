@@ -14,7 +14,7 @@ This folder is the agent's knowledge base. It is NOT read by the agent at runtim
 | `00-agent-core/` | Tool usage, chunked writing, grounding rules | every agent |
 | `01-architecture/` | Clean architecture, DI, immutability | dev, logic |
 | `02-qa-automation/` | Appium (general + C#), Playwright POM | qa agent; auto when Appium/Playwright is detected |
-| `03-mobile/` | SwiftUI, Jetpack Compose | auto when an Xcode / Gradle project is detected |
+| `03-mobile/` | iOS: `ios-swiftui.md` (entry) + `ios-architecture`, `ios-swiftui-ui`, `ios-data-networking`, `ios-testing`, `ios-build-debug`; Android: `android-compose.md` (entry); shared: `mobile-common`, `mobile-project-analysis`, `mobile-code-review` | auto when an Xcode / Gradle project is detected; the entry file always, shared + detail files by agent role (see `MOBILE_ROLE` in `helpers.ts`) |
 | `04-frontend/` | React / Next.js | auto when react / next is detected |
 | `05-backend/` | C# / .NET, Python / FastAPI | auto when a .csproj / FastAPI project is detected |
 | `06-database/` | Schema, migrations, query performance, integrity | db agent |
