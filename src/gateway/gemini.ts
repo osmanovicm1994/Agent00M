@@ -233,6 +233,41 @@ export class GeminiTriageClient {
     throw new TriageError(`No Gemini model produced a usable plan (tried ${order.join(", ")}). Last error: ${lastError}`);
   }
 
+  /**
+   * Free-text answer about one image (used by `/image` to turn a screenshot or mockup into a design brief).
+   * Tries the model chain; overloaded, slow or retired models are skipped.
+   */
+  async describeImage(systemInstruction: string, prompt: string, mimeType: string, base64: string): Promise<{ text: string; model: string }> {
+    const client = await this.getClient();
+    const order = this.activeModel ? [this.activeModel, ...this.models.filter((m) => m !== this.activeModel)] : this.models;
+    let lastError = "no attempt was made";
+
+    for (const model of order) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs * 2);
+      try {
+        const response = await client.models.generateContent({
+          model,
+          contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: base64 } }] }],
+          config: { systemInstruction, maxOutputTokens: 4096, ...thinkingConfig(), abortSignal: controller.signal },
+        });
+        const text = (response.text ?? "").trim();
+        if (!text) throw new Error("empty answer");
+        this.activeModel = model;
+        return { text, model };
+      } catch (err: any) {
+        const message = controller.signal.aborted ? "no answer in time" : String(err?.message ?? err).split("\n")[0].slice(0, 300);
+        lastError = `${model}: ${message}`;
+        if (!controller.signal.aborted && classify(err) === "fatal") {
+          throw new TriageError(`Gemini rejected the request (${message}). Check GEMINI_API_KEY.`, true);
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw new TriageError(`No Gemini model could read the image (tried ${order.join(", ")}). Last error: ${lastError}`);
+  }
+
   /** Tiny real request per model: tells you which ids work and how long they take (for `triage-models --test`). */
   async ping(model: string, timeoutMs = 30_000): Promise<{ ok: boolean; ms: number; detail: string }> {
     const client = await this.getClient();

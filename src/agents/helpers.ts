@@ -71,6 +71,63 @@ const STACK_PRIORITY = [
   "02-qa-automation/playwright-standards.md",
 ];
 
+// Mobile knowledge is split into an entry file per platform plus focused detail files. Only the details that
+// fit the agent's role are injected, so a small local model is not flooded with every document.
+// Detail files that do not exist yet are skipped silently (add them and they start loading).
+const MOBILE_PLATFORMS: Record<string, { entry: string; details: Record<string, string> }> = {
+  ios: {
+    entry: "03-mobile/ios-swiftui.md",
+    details: {
+      architecture: "03-mobile/ios-architecture.md",
+      ui: "03-mobile/ios-swiftui-ui.md",
+      data: "03-mobile/ios-data-networking.md",
+      testing: "03-mobile/ios-testing.md",
+      build: "03-mobile/ios-build-debug.md",
+    },
+  },
+  android: {
+    entry: "03-mobile/android-compose.md",
+    details: {
+      architecture: "03-mobile/android-architecture.md",
+      ui: "03-mobile/android-compose-ui.md",
+      data: "03-mobile/android-data-networking.md",
+      testing: "03-mobile/android-testing.md",
+      build: "03-mobile/android-build-debug.md",
+    },
+  },
+};
+
+// Which detail slots and shared files each agent role gets.
+const MOBILE_ROLE: Record<string, { shared: string[]; slots: string[] }> = {
+  dev: { shared: ["mobile-common", "mobile-project-analysis"], slots: ["architecture", "ui", "data"] },
+  design: { shared: ["mobile-common"], slots: ["ui"] },
+  api: { shared: ["mobile-common"], slots: ["data"] },
+  qa: { shared: ["mobile-common", "mobile-code-review"], slots: ["testing"] },
+  debug: { shared: ["mobile-common", "mobile-project-analysis"], slots: ["build", "architecture", "testing"] },
+  logic: { shared: ["mobile-project-analysis"], slots: [] },
+  safety: { shared: ["mobile-common", "mobile-code-review"], slots: [] },
+};
+
+function knowledgeExists(rel: string): boolean {
+  return fs.existsSync(path.join(KNOWLEDGE_ROOT, rel));
+}
+
+function addMobileDetails(base: string[], agentId: string): string[] {
+  const role = MOBILE_ROLE[agentId];
+  if (!role) return base;
+  const platforms = Object.values(MOBILE_PLATFORMS).filter((p) => base.includes(p.entry));
+  if (!platforms.length) return base;
+
+  const extra: string[] = [];
+  for (const s of role.shared) extra.push(`03-mobile/${s}.md`);
+  for (const p of platforms) for (const slot of role.slots) if (p.details[slot]) extra.push(p.details[slot]);
+  // Placed right after the mobile entry files (before Appium/other stacks): entry first, then shared rules,
+  // then role details, so the prompt budget cuts the least important text first.
+  const at = Math.max(...platforms.map((p) => base.indexOf(p.entry))) + 1;
+  const add = extra.filter((f) => !base.includes(f) && knowledgeExists(f));
+  return [...base.slice(0, at), ...add, ...base.slice(at)];
+}
+
 function inspectDir(dir: string, found: Set<string>): void {
   let names: string[];
   try {
@@ -122,7 +179,7 @@ function inspectDir(dir: string, found: Set<string>): void {
  * subfolders, and apps/* + packages/* for monorepos) and returns the knowledge
  * files that apply, so e.g. a C# project automatically gets the C# standards.
  */
-export function detectStackKnowledge(workspaceRoot: string): string[] {
+export function detectStackKnowledge(workspaceRoot: string, agentId?: string): string[] {
   const found = new Set<string>();
   const dirs: string[] = [workspaceRoot];
 
@@ -143,5 +200,6 @@ export function detectStackKnowledge(workspaceRoot: string): string[] {
 
   for (const dir of dirs.slice(0, 60)) inspectDir(dir, found);
 
-  return STACK_PRIORITY.filter((p) => found.has(p));
+  const base = STACK_PRIORITY.filter((p) => found.has(p));
+  return agentId ? addMobileDetails(base, agentId) : base;
 }

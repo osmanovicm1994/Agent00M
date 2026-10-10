@@ -150,7 +150,7 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 
 ## Configuration (env)
 
-`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`, and for the optional Gemini triage `GEMINI_API_KEY`, `AGENT_TRIAGE`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `AGENT_TRIAGE_TIMEOUT_MS`, `AGENT_TRIAGE_MAX_CHARS`, `AGENT_TRIAGE_CONFIRM`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
+`AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AGENT_MAX_STEPS`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`, `AGENT_CMD_TIMEOUT_MIN`, `AI_VISION_MODEL`, and for the optional Gemini triage `GEMINI_API_KEY`, `AGENT_TRIAGE`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `AGENT_TRIAGE_TIMEOUT_MS`, `AGENT_TRIAGE_MAX_CHARS`, `AGENT_TRIAGE_CONFIRM`. See `.env.example`. `.env.nim` holds a real cloud API key and is git-ignored; never print or commit it.
 
 ## Conventions
 
@@ -159,6 +159,23 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 - Keep tool results and prompts compact: local models are slow and context-limited, so prefer capping/eliding over sending more text.
 - New tools: add the schema next to its implementation, add a `case` in `Executor.dispatchToolCall`, and decide if it is read-only (add to `READ_ONLY_TOOLS`).
 - New agents: create `agents/list/<id>.ts`, register it in `definitions.ts`, and add keywords to `router.ts` only if they are specific (generic words like "test" or "fix" must fall through to the LLM router).
+
+## Long commands and Ctrl+C
+
+- Builds, tests and installs (`gradlew`, `xcodebuild`, `mvn`, `npm run build|test|ci|install`, `docker build`, `fastlane`, `pod install` ...) get up to `AGENT_CMD_TIMEOUT_MIN` minutes (default 30; hard ceiling 2 h). The model's `timeout_seconds` is only honoured for servers/watchers and can never shorten a build command (`clampTimeoutMs(seconds, command)` in `tools/shell.tool.ts`). A command without a hint also gets the long limit.
+- A heartbeat line (`still running, 2m 30s`) prints every 30 s so a quiet build does not look frozen.
+- **Ctrl+C stops the running command**, not the CLI: the process group gets SIGINT, then SIGTERM after 2 s, SIGKILL after 5 s. The executor ends the task right away (`ExecutorResult.interrupted`); with nothing running, Ctrl+C exits as before. `core/interrupt.ts` resumes stdin in raw mode while a command runs, because the chat pauses readline during execution.
+
+## Team mode (the "company") and reference pictures
+
+Opt-in, all local. `/team <task>` runs one task with the team, `/team` toggles it for every task, `run "task" --team` does it from the shell.
+
+- **Flow** (`src/team/orchestrator.ts`): Project Manager plans (one plain model call, JSON: goal, assumptions, risks, questions, <= 6 tasks with role + acceptance criteria) -> you approve the plan (skipped in auto-write mode and for dashboard runs) -> tasks run in order: `ux` writes a build spec (plain model call), the others run through the normal Executor with the existing agents (`design`, `dev`, `api`, `db`, `debug`, `qa`) -> **Safety Reviewer** (`safety`, `readOnly: true`) reads every written file and ends with `VERDICT: PASS|FAIL` -> on FAIL one fix round and one re-review -> PM delivery report built only from recorded facts (files written, commands run, verdict).
+- Roles and all prompts live in `src/team/roles.ts`. `safety` is not in `AGENTS` (not routable, not lockable); PM and UX are plain model calls without tools.
+- `AgentDefinition.readOnly` is enforced by the Executor: `write_file`/`append_file` are refused and only the read-only diagnostic allowlist may run.
+- Each engineer gets a fresh small context (assignment + acceptance criteria + short notes on earlier steps), not one growing conversation: that keeps a local model fast. If the user presses Ctrl+C during a command the team stops after that task.
+- If planning fails (bad JSON twice) or the plan is declined, the normal single-agent path runs.
+- **Reference pictures** (`src/vision/describe.ts`): `/image <path> [note]` or `run --image <path>`. The coding model cannot see, so a vision model reads the picture once into a text design brief (layout, components, colours, typography, states, open questions) that is added to every following task (`/image show`, `/image clear`). Reader order: local LM Studio vision model `AI_VISION_MODEL`, else Gemini (needs `GEMINI_API_KEY` and a yes at the prompt, because the image goes to Google). The brief is an estimate of the picture, not a pixel measurement.
 
 ## Gemini triage gateway (optional, off by default)
 
