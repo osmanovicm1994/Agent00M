@@ -213,6 +213,13 @@ npx ts-node src/cli.ts run "task" -p /path --serve   # one-shot run, same socket
 - Security: the socket binds to 127.0.0.1, rejects browser origins other than localhost:5173 (`AGENT_UI_ORIGINS` adds more), and commands (submit_task, answer_approval) are only accepted from connections that present the random token (`?token=`, constant-time compared). Without the token a page is read-only. The agent can write files and run commands, so keep the token URL private. Env: `AGENT_UI_PORT` (3001), `AGENT_UI_TOKEN` (fixed token instead of random), `AGENT_UI_URL` (UI base URL printed with the token), `AGENT_UI_HISTORY` (400 replayed events), `VITE_AGENT_WS` (frontend socket URL).
 - Wire protocol additions: client commands `ClientCommand` in `core/event-types.ts`; server messages `hello` (with `canControl`, `busy`), `event`, `busy`, `notice`.
 
+## Gemini as lead and architect, Qwen as worker
+
+- Roles: Gemini (free tier, `GEMINI_API_KEY` in `.env`) is the project lead and architect; the local Qwen is only the worker that reads, edits and runs commands. There is no paid cloud model (an Anthropic provider was removed; `factory.ts` throws for `anthropic`).
+- Triage plan (`src/gateway`): besides the problem, hypotheses and steps it now carries `architecture` (approach, techChoices, filesToTouch, constraints) and `checks`. `render.ts` hands it to Qwen as "ARCHITECT'S PLAN (you are the worker)": execute, do not redesign, finish only when every check was run.
+- Team mode: with Gemini triage ON (chat startup question, `/triage`, `--triage`, `AGENT_TRIAGE=on`) the Project Manager and the UX Designer run on Gemini through `TriageGateway.think()` -> `GeminiTriageClient.generateText()` (same model chain, retries and secret masking). `TeamOptions.think` is the hook; if Gemini fails the local model does the step. Engineers, the Safety Reviewer and the delivery report always run locally.
+- Privacy: what Gemini sees is the request, a file-name overview of the project, and (team mode) the reference-design text and the planner/UX prompts. No file contents. Free-tier Gemini traffic may be used by Google to improve its products, so keep it off for confidential projects.
+
 ## Known gaps
 
 - `src/tools/tools.test.ts` and `test-tools.ts` are entirely commented out; no test runner (vitest/jest) is installed.

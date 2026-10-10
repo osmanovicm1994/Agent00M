@@ -253,8 +253,9 @@ program
           // Optional Gemini triage: a plan for the local agent, plus a suggested agent.
           let planContext: string | undefined;
           let suggested: string | undefined;
-          if (opts.triage || triageEnv() === "on") {
-            const triage = new TriageGateway();
+          const triage = new TriageGateway();
+          const useTriage = Boolean(opts.triage) || triageEnv() === "on";
+          if (useTriage) {
             if (!triage.hasApiKey()) {
               console.log(pc.yellow("⚠ Triage requested but GEMINI_API_KEY is not set (put it in .env). Continuing without it."));
             } else {
@@ -276,6 +277,8 @@ program
               workspaceRoot,
               context: combinedContext,
               approvePlan: !executor.isAutoWrite(),
+              // Gemini leads (PM + UX) when you opted into Gemini; the local model is the worker.
+              think: useTriage && triage.hasApiKey() ? (s, u, m, j) => triage.think(s, u, m, j) : undefined,
             });
             if (team) {
               return {
@@ -643,6 +646,8 @@ program
               context: combinedContext,
               // You approve the plan in the terminal; auto-write mode and dashboard runs start without asking.
               approvePlan: origin === "terminal" && !executor.isAutoWrite(),
+              // Gemini leads (PM + UX) while Gemini triage is ON; the local model is the worker.
+              think: triageOn ? (s, u, m, j) => triage.think(s, u, m, j) : undefined,
             });
             if (team) {
               return {

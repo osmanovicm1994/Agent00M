@@ -104,6 +104,20 @@ export class TriageGateway {
       return null;
     }
   }
+
+  /**
+   * One Gemini call for a team lead role (Project Manager, UX Designer). Secrets are masked first.
+   * Returns null on any failure so the caller can fall back to the local model.
+   */
+  async think(system: string, user: string, maxTokens: number, json = false): Promise<string | null> {
+    try {
+      const { text } = await this.client.generateText(system, redactSecrets(user).text, { json, maxTokens: Math.max(maxTokens, 4096) });
+      return text;
+    } catch (err: any) {
+      console.log(pc.yellow(`⚠ Gemini lead step failed: ${err?.message ?? err}`));
+      return null;
+    }
+  }
 }
 
 /** Optional safety net (AGENT_TRIAGE_CONFIRM=1): let the developer veto the plan before it is used. */

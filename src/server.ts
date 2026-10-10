@@ -10,6 +10,7 @@ import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import pc from "picocolors";
 import { randomBytes, timingSafeEqual } from "crypto";
+import * as os from "os";
 import { AGENTS } from "./agents/definitions";
 import { bus } from "./core/events";
 import { control, MAX_ANSWER_CHARS } from "./core/control";
@@ -27,6 +28,24 @@ const DEFAULT_PORT = Number(process.env.AGENT_UI_PORT) || 3001;
 export const UI_BASE_URL = process.env.AGENT_UI_URL || "http://localhost:5173";
 const WS_OPEN = 1;
 const MAX_MESSAGE_BYTES = 64 * 1024;
+const WEB_PORT = Number(process.env.AGENT_UI_WEB_PORT) || 5173;
+
+// LAN mode (AGENT_UI_LAN=1, or `npm run chat:ui:lan`): the socket and the web app are reachable from
+// other devices on your home network, e.g. your phone. Off by default (loopback only).
+// Because the agent can run commands and write files, LAN mode requires the token for EVERY connection
+// (no read-only guests) and only accepts browser origins that are one of this machine's own addresses.
+export const LAN_MODE = ["1", "on", "true", "yes"].includes((process.env.AGENT_UI_LAN ?? "").trim().toLowerCase());
+
+// This machine's private IPv4 addresses (Wi-Fi / Ethernet), without loopback.
+export function lanAddresses(): string[] {
+  const out: string[] = [];
+  for (const nets of Object.values(os.networkInterfaces())) {
+    for (const n of nets ?? []) {
+      if (n.family === "IPv4" && !n.internal) out.push(n.address);
+    }
+  }
+  return out;
+}
 
 // The dashboard exposes what the agent reads, runs and writes, so only the local Vite dev server
 // (or origins you list in AGENT_UI_ORIGINS, comma separated) may connect from a browser.
@@ -35,7 +54,8 @@ function allowedOrigins(): Set<string> {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  return new Set(["http://localhost:5173", "http://127.0.0.1:5173", ...extra]);
+  const lan = LAN_MODE ? [...lanAddresses(), os.hostname()].map((h) => `http://${h}:${WEB_PORT}`) : [];
+  return new Set(["http://localhost:5173", "http://127.0.0.1:5173", ...lan, ...extra]);
 }
 
 function tokenMatches(given: string | undefined, expected: string): boolean {
@@ -86,6 +106,10 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
 
     const query = req.query as { token?: string };
     const canControl = tokenMatches(query.token, token);
+    if (LAN_MODE && !canControl) {
+      socket.close(1008, "token required");
+      return;
+    }
 
     const send = (message: ServerMessage) => {
       if (socket.readyState === WS_OPEN) socket.send(JSON.stringify(message));
@@ -150,12 +174,24 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
     socket.on("error", cleanup);
   });
 
-  // Loopback only: never reachable from the network.
-  await app.listen({ port, host: "127.0.0.1" });
+  // Loopback only unless LAN mode is on.
+  await app.listen({ port, host: LAN_MODE ? "0.0.0.0" : "127.0.0.1" });
   const url = `${UI_BASE_URL}/?token=${token}`;
   console.log(pc.cyan(`📡 Dashboard socket: ws://127.0.0.1:${port}/ws`));
   console.log(pc.cyan(`🖥  Dashboard (with control): ${url}`));
-  console.log(pc.dim("   Without the token it is read-only. Keep this URL private."));
+  if (LAN_MODE) {
+    const ips = lanAddresses();
+    if (ips.length === 0) {
+      console.log(pc.yellow("⚠ LAN mode is on but no network address was found. Are you connected to Wi-Fi?"));
+    }
+    for (const ip of ips) {
+      console.log(pc.green(`📱 Open on your phone (same Wi-Fi): http://${ip}:${WEB_PORT}/?token=${token}`));
+    }
+    console.log(pc.yellow("   LAN mode: anyone with this URL can control the agent. Keep it private; it changes every start."));
+  } else {
+    console.log(pc.dim("   Without the token it is read-only. Keep this URL private."));
+    console.log(pc.dim("   Want it on your phone? Use `npm run chat:ui:lan`."));
+  }
 
   return { port, token, url, close: () => app.close() };
 }

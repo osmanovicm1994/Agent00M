@@ -5,7 +5,9 @@
 //   request ─► Project Manager (plan) ─► you approve ─► for each task: UX spec / engineer (Executor loop)
 //           ─► Safety Reviewer (read-only) ─► one fix round if it finds blockers ─► PM delivery report
 //
-// Every step runs on the local model. Each engineer gets a fresh, small context (the assignment, the
+// Lead roles (Project Manager, UX) run on Gemini when `think` is given (the user opted into Gemini triage); with no
+// `think`, or when Gemini fails, they run on the local model. Engineers and the reviewer always run locally.
+// Each engineer gets a fresh, small context (the assignment, the
 // acceptance criteria and a short summary of earlier steps) rather than one ever-growing conversation,
 // which keeps a local model fast and focused.
 
@@ -56,6 +58,8 @@ export interface TeamOptions {
   context?: string;
   /** Ask the user to approve the PM's plan before work starts. */
   approvePlan: boolean;
+  /** Gemini hook for the lead roles. Returns null on failure (the local model then does the step). */
+  think?: (system: string, user: string, maxTokens: number, json?: boolean) => Promise<string | null>;
 }
 
 const MAX_SUMMARY = 700;
@@ -75,6 +79,16 @@ async function ask(llm: LLMProvider, system: string, user: string, maxTokens = 2
     { temperature: 0.2, maxTokens },
   );
   return res.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+}
+
+// A lead-role step: Gemini first when available, the local model otherwise.
+async function lead(opts: TeamOptions, system: string, user: string, maxTokens: number, json = false): Promise<string> {
+  if (opts.think) {
+    const text = await opts.think(system, user, maxTokens, json);
+    if (text) return text;
+    console.log(pc.dim("  (Gemini unavailable for this step, the local model takes over)"));
+  }
+  return ask(opts.llm, system, user, maxTokens);
 }
 
 function projectListing(root: string): string {
@@ -105,7 +119,7 @@ async function planWithPm(opts: TeamOptions): Promise<PmPlan> {
 
   let lastErr = "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await ask(opts.llm, PM_SYSTEM, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500);
+    const raw = await lead(opts, PM_SYSTEM, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500, true);
     try {
       const plan = parsePlan(raw);
       // Keep only roles that exist; unknown ones fall back to the general engineer.
@@ -185,7 +199,7 @@ function fallbackReport(r: Omit<TeamResult, "report">): string {
  * (the caller then falls back to the normal single-agent path).
  */
 export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
-  console.log(pc.bold("\n🏢 Team mode: Project Manager is planning …"));
+  console.log(pc.bold(`\n🏢 Team mode: Project Manager is planning${opts.think ? " (Gemini)" : ""} …`));
 
   let plan: PmPlan;
   try {
@@ -227,7 +241,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
           `<goal>${plan.goal}</goal>\n<task>${t.title}\n${t.instructions}</task>\n` +
           `<project_files_top_level>\n${projectListing(opts.workspaceRoot)}\n</project_files_top_level>` +
           (opts.context ? `\n\n<reference_and_context>\n${clip(opts.context, 6000)}\n</reference_and_context>` : "");
-        uxSpec = await ask(opts.llm, UX_SYSTEM, user, 3000);
+        uxSpec = await lead(opts, UX_SYSTEM, user, 3000);
         console.log(pc.dim(clip(uxSpec, 1200)));
         notes.push(`- UX Designer wrote a build spec for: ${t.title}`);
         outcomes.push({ role: t.role, title: t.title, status: "done", summary: "UX spec written" });

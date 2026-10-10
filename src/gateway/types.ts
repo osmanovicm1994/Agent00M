@@ -29,8 +29,18 @@ const xySchema = z.object({
   note: text,
 });
 
+// The architect's design for build/change tasks: what to build, what to use, where.
+const architectureSchema = z.object({
+  approach: text,
+  techChoices: list(z.string()),
+  filesToTouch: list(z.object({ path: text, change: text })),
+  constraints: list(z.string()),
+});
+
 export const planSchema = z.object({
   clarifiedProblem: text,
+  architecture: architectureSchema.nullish().transform((v) => v ?? architectureSchema.parse({})),
+  checks: list(z.string()),
   xy: xySchema.nullish().transform((v) => v ?? xySchema.parse({})),
   workspaces: list(
     z.object({
@@ -94,6 +104,24 @@ export function buildResponseSchema(toolNames: string[], agentIds: string[]): Re
     type: "object",
     properties: {
       clarifiedProblem: { type: "string", description: "The real problem in 1-3 sentences, free of the XY trap." },
+      architecture: {
+        type: "object",
+        description: "The design for build/change tasks. Leave fields empty for pure debugging.",
+        properties: {
+          approach: { type: "string", description: "How to build it, in 2-5 sentences: structure, data flow, key decisions." },
+          techChoices: { ...strList, description: "What to use: existing libraries/patterns of the project first. Maximum 6." },
+          filesToTouch: {
+            type: "array",
+            description: "Files to create or change. Maximum 10. Prefix new files with 'new: '.",
+            items: { type: "object", properties: { path: str, change: str }, required: ["path", "change"] },
+          },
+          constraints: { ...strList, description: "Rules the worker must follow (conventions, things not to touch). Maximum 5." },
+        },
+      },
+      checks: {
+        ...strList,
+        description: "2-5 concrete checks the worker must run or confirm before saying it is done (exact commands or observable results).",
+      },
       xy: {
         type: "object",
         properties: {
