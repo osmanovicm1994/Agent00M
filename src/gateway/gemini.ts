@@ -234,6 +234,59 @@ export class GeminiTriageClient {
   }
 
   /**
+   * One free-form Gemini answer (text or JSON) through the model chain. Used for the team's lead roles
+   * (Project Manager, UX): thinking steps that need no repository access.
+   */
+  async generateText(systemInstruction: string, userContent: string, opts: { json?: boolean; maxTokens?: number } = {}): Promise<{ text: string; model: string }> {
+    const client = await this.getClient();
+    const order = this.activeModel ? [this.activeModel, ...this.models.filter((m) => m !== this.activeModel)] : this.models;
+    let lastError = "no attempt was made";
+
+    for (const model of order) {
+      let attempts = 0;
+      while (attempts < 2) {
+        attempts++;
+        const controller = new AbortController();
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, this.timeoutMs);
+        try {
+          const response = await client.models.generateContent({
+            model,
+            contents: userContent,
+            config: {
+              systemInstruction,
+              ...(opts.json ? { responseMimeType: "application/json" } : {}),
+              maxOutputTokens: opts.maxTokens ?? 8192,
+              ...thinkingConfig(),
+              abortSignal: controller.signal,
+            },
+          });
+          const text = (response.text ?? "").trim();
+          if (!text) throw new Error("empty answer");
+          this.activeModel = model;
+          return { text, model };
+        } catch (err: any) {
+          const message = timedOut ? "no answer in time" : String(err?.message ?? err).split("\n")[0].slice(0, 300);
+          lastError = `${model}: ${message}`;
+          const kind = timedOut ? "timeout" : classify(err);
+          if (kind === "fatal") throw new TriageError(`Gemini rejected the request (${message}). Check GEMINI_API_KEY.`, true);
+          if (kind === "transient" && attempts < 2) {
+            await sleep(2000);
+            continue;
+          }
+          break; // next model
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    }
+    throw new TriageError(`No Gemini model answered (tried ${order.join(", ")}). Last error: ${lastError}`);
+  }
+
+  /**
    * Free-text answer about one image (used by `/image` to turn a screenshot or mockup into a design brief).
    * Tries the model chain; overloaded, slow or retired models are skipped.
    */

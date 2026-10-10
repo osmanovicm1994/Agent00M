@@ -16,18 +16,31 @@ function clip(s: string, max: number): string {
 function build(plan: TriagePlan, maxSteps: number, maxHypotheses: number): string {
   const out: string[] = [];
 
-  out.push("## EXTERNAL TRIAGE PLAN");
+  out.push("## ARCHITECT'S PLAN (you are the worker)");
   out.push(
-    "Written by a reviewer who could NOT see the repository. Hypotheses are unverified: confirm them with your tools before " +
-      "changing anything. Follow the steps in order, but if real output contradicts the plan, follow the evidence. Paths " +
-      "that are not in the project tree must be located with find_files or grep first. A fix counts only after the " +
-      "failing command passes.",
+    "Written by the project lead/architect, who could NOT see the repository. You execute it; you do not redesign it. " +
+      "Follow the design and the steps in order. If real output contradicts the plan, follow the evidence and say so in " +
+      "your final answer. Hypotheses are unverified: confirm them with your tools before changing anything. Paths that " +
+      "are not in the project tree must be located with find_files or grep first. You are done only when every check " +
+      "listed below has been run or confirmed and you can name its result.",
   );
 
   if (plan.clarifiedProblem) out.push(`\nProblem: ${clip(plan.clarifiedProblem, 400)}`);
   if (plan.xy.isXYProblem || plan.xy.likelyRealGoal) {
     const flag = plan.xy.isXYProblem ? "XY problem: yes. " : "";
     out.push(`Real goal: ${flag}${clip(plan.xy.likelyRealGoal || plan.xy.note, 300)}`);
+  }
+
+  const a = plan.architecture;
+  if (a.approach || a.techChoices.length || a.filesToTouch.length || a.constraints.length) {
+    out.push("\nDesign:");
+    if (a.approach) out.push(`Approach: ${clip(a.approach, 600)}`);
+    if (a.techChoices.length) out.push(`Use: ${a.techChoices.slice(0, 6).map((s) => clip(s, 140)).join(" | ")}`);
+    if (a.filesToTouch.length) {
+      out.push("Files:");
+      a.filesToTouch.slice(0, 10).forEach((f) => out.push(`- ${clip(f.path, 120)}${f.change ? `: ${clip(f.change, 160)}` : ""}`));
+    }
+    if (a.constraints.length) out.push(`Rules: ${a.constraints.slice(0, 5).map((s) => clip(s, 140)).join(" | ")}`);
   }
 
   if (plan.workspaces.length) {
@@ -55,6 +68,7 @@ function build(plan: TriagePlan, maxSteps: number, maxHypotheses: number): strin
     });
   }
 
+  if (plan.checks.length) out.push(`\nChecks before you finish: ${plan.checks.slice(0, 5).map((s, i) => `(${i + 1}) ${clip(s, 180)}`).join(" ")}`);
   if (plan.stopConditions.length) out.push(`\nStop and report if: ${plan.stopConditions.slice(0, 4).map((s) => clip(s, 160)).join(" | ")}`);
   if (plan.risks.length) out.push(`Risks: ${plan.risks.slice(0, 3).map((s) => clip(s, 160)).join(" | ")}`);
   if (plan.docsToCheck.length) {
@@ -102,6 +116,11 @@ export function printTriageSummary(plan: TriagePlan, meta: TriageMeta): void {
   if (plan.workspaces.length) {
     console.log(`  ${pc.bold("Workspaces:")} ${plan.workspaces.slice(0, 5).map((w) => `${w.kind}@${w.path || "."} (${w.confidence || "?"})`).join(", ")}`);
   }
+  if (plan.architecture.approach) console.log(`  ${pc.bold("Design:")} ${clip(plan.architecture.approach, 300)}`);
+  if (plan.architecture.filesToTouch.length) {
+    console.log(`  ${pc.bold("Files:")} ${plan.architecture.filesToTouch.slice(0, 6).map((f) => f.path).join(", ")}`);
+  }
+  if (plan.checks.length) console.log(`  ${pc.bold("Checks:")} ${plan.checks.length} planned`);
   plan.hypotheses.slice(0, 3).forEach((h, i) => console.log(`  ${pc.bold(`Hypothesis ${i + 1}:`)} ${clip(h.hypothesis, 200)}`));
   console.log(
     `  ${pc.bold("Plan:")} ${plan.steps.length} step(s)${meta.recommendedAgent ? ` · agent: ${meta.recommendedAgent}` : ""}` +

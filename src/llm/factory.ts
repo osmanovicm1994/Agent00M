@@ -13,9 +13,8 @@ export function createProvider(id: ProviderId = "lmstudio", config?: LMStudioCon
       baseProvider = new LMStudioProvider(config);
       break;
     case "anthropic":
-      throw new Error(
-        "Anthropic provider not implemented yet — this is the plug point for adding it later.",
-      );
+      // Intentionally not implemented: the agent's brain is the local model (worker) plus Gemini (architect, see src/gateway).
+      throw new Error("Anthropic provider is not implemented. The agent uses the local model; Gemini plans via the triage gateway.");
     default:
       throw new Error(`Unknown LLM provider: ${id}`);
   }
