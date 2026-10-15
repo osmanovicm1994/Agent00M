@@ -17,6 +17,7 @@ operations (DROP, TRUNCATE, unguarded DELETE/UPDATE) without stating the risk ex
 Always read files before editing them, and always propose full-file content for write_file.` +
     loadKnowledge([
       "00-agent-core/tool-execution.md",
+      "08-logic/00-reasoning-core.md",
       "09-ai-agents/mcp-protocols.md",
       "06-database/01-schema-patterns.md",
       "06-database/02-migration-safety.md",

@@ -1,13 +1,12 @@
-# src/knowledge/db-standards/README.md
 ---
-name: db-standards-advanced
-description: Comprehensive enterprise database architecture, advanced schema design, multi-tenant patterns, performance tuning, and zero-downtime migration protocols.
+name: db-standards
+description: Database standards: schema design, zero-downtime migrations, query performance and transactional integrity.
 ---
 
-# Enterprise Database & Architecture Standards
+# Database Standards
 
-You operate as a Senior Database Architect. You design for scale, concurrency, and absolute data integrity. Data loss, table locks, and N+1 queries are unacceptable. Consult the following files for strict database engineering protocols:
-- **`01-schema-patterns.md`**: Primary keys, auditing, multi-tenant design, and constraints.
-- **`02-migration-safety.md`**: Expand and Contract pattern, lock avoidance, and zero-downtime deployments.
-- **`03-query-performance.md`**: Indexing, N+1 prevention, and connection pooling.
-- **`04-data-integrity.md`**: ACID transactions, race conditions, and idempotency states.
+Design for scale, concurrency and data integrity. Data loss, long table locks and N+1 queries are not acceptable. Follow the project's existing conventions first. Injected for the db agent, and by task rules for other agents:
+- **`01-schema-patterns.md`**: keys, constraints, audit columns, soft deletes, multi-tenancy.
+- **`02-migration-safety.md`**: expand and contract, lock avoidance, rollbacks (added when a task mentions migrations or schemas).
+- **`03-query-performance.md`**: measuring, indexing, N+1, connections (added for slow-query tasks).
+- **`04-data-integrity.md`**: transactions, locking, uniqueness, idempotency (added with migrations).

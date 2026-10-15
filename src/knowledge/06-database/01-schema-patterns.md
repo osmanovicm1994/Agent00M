@@ -1,15 +1,21 @@
-# src/knowledge/db-standards/01-schema-patterns.md
 # Schema Design & Data Modeling
 
-## 1. Primary Keys & Identifiers
-- **Never use auto-incrementing integers (`SERIAL`) for public-facing primary keys.** They expose business volume and are vulnerable to enumeration attacks.
-- Use UUIDv7 or ULID for primary keys. They are lexicographically sortable, which prevents B-Tree index fragmentation common with UUIDv4, while maintaining decentralized generation.
+Follow the project's existing conventions (key type, naming, soft-delete style) over the defaults below; these apply to new tables and projects with no convention.
 
-## 2. Audit Columns & Soft Deletes
-- Every table must include `created_at` (immutable) and `updated_at` (auto-updating via trigger or ORM middleware).
-- Do not use hard `DELETE` for core domain entities. Implement a `deleted_at` timestamp. Queries must automatically filter out `deleted_at IS NOT NULL` via ORM global scopes or database Row-Level Security (RLS).
+## 1. Keys and identifiers
+- Do not expose auto-incrementing integers in public URLs: they leak volume and invite enumeration. Use UUIDv7 or ULID (time-ordered, so B-tree inserts stay compact; UUIDv4 fragments indexes). Internal join tables may keep integers.
 
-## 3. Multi-Tenancy Architecture
-- In a shared-schema multi-tenant environment, every table belonging to a tenant MUST have a `tenant_id` column.
-- The `tenant_id` must be part of the composite primary key or included in a composite unique index for all unique constraints to prevent cross-tenant data collision.
-- Use Row-Level Security (RLS) in PostgreSQL to enforce tenant isolation at the database engine level, independent of application logic.
+## 2. Constraints do the enforcing
+- Put rules in the database, not only in code: `NOT NULL`, `UNIQUE`, `CHECK`, foreign keys. Application validation can be bypassed by a second code path, a script or a race.
+- Choose `ON DELETE` on purpose (RESTRICT by default, CASCADE only for true ownership). Index every foreign key.
+- Money: `numeric(p,s)` or integer minor units, never float. Timestamps: `timestamptz` (UTC). Enums: a native enum or a lookup table, not free strings.
+
+## 3. Audit columns and soft deletes
+- Core tables get `created_at` (immutable) and `updated_at` (trigger or ORM hook).
+- For core domain entities prefer `deleted_at` over hard `DELETE`; every read path must filter it (ORM global scope or a view). A unique constraint on a soft-deleted table needs a partial index (`WHERE deleted_at IS NULL`).
+
+## 3b. Multi-tenancy
+- Shared-schema tenancy: every tenant table has `tenant_id`, included in composite unique indexes and in every query. Enforce isolation in the database with Row-Level Security (PostgreSQL), not only in application code.
+
+## 4. Change safely
+- Schema changes go through the project's migration tool as new migrations; see `02-migration-safety.md`.

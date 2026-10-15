@@ -1,167 +1,34 @@
-# Android Build and Debug Standards
+# Android Build and Debug
 
-## 1. Gradle and project configuration
+## Gradle and configuration
+- Inspect the wrapper, AGP, Kotlin, JDK and SDK versions before touching build config. Use `./gradlew` (or `gradlew.bat`), never a global Gradle. Keep versions in the project's version catalog or convention plugins.
+- No upgrades of Gradle, AGP, Kotlin or major dependencies inside an unrelated change. No machine-specific paths or secrets in Gradle files; the build must work on a clean checkout and in CI.
+- Follow existing flavors, build types, signing and environment config. Never disable minification, lint, tests or security checks to hide a problem. Never commit keystores or passwords. Check that each variant uses the right application id, endpoint and flags.
 
--   Inspect the project's Gradle wrapper, Android Gradle Plugin (AGP),
-    Kotlin, JDK, and SDK versions before changing build configuration.
--   Use the repository's Gradle wrapper (`./gradlew` or `gradlew.bat`)
-    rather than a globally installed Gradle version.
--   Keep plugin and dependency versions centralized using the project's
-    existing version catalog or convention plugins.
--   Avoid upgrading Gradle, AGP, Kotlin, or major dependencies as part
-    of an unrelated feature.
--   Do not hard-code local machine paths or commit machine-specific
-    configuration.
--   Keep secrets out of Gradle files and source control; use approved
-    local/CI secret configuration.
--   Prefer configuration that works on a clean checkout and in CI.
-
-## 2. Build variants and configuration
-
--   Follow existing product flavors, build types, signing setup, and
-    environment configuration.
--   Keep debug and release behavior intentionally separated.
--   Do not disable minification, lint, tests, or security checks merely
-    to hide a build problem.
--   Never commit signing keys, keystores, passwords, or production
-    credentials.
--   Verify that the correct application ID, endpoint, and feature flags
-    are used for each variant.
--   Avoid leaking production endpoints or sensitive configuration into
-    debug logs and artifacts.
-
-## 3. Standard commands
-
-Run commands from the Android project root. Use the Gradle wrapper.
-
-### macOS/Linux
-
-``` bash
+## Commands (project root, wrapper)
+```
 ./gradlew tasks
 ./gradlew assembleDebug
-./gradlew test
-./gradlew lint
-./gradlew connectedDebugAndroidTest
+./gradlew testDebugUnitTest      # or: ./gradlew test
+./gradlew lintDebug              # or: ./gradlew lint
+./gradlew connectedDebugAndroidTest   # needs an emulator or device
 ```
+Run the narrowest relevant task first, then broader checks. Add `--stacktrace` or `--info` for targeted diagnosis; `--debug` only when needed (large, may expose sensitive data).
 
-### Windows
+## Debug workflow
+1. Reproduce and note the variant, device or emulator, and API level.
+2. Read the FIRST meaningful error in Gradle output or Logcat; later errors are often cascades.
+3. Classify: configuration, compilation, dependency resolution, runtime/lifecycle, network, device-specific.
+4. Make the smallest change, re-run the failing task, then the related tests. For generated code or config changes, also do a clean build.
+5. Report the checks actually run and remaining uncertainty.
 
-``` bat
-gradlew.bat tasks
-gradlew.bat assembleDebug
-gradlew.bat test
-gradlew.bat lint
-gradlew.bat connectedDebugAndroidTest
-```
+## Logcat and devices
+- `adb devices`, `adb logcat` (filter by package, tag or level), `adb logcat -s AndroidRuntime`. Keep full stack traces and causes; redact tokens and personal data before sharing logs.
+- ADB trouble: check `adb devices`, cable/USB mode and authorization; restart with `adb kill-server && adb start-server` only if needed. Emulator trouble: logs, disk space, virtualization, system-image compatibility. Emulators do not reproduce OEM or hardware behavior.
 
-Run the narrowest relevant task first, then broader checks as time and
-environment allow. Some tasks may require an emulator or connected
-device.
+## Dependency and build failures
+- Inspect resolution errors, repositories, version conflicts and JDK/AGP compatibility before changing versions. Do not force versions or add duplicate repositories without understanding the conflict. Check KSP/KAPT compatibility for generated sources.
+- Do not delete caches or `clean` as a first reaction; confirm the cause first. Warnings are not failures unless configured as errors.
 
-## 4. Debugging workflow
-
-1.  Reproduce the issue and record the exact steps, build variant,
-    device/emulator, and API level.
-2.  Read the first meaningful error in Gradle output or Logcat; later
-    errors may be cascading failures.
-3.  Determine whether the failure is configuration, compilation,
-    dependency resolution, runtime, lifecycle, network, or
-    device-specific.
-4.  Make the smallest targeted change and rerun the failing task.
-5.  Run relevant tests and a clean build when the change could affect
-    generated code or configuration.
-6.  Report the actual checks performed and any remaining uncertainty.
-
-## 5. Logcat and diagnostics
-
--   Use Android Studio Logcat or `adb logcat` to capture runtime errors.
--   Filter by package, process, tag, or severity to reduce noise.
--   Preserve stack traces and the original exception cause when
-    diagnosing failures.
--   Redact tokens, passwords, session identifiers, personal data, and
-    sensitive payloads before sharing logs.
--   Do not leave verbose debug logging of sensitive data enabled in
-    release builds.
--   Avoid swallowing exceptions or replacing useful diagnostics with
-    generic messages.
-
-Example:
-
-``` bash
-adb devices
-adb logcat
-adb logcat -s AndroidRuntime
-```
-
-## 6. Emulator and device troubleshooting
-
--   Confirm the selected device is online and the expected API level is
-    installed.
--   For ADB issues, check `adb devices`, cable/USB mode, device
-    authorization, and OEM drivers on Windows.
--   Restart the ADB server only when needed:
-
-``` bash
-adb kill-server
-adb start-server
-adb devices
-```
-
--   For emulator issues, check emulator logs, available disk space,
-    virtualization support, and system-image compatibility.
--   Do not assume an emulator reproduces OEM-specific behavior or
-    physical hardware capabilities.
--   For permissions, notifications, background execution, and
-    biometrics, validate on appropriate API levels and real devices when
-    necessary.
-
-## 7. Dependency and build failures
-
--   Inspect dependency-resolution errors, repository configuration,
-    version conflicts, and JDK/AGP compatibility before changing
-    versions.
--   Use `--stacktrace` or `--info` for targeted diagnostics; use
-    `--debug` only when necessary because it can produce large,
-    sensitive logs.
--   Avoid deleting caches as a first response. Confirm the cause before
-    using `clean` or invalidating caches.
--   Do not add duplicate repositories or force dependency versions
-    without understanding the conflict.
--   Check generated sources, KSP/KAPT configuration, and annotation
-    processor compatibility when relevant.
--   Treat deprecation warnings separately from actual build failures
-    unless warnings are configured as errors.
-
-Example:
-
-``` bash
-./gradlew assembleDebug --stacktrace
-./gradlew testDebugUnitTest
-./gradlew lintDebug
-```
-
-## 8. Performance and release readiness
-
--   Measure startup, rendering, memory, and battery issues with
-    appropriate profiling tools rather than guessing.
--   Validate release builds, shrinking/obfuscation, resource handling,
-    and app startup where applicable.
--   Check app permissions, exported components, network security
-    configuration, and manifest changes during release review.
--   Ensure crash reporting and logging do not expose secrets or personal
-    data.
--   Confirm build artifacts and test reports are generated at expected
-    paths before relying on them in CI.
-
-## 9. Build/debug review checklist
-
--   [ ] Wrapper and toolchain versions are respected.
--   [ ] No unrelated dependency or plugin upgrades were introduced.
--   [ ] Debug and release configuration remain correct.
--   [ ] Errors were diagnosed from primary evidence, not guessed at.
--   [ ] Relevant tests, lint, and build tasks were run or clearly marked
-    as not run.
--   [ ] Logs and artifacts contain no secrets or unnecessary personal
-    data.
--   [ ] Device-specific behavior is validated on appropriate hardware
-    when needed.
+## Release readiness
+- Profile startup, rendering, memory and battery instead of guessing. Validate release builds (shrinking, obfuscation, resources), exported components, manifest and network security config. Logs and crash reports must not leak secrets or personal data.

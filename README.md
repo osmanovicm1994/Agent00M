@@ -1,230 +1,63 @@
-```markdown
 # agent-cli
 
-Local Copilot-CLI / Claude-Code-style multi-agent coding system backed by DeepSeek R1 via LM Studio or cloud LLM providers (e.g., NVIDIA NIM). 
+A local, Copilot-CLI-style coding agent. It runs a tool-using loop against a **local model served by LM Studio** (OpenAI-compatible API on `localhost:1234`), reads and writes files in a *target project*, routes each task to a specialist agent, and asks you to approve every file write and shell command (unless auto mode is on).
 
-Built as a standalone CLI tool that operates safely against any target project directory with session workspace locking, fast local command interceptors, dynamic domain skill injection, and a modular registry architecture.
+Everything runs locally by default. The only feature that sends data off the machine is the optional Gemini research stage (opt-in).
 
----
+The current references are `CLAUDE.md` (architecture and conventions) and `docs/AGENTS.md` (agents, routing, knowledge). `docs/MODELS.md` covers models and LM Studio settings.
 
-## Directory Layout
-
-```text
-agent-cli/
-├── src/
-│   ├── cli.ts                  # Main CLI entry point (Commander setup & chat loop)git check
-│   ├── agents/
-│   │   ├── helpers.ts          # Utility functions (e.g., loadSkill for prompt enrichment)
-│   │   ├── definitions.ts      # Agent registry & lookup dispatcher
-│   │   ├── router.ts           # Automatic task router selecting specialist agents
-│   │   └── list/               # Individual agent definitions (Registry Pattern)
-│   │       ├── dev.ts          # Development Agent
-│   │       ├── api.ts          # API & Backend Agent
-│   │       ├── db.ts           # Database Architect Agent
-│   │       ├── design.ts       # UI/UX Design Agent
-│   │       ├── logic.ts        # Logical Architecture Strategist
-│   │       └── kb-harvester.ts # Knowledge Base Harvester Agent
-│   │       └── debug.ts        # Problem solving Agent
-│   ├── core/
-│   │   ├── executor.ts         # Plan-act execution loop & safety guardrails
-│   │   └── tools/              # File system & shell command tool execution
-│   ├── knowledge/              # Markdown-based domain skill guidelines
-│   │   ├── 00-agent-core/      # Standard coding rules loaded via loadSkill()
-│   │   ├── 01-arhitecture/
-│   │   ├── 02-qa-automation/
-│   │   ├── 03-mobile/
-│   │   └── 04-frontend/
-│   │   └── 05-backend/
-│   │   └── 06-database/
-│   │   └── 07-api/
-│   │   └── 08-logic/
-│   │   └── 09-ai-agents/
-│   │   └── 10-design/
-│   │   └── 11-kb/
-│   │   └── uupm/
-│   └── llm/
-│       ├── factory.ts          # LLM provider initialization
-│       └── providers/          # Provider adapters (LM Studio, NVIDIA NIM, OpenAI)
-├── .env.example
-├── package.json
-├── tsconfig.json
-└── README.md
-
-```
-
----
-
-## Key Features
-
-* **Session Workspace Locking:** Prompts for the target project path on startup and locks all file execution tools (`read_file`, `write_file`, `list_directory`, `grep`) strictly to that target workspace root.
-* **Registry Pattern Architecture:** Specialist agents live in isolated files under `src/agents/list/`, keeping definitions clean, scalable, and independent.
-* **Dynamic Skill Injection (`loadSkill`):** System prompts dynamically import markdown guidelines from `src/knowledge/` to inject domain expertise into agents without hardcoding large prompt strings.
-* **Zero-Latency Local Interceptors:** System queries like listing agents, manual agent locking, clearing output, or displaying workspace paths bypass LLM API calls entirely.
-* **Safety-First Execution:** Read-only operations proceed automatically, while state-changing disk writes (`write_file`) and shell executions (`run_command`) require explicit user confirmation.
-
----
-
-## Setup
-
-### 1. Configure Your LLM Provider
-
-* **LM Studio (Local):** Start LM Studio, load your model (e.g., Qwen3 Coder), and start the local server (default port `1234`). Note the exact model identifier.
-* **NVIDIA NIM / Cloud APIs:** Set your provider base URL and API keys in your `.env` file.
-
-### 2. Environment Configuration
-
-Copy `.env.example` to `.env` and set your runtime options:
-
-```bash
-cp .env.example .env
-
-```
-
-Example `.env`:
-
-```env
-AI_PROVIDER=lmstudio
-AI_MODEL_NAME=qwen/qwen3-coder-30b
-LMSTUDIO_BASE_URL=http://localhost:1234/v1
-
-```
-
-### 3. Install & Build
+## Quick start
 
 ```bash
 npm install
-npm run build
-
+npm run web:install            # once, only if you want the live dashboard
+cp .env.example .env           # API keys go here (GEMINI_API_KEY, BRAVE_API_KEY, ...), never in .env.local
+npm run chat                   # interactive session with .env.local
+npm run chat:ui                # chat + live web dashboard
 ```
 
----
+In LM Studio: start the local server, load the model, and set its **context length** larger than prompt + `AI_MAX_TOKENS`.
 
-## Usage
-
-### Interactive Multi-Agent Session (Recommended)
-
-Launch the interactive chat interface:
+One-shot tasks:
 
 ```bash
-npm run chat
-
+npx ts-node src/cli.ts run "add a health check endpoint" -p /path/to/project
+npx ts-node src/cli.ts run "npm run dev:api fails" -p /path/to/project -a debug
+npx ts-node src/cli.ts run "add checkout with API, DB and UI" -p /path/to/project --team
+npx ts-node src/cli.ts agents
 ```
 
-On startup, lock your session to your target workspace path:
+## Commands
 
-```text
-🤖 Interactive Multi-Agent CLI Started.
+| Command | What it does |
+| --- | --- |
+| `npm run typecheck` | `tsc --noEmit` (run after every change) |
+| `npm test` | Unit tests (vitest): tools, routing, knowledge selection, command safety, cache, registry |
+| `npm run build` | `tsc` to `dist/` (tests excluded) |
+| `npm run models` / `npm run bench` | List LM Studio models / measure speed and tool calling |
+| `npm run search:test -- "query"` | Diagnose web search engines |
 
-Are you working on an existing project? (y/N): y
-Enter the absolute path to the project: /Users/mustafaosmanovic/testLocalMustafa/WEB PROJECT/PREOBUCI
+Chat slash commands: `/help` lists them (`/agents`, `/use <id>`, `/auto`, `/model`, `/auto-write`, `/auto-run`, `/research`, `/plan`, `/team`, `/image`, `/clear`, `/exit`).
 
-✅ Workspace locked to: /Users/mustafaosmanovic/testLocalMustafa/WEB PROJECT/PREOBUCI
-Type 'help' or '/help' for options, your task, or 'exit' to quit.
+## How a task is handled
 
-[auto] User > 
+1. **Routing** (`src/agents/router.ts`, signals in `src/agents/orchestration.ts`): forced agent (`-a`, `/use`) > research-stage recommendation > keyword score with one strict winner > one capped model call > `dev`.
+2. **Standards** (`src/knowledge/`): each agent always carries its own standards, the project's stack standards are detected automatically, and **task-specific standards** (logic standards such as edge cases, decomposition, distributed work, root causes; cross-domain files such as migration safety) are added from the task text.
+3. **Execution** (`src/core/executor.ts`): read-only tools run together, writes and commands run one per turn with approval. Safety gates stay on in every mode.
+4. **Team mode** (`/team`, `--team`): a Project Manager plans, engineers build, a read-only Safety Reviewer checks.
 
-```
+Agents: `dev`, `api`, `db`, `design` (frontend developer), `logic`, `kb-harvester`, `qa`, `debug`, `research`.
 
-### Local Commands Reference
+## Safety
 
-Intercepted locally at zero cost without invoking LLM API calls:
+- File tools are scoped to the target project. Real `.env` files cannot be read.
+- Every write shows a diff and asks, unless auto mode is on. Risky commands (rm, sudo, git push/reset, kill, publish, shell redirects and `sed -i` that bypass the write gates ...) ask even in auto mode.
+- **There is no sandbox.** Auto mode runs model-chosen commands on your machine. Use it only on projects under git; the agent warns when it is not.
 
-| Command | Slash Alias | Description |
-| --- | --- | --- |
-| `show agents` | `/agents` | List all available specialist agents with descriptions |
-| `use <agent_id>` | `/use <id>` | Lock session directly to a specific agent (e.g., `use kb-harvester`) |
-| `auto` | `/auto` | Unlock agent and return to automatic task routing |
-| `show project` | `/project` | Display the currently locked workspace path |
-| `clean` / `clear` | `/clear` | Clear the terminal screen |
-| `help` | `/help` | Print the command cheatsheet |
-| `exit` / `quit` | `/exit` | Terminate the CLI session |
+## Seeing the UI
 
----
+The model cannot see pictures. The `inspect_page` tool renders a localhost dev server (or a static `.html` file) in headless Chromium and returns facts: console errors, failed requests, horizontal overflow at phone and desktop widths, structure and accessibility problems. Run `npx playwright install chromium` once. Visual design still needs a human look.
 
-### Direct Task Execution
+## Adding things
 
-Run single, standalone tasks from the terminal:
-
-```bash
-# Auto-route task in the current workspace
-npm run dev -- run "add a health check endpoint"
-
-# Target a specific workspace and force an agent
-npm run dev -- run "Scan project and build architecture docs" \
-  --project "/Users/mustafaosmanovic/testLocalMustafa/WEB PROJECT/PREOBUCI" \
-  --agent kb-harvester
-
-```
-
-List registered agents from the CLI:
-
-```bash
-npm run dev -- agents
-
-```
-
----
-
-## How It Works
-
-1. **Workspace Binding:** The target directory is captured during launch and passed to the `Executor` instance. All tool file paths are validated and resolved against this target root.
-2. **Task Routing & Agent Lock:**
-* In **Auto Mode** (`[auto]`), `router.ts` evaluates the task description against registered agent capabilities and selects the appropriate specialist.
-* In **Locked Mode** (`[agent-id]`), task routing is bypassed to eliminate latency.
-
-
-3. **Dynamic Prompt Assembly:** The agent's base system prompt is loaded alongside domain-specific standards via `loadSkill()` from `src/knowledge/`.
-4. **Plan-Act Loop:** The agent generates tool calls (`list_directory`, `read_file`, `write_file`, `run_command`). Read-only actions run immediately; write or shell operations require manual `y/n` approval.
-
----
-
-## Adding a New Agent
-
-1. Create a file under `src/agents/list/` (e.g., `src/agents/list/tester.ts`):
-```typescript
-import { AgentDefinition } from "../definitions";
-import { loadSkill } from "../helpers";
-
-export const testerAgent: AgentDefinition = {
-  id: "tester",
-  name: "Test Automation Agent",
-  description: "Writes, refactors, and runs unit, integration, and E2E test suites.",
-  systemPrompt: `You are a QA and test automation specialist...` + loadSkill("testing-standards"),
-};
-
-```
-
-
-2. Register the agent in `src/agents/definitions.ts`:
-```typescript
-import { testerAgent } from "./list/tester";
-
-export const AGENTS: AgentDefinition[] = [
-  devAgent,
-  apiAgent,
-  dbAgent,
-  designAgent,
-  logicAgent,
-  kbHarvesterAgent,
-  testerAgent, // <-- Registered here
-];
-
-```
-
-
-
----
-
-## Adding a New LLM Provider
-
-To integrate a new model provider (e.g., Anthropic, Ollama, OpenAI):
-
-1. Implement the `LLMProvider` interface in `src/llm/types.ts`.
-2. Create the provider adapter under `src/llm/providers/` (e.g., `src/llm/providers/anthropic.ts`).
-3. Add a creation case in `src/llm/factory.ts`.
-
-No modifications to agent definitions, core tool execution, or routing logic are required.
-
-```
-
-```
+New agent, tool or knowledge file: see `docs/AGENTS.md` section 5 and the Conventions section of `CLAUDE.md`. In short: create `src/agents/list/<id>.ts`, **register it in `src/agents/definitions.ts`**, add routing signals in `src/agents/orchestration.ts` only if they are specific, and run `npm run typecheck && npm test`.

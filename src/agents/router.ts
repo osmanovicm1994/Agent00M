@@ -1,46 +1,44 @@
 import type { LLMProvider } from "../llm/types";
 import { bus, truncate } from "../core/events";
 import { AGENTS, getAgent, type AgentDefinition } from "./definitions";
+import { detectStackKnowledge } from "./helpers";
+import { describeSignals, pickByKeywords, rankDomains, type DomainScore } from "./orchestration";
 
-// Cheap keyword scoring: when exactly one specialist clearly wins, route
-// instantly and skip an LLM round-trip (slow on a local 32B model). Anything
-// ambiguous still goes to the model. Keywords are deliberately specific;
-// generic words like "test" or "fix" are NOT here so they fall through.
-const KEYWORDS: Record<string, RegExp[]> = {
-  qa: [/appium/i, /playwright/i, /selenium/i, /\be2e\b/i, /page object/i, /locator/i, /test automation/i, /xcuitest/i, /espresso/i, /flaky/i, /nunit/i],
-  db: [/\bschema\b/i, /migration/i, /\bsql\b/i, /postgres/i, /\bindex(es|ing)?\b/i, /\borm\b/i, /prisma/i, /entity framework/i, /\bquery\b/i],
-  api: [/endpoint/i, /\brest(ful)?\b/i, /controller/i, /\bapi\b/i, /middleware/i, /\bdto\b/i, /openapi|swagger/i],
-  design: [/\bcss\b/i, /tailwind/i, /\bui\b/i, /\bux\b/i, /layout/i, /responsive/i, /accessib/i, /design system/i, /styling/i],
-  "kb-harvester": [/knowledge base/i, /document (the )?(project|codebase|architecture)/i, /architecture docs?/i, /reverse.?engineer/i],
-  // Failing commands and errors. Several patterns so a real failure report outscores the
-  // single keyword it often shares with another agent ("npm run dev:api failing" also matches api).
-  debug: [
-    /\bfail(s|ed|ing|ure|ures)\b/i,
-    /\bcrash(es|ed|ing)?\b/i,
-    /exception/i,
-    /stack ?trace/i,
-    /\b(doesn'?t|does not|won'?t|can'?t|cannot|isn'?t|not)\s+(start|work|working|run|running|build|compile|load|boot)/i,
-    /\bbroken\b/i,
-    /\bdebug(ging)?\b/i,
-    /cannot find module|can'?t resolve dependencies/i,
-    /\bE(NOENT|ADDRINUSE|CONNREFUSED|ACCES)\b|\bERR_[A-Z_]+|\bTS\d{4}\b|\bCS\d{4}\b/,
-    // A package-manager command together with a failure word, in either order. "npm run" alone is
-    // NOT a signal: "add an npm run script" is a normal dev task.
-    /\b(npm|pnpm|yarn|bun)\s+(run|start|test|build)\b.*\b(fail|error|crash|broke|not work|won'?t|doesn'?t)|\b(fail|error|crash|broke|won'?t|doesn'?t).*\b(npm|pnpm|yarn|bun)\s+(run|start|test|build)\b/i,
-  ],
-  logic: [/decompos/i, /trade-?offs?/i, /edge cases?/i, /root cause/i, /\bplan\b.*\b(approach|architecture)\b/i, /distributed/i],
-};
+// Routing signals live in orchestration.ts (pure, unit-tested). Cheap keyword scoring: when exactly one
+// specialist clearly wins, route instantly and skip an LLM round-trip (slow on a local 32B model).
+// Anything ambiguous still goes to the model, which is also told which signals were found.
 
-function keywordRoute(task: string): AgentDefinition | undefined {
-  const scores = Object.entries(KEYWORDS)
-    .map(([id, patterns]) => ({ id, score: patterns.filter((p) => p.test(task)).length }))
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score);
+export interface RouteOptions {
+  /** Target project root. Lets generic words like "write tests" route to QA in an Appium/Playwright project. */
+  workspaceRoot?: string;
+}
 
-  if (scores.length === 0) return undefined;
-  // Require a strict winner; ties are ambiguous and go to the LLM.
-  if (scores.length > 1 && scores[0].score === scores[1].score) return undefined;
-  return getAgent(scores[0].id);
+const warnedUnregistered = new Set<string>();
+
+// A signal group whose agent is not registered used to fall through silently (the research agent was
+// in that state). Say so once instead.
+function resolveAgent(id: string): AgentDefinition | undefined {
+  const agent = getAgent(id);
+  if (!agent && !warnedUnregistered.has(id)) {
+    warnedUnregistered.add(id);
+    console.warn(`⚠ Routing matched agent '${id}' but it is not registered in agents/definitions.ts. Falling back.`);
+  }
+  return agent;
+}
+
+function isAutomationProject(workspaceRoot?: string): boolean {
+  if (!workspaceRoot) return false;
+  try {
+    return detectStackKnowledge(workspaceRoot).some((p) => p.startsWith("02-qa-automation/"));
+  } catch {
+    return false;
+  }
+}
+
+export function keywordRoute(task: string, opts: RouteOptions = {}): { agent?: AgentDefinition; scores: DomainScore[] } {
+  const scores = rankDomains(task, { automationProject: isAutomationProject(opts.workspaceRoot) });
+  const id = pickByKeywords(scores);
+  return { agent: id ? resolveAgent(id) : undefined, scores };
 }
 
 type RouteMethod = "keyword" | "llm" | "default" | "forced" | "triage";
@@ -57,7 +55,7 @@ export function announceForcedAgent(agent: AgentDefinition): void {
   routed(agent, "forced");
 }
 
-// For callers that take the agent Gemini triage recommended instead of routing.
+// For callers that take the agent the research stage / planner recommended instead of routing.
 export function announceTriageAgent(agent: AgentDefinition): void {
   routed(agent, "triage");
 }
@@ -65,23 +63,26 @@ export function announceTriageAgent(agent: AgentDefinition): void {
 // Asks the model to pick which specialist agent should handle a task.
 // Falls back to the "dev" agent if the model's answer doesn't match a known
 // agent id (keeps the router robust against a small/local model being sloppy).
-export async function routeTask(llm: LLMProvider, task: string): Promise<AgentDefinition> {
+export async function routeTask(llm: LLMProvider, task: string, opts: RouteOptions = {}): Promise<AgentDefinition> {
   bus.emit("orchestrator_evaluating", { task: truncate(task, 500) });
 
-  const quick = keywordRoute(task);
+  const { agent: quick, scores } = keywordRoute(task, opts);
   if (quick) return routed(quick, "keyword");
 
   // AGENT_ROUTER=keywords: never spend a model call on routing (unmatched tasks go to "dev").
   if ((process.env.AGENT_ROUTER ?? "auto").toLowerCase() === "keywords") return routed(getAgent("dev")!, "default");
 
   const agentList = AGENTS.map((a) => `- ${a.id}: ${a.description}`).join("\n");
+  const signals = scores.length ? `\nKeyword signals found in the task (a tie, so you decide): ${describeSignals(scores)}` : "";
 
   const routerPrompt = `You are a router that assigns a coding task to exactly one specialist agent.
 
 Available agents:
 ${agentList}
 
-Task: "${task}"
+Rules: "debug" when something fails or misbehaves; "dev" for building or changing features that do not fit a specialist; "logic" only for planning or architecture questions that need no code; "research" only for questions answered by reading the web; a specialist when the task is clearly in its area.
+
+Task: "${task}"${signals}
 
 Respond with ONLY the agent id (one of: ${AGENTS.map((a) => a.id).join(", ")}), nothing else.`;
 

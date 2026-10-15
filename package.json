@@ -9,8 +9,10 @@
   },
   "main": "dist/cli.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "dev": "ts-node src/cli.ts",
     "start": "node dist/cli.js",
     "chat": "dotenv -e .env.local -- ts-node src/cli.ts chat",
@@ -25,30 +27,36 @@
     "web:install": "npm --prefix web install",
     "models": "dotenv -e .env.local -- ts-node src/cli.ts models",
     "triage:models": "ts-node src/cli.ts triage-models",
+    "search:test": "dotenv -e .env.local -- ts-node src/cli.ts search-test",
     "bench": "dotenv -e .env.local -- ts-node src/cli.ts bench",
     "bench:qwen3": "dotenv -e .env.qwen3coder -- ts-node src/cli.ts bench",
     "bench:devstral": "dotenv -e .env.devstral -- ts-node src/cli.ts bench",
     "bench:codestral": "dotenv -e .env.codestral -- ts-node src/cli.ts bench"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.133.0",
     "@fastify/websocket": "^11.0.0",
     "@google/genai": "^2.27.0",
+    "cheerio": "^1.2.0",
     "commander": "^12.1.0",
     "diff": "^5.2.0",
     "dotenv": "^16.4.5",
+    "duck-duck-scrape": "^2.2.7",
     "fastify": "^5.0.0",
+    "google-sr": "^6.0.0",
     "openai": "^4.68.0",
     "picocolors": "^1.0.1",
+    "playwright": "^1.64.0",
     "prompts": "^2.4.2",
+    "unpdf": "^1.8.1",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/diff": "^5.2.1",
-    "@types/node": "^20.14.9",
+    "@types/node": "^22.0.0",
     "@types/prompts": "^2.4.9",
     "dotenv-cli": "^11.0.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "vitest": "^5.0.4"
   }
 }

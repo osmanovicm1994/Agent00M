@@ -21,5 +21,6 @@ steps) and do NOT call write_file or run_command.` +
       "08-logic/02-edge-case-analysis.md",
       "08-logic/03-distributed-systems.md",
       "08-logic/04-root-cause-debugging.md",
+      "08-logic/05-debugging-playbook.md",
     ]),
 };

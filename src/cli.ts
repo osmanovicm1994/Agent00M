@@ -12,7 +12,8 @@ import { createProvider } from "./llm/factory";
 import { LMStudioProvider } from "./llm/providers/lmstudio";
 import { getProfile } from "./llm/models";
 import type { LLMProvider } from "./llm/types";
-import { routeTask, announceForcedAgent, announceTriageAgent } from "./agents/router";
+import { routeTask, announceForcedAgent, announceTriageAgent, keywordRoute } from "./agents/router";
+import { analyzeTask, describeSignals } from "./agents/orchestration";
 import { getAgent, AGENTS } from "./agents/definitions";
 import { Executor } from "./core/executor";
 import { McpManager } from "./mcp/client";
@@ -21,7 +22,9 @@ import { control } from "./core/control";
 import { startServer, type DashboardServer } from "./server";
 import { interruptRunningCommands } from "./tools/shell.tool";
 import { launchDashboard, stopDashboard } from "./ui-launcher";
-import { TriageGateway, GeminiTriageClient, confirmPlan, resolveModels } from "./gateway";
+import { GeminiTriageClient, resolveModels } from "./gateway";
+import { ResearchPipeline, confirmPlan, confirmRequired, researchEnv } from "./research";
+import { searchWeb } from "./tools/web-search.tool";
 import { runTeam } from "./team/orchestrator";
 import { describeImage, renderBriefForAgents, type DesignBrief } from "./vision/describe";
 
@@ -76,14 +79,6 @@ function resolveDefaultWorkspace(fallback: string): string {
   if (isDirectory(resolved)) return resolved;
   console.log(pc.yellow(`⚠ AGENT_DEFAULT_WORKSPACE (${resolved}) is not a folder. Using ${path.resolve(fallback)} instead.`));
   return path.resolve(fallback);
-}
-
-// Triage (Gemini) is opt-in because it is the only feature that sends data off the machine.
-function triageEnv(): "on" | "off" | undefined {
-  const v = (process.env.AGENT_TRIAGE ?? "").trim().toLowerCase();
-  if (["on", "1", "true", "yes"].includes(v)) return "on";
-  if (["off", "0", "false", "no"].includes(v)) return "off";
-  return undefined;
 }
 
 function describeModel(llm: LLMProvider): string {
@@ -191,7 +186,8 @@ program
   .option("-m, --model <id>", "Model id to use (default: AI_MODEL_NAME)")
   .option("--no-mcp", "Do not start MCP servers (e.g. sequential-thinking)")
   .option("-y, --auto-write", "Auto mode: write files and run commands without asking (each action is logged; risky commands still ask)")
-  .option("-t, --triage", "First let Gemini analyse the task and write a plan for the local agent (sends the query + a file-name overview to Google)")
+  .option("-r, --research", "Research stage first: Gemini (with Google Search) works out the problem, and a planner writes a plan only when needed (sends the query + a file-name overview to Google)")
+  .option("-t, --triage", "Older name of --research")
   .option("--team", "Team mode: Project Manager plans, engineers build, Safety Reviewer checks the result")
   .option("-i, --image <path>", "A picture of what you want (png/jpg/webp); it is read into a design brief the agents build from")
   .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
@@ -205,6 +201,7 @@ program
         mcp: boolean;
         autoWrite?: boolean;
         serve?: boolean;
+        research?: boolean;
         triage?: boolean;
         team?: boolean;
         image?: string;
@@ -250,18 +247,19 @@ program
         const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
           const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
 
-          // Optional Gemini triage: a plan for the local agent, plus a suggested agent.
+          // Optional Gemini front stage: research first (Google Search), a planner only when needed.
+          // The result is extra context for the local agent, plus a suggested agent.
           let planContext: string | undefined;
           let suggested: string | undefined;
-          const triage = new TriageGateway();
-          const useTriage = Boolean(opts.triage) || triageEnv() === "on";
-          if (useTriage) {
-            if (!triage.hasApiKey()) {
-              console.log(pc.yellow("⚠ Triage requested but GEMINI_API_KEY is not set (put it in .env). Continuing without it."));
+          const pipeline = new ResearchPipeline();
+          const useResearch = Boolean(opts.research) || Boolean(opts.triage) || researchEnv() === "on";
+          if (useResearch) {
+            if (!pipeline.hasApiKey()) {
+              console.log(pc.yellow("⚠ Research requested but GEMINI_API_KEY is not set (put it in .env). Continuing without it."));
             } else {
-              const out = await triage.run(task, workspaceRoot, executor.toolNames());
-              if (out && (process.env.AGENT_TRIAGE_CONFIRM !== "1" || (await confirmPlan()))) {
-                planContext = out.agentContext;
+              const out = await pipeline.run(task, workspaceRoot, executor.toolNames());
+              if (out && (!confirmRequired() || (await confirmPlan()))) {
+                planContext = out.context;
                 suggested = out.recommendedAgent;
               }
             }
@@ -278,7 +276,7 @@ program
               context: combinedContext,
               approvePlan: !executor.isAutoWrite(),
               // Gemini leads (PM + UX) when you opted into Gemini; the local model is the worker.
-              think: useTriage && triage.hasApiKey() ? (s, u, m, j) => triage.think(s, u, m, j) : undefined,
+              think: useResearch && pipeline.hasApiKey() ? (s, u, m, j) => pipeline.think(s, u, m, j) : undefined,
             });
             if (team) {
               return {
@@ -291,7 +289,7 @@ program
             console.log(pc.dim("Continuing with a single agent.\n"));
           }
 
-          const resolvedAgent = agent ?? (suggested ? getAgent(suggested) : undefined) ?? (await routeTask(llm, task));
+          const resolvedAgent = agent ?? (suggested ? getAgent(suggested) : undefined) ?? (await routeTask(llm, task, { workspaceRoot }));
 
           if (agent) {
             announceForcedAgent(resolvedAgent);
@@ -394,6 +392,29 @@ program
     } catch (err: any) {
       console.log(pc.red(err?.message ?? String(err)));
       process.exitCode = 1;
+    }
+  });
+
+program
+  .command("search-test")
+  .description("Run one web search with the configured engines and show what each engine answered (diagnoses web_search failures)")
+  .argument("[query...]", "Search query")
+  .action(async (words: string[]) => {
+    const query = words.join(" ").trim() || "typescript 5 release notes";
+    console.log(pc.bold("Web search test"));
+    console.log(`  WEB_SEARCH_ENGINES = ${process.env.WEB_SEARCH_ENGINES ?? "(not set, default: gemini)"}`);
+    console.log(`  GEMINI_API_KEY     = ${GeminiTriageClient.resolveApiKey() ? "set" : pc.red("NOT set (put it in .env)")}`);
+    console.log(`  query              = ${query}\n`);
+    try {
+      const out = await searchWeb(query, 5);
+      console.log(pc.green(`✔ ${out.results.length} result(s) via ${out.engines.join(" + ")}`));
+      out.results.forEach((r, i) => console.log(`  ${i + 1}. ${r.title}\n     ${r.url}`));
+      out.notes.forEach((n) => console.log(pc.yellow(`  note: ${n}`)));
+    } catch (err: any) {
+      console.log(pc.red(`✖ ${err?.message ?? err}`));
+      process.exitCode = 1;
+    } finally {
+      process.exit();
     }
   });
 
@@ -554,25 +575,26 @@ program
         : pc.dim("Auto-run OFF: you approve every command. Type '/auto-run' any time to switch."),
     );
 
-    // Gemini triage: opt-in, because it sends the question and a file-name overview to Google.
-    const triage = new TriageGateway();
-    let triageOn = false;
-    const triageSetting = triageEnv();
-    if (triageSetting === "on") {
-      triageOn = triage.hasApiKey();
+    // Gemini research stage: opt-in, because it sends the question and a file-name overview to Google.
+    // Research (Gemini + Google Search) runs first; a planner runs after it only when the research says a plan is needed.
+    const pipeline = new ResearchPipeline();
+    let researchOn = false;
+    const researchSetting = researchEnv();
+    if (researchSetting === "on") {
+      researchOn = pipeline.hasApiKey();
       console.log(
-        triageOn
-          ? pc.yellow("🧭 Gemini triage ON (AGENT_TRIAGE=on): each task is analysed by Gemini first.")
-          : pc.yellow("⚠ AGENT_TRIAGE=on but GEMINI_API_KEY is not set (put it in .env). Triage stays off."),
+        researchOn
+          ? pc.yellow(`🔎 Research stage ON (AGENT_RESEARCH=on): Gemini researches each task first, planner mode: ${pipeline.plannerMode}.`)
+          : pc.yellow("⚠ AGENT_RESEARCH=on but GEMINI_API_KEY is not set (put it in .env). Research stays off."),
       );
-    } else if (triageSetting === undefined && triage.hasApiKey()) {
-      triageOn = await askYesNo(
-        "Gemini triage: run every task through Gemini first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google.",
+    } else if (researchSetting === undefined && pipeline.hasApiKey()) {
+      researchOn = await askYesNo(
+        "Research stage: let Gemini (with Google Search) research every task first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google.",
         pc.cyan(
-          "Run every task through Gemini triage first? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google. (y/N): ",
+          "Let Gemini research every task first (Google Search)? Your question and a file-name overview of the project (no file contents, secrets masked) are sent to Google. (y/N): ",
         ),
       );
-      console.log(triageOn ? pc.yellow("🧭 Gemini triage ON. Type '/triage' to switch.") : pc.dim("Triage OFF. Type '/triage' to switch."));
+      console.log(researchOn ? pc.yellow("🔎 Research stage ON. Type '/research' to switch, '/plan' for the planner mode.") : pc.dim("Research OFF. Type '/research' to switch."));
     }
 
     const mcp = await setupMcp(!opts.mcp);
@@ -622,14 +644,14 @@ program
           let suggested: string | undefined;
           const forcedId = forcedAgentId ?? lockedAgentId;
 
-          if (triageOn) {
-            if (origin === "dashboard" && process.env.AGENT_TRIAGE_CONFIRM === "1") {
-              // The plan confirmation is a terminal prompt; do not block a browser-started run on it.
-              console.log(pc.dim("Triage skipped: AGENT_TRIAGE_CONFIRM=1 needs the terminal."));
+          if (researchOn) {
+            if (origin === "dashboard" && confirmRequired()) {
+              // The confirmation is a terminal prompt; do not block a browser-started run on it.
+              console.log(pc.dim("Research skipped: AGENT_RESEARCH_CONFIRM=1 needs the terminal."));
             } else {
-              const out = await triage.run(task, workspaceRoot, executor.toolNames());
-              if (out && (process.env.AGENT_TRIAGE_CONFIRM !== "1" || (await confirmPlan()))) {
-                planContext = out.agentContext;
+              const out = await pipeline.run(task, workspaceRoot, executor.toolNames());
+              if (out && (!confirmRequired() || (await confirmPlan()))) {
+                planContext = out.context;
                 suggested = out.recommendedAgent;
               }
             }
@@ -646,8 +668,8 @@ program
               context: combinedContext,
               // You approve the plan in the terminal; auto-write mode and dashboard runs start without asking.
               approvePlan: origin === "terminal" && !executor.isAutoWrite(),
-              // Gemini leads (PM + UX) while Gemini triage is ON; the local model is the worker.
-              think: triageOn ? (s, u, m, j) => triage.think(s, u, m, j) : undefined,
+              // Gemini leads (PM + UX) while the research stage is ON; the local model is the worker.
+              think: researchOn ? (s, u, m, j) => pipeline.think(s, u, m, j) : undefined,
             });
             if (team) {
               return {
@@ -670,7 +692,7 @@ program
             console.log(pc.dim(`Triage selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
           } else {
             console.log(pc.dim("... Routing task & analyzing ..."));
-            resolvedAgent = await routeTask(llm, task);
+            resolvedAgent = await routeTask(llm, task, { workspaceRoot });
             console.log(pc.dim(`Router selected agent: ${resolvedAgent.id} (${resolvedAgent.name})`));
           }
 
@@ -717,7 +739,8 @@ program
   ${pc.cyan("/model")}                       - List models on the server; ${pc.cyan("/model <id>")} switches
   ${pc.cyan("auto-write")}    | ${pc.cyan("/auto-write")} - Toggle auto-write and auto-run together (files + commands without asking)
   ${pc.cyan("/auto-run")}                   - Toggle auto-run only (commands without asking; risky ones still ask)
-  ${pc.cyan("/triage")}                      - Toggle Gemini triage; ${pc.cyan("/triage show")} prints the last plan given to the agent
+  ${pc.cyan("/research")}                    - Toggle the Gemini research stage (Google Search, runs first); ${pc.cyan("/research show")} prints the last brief and plan given to the agent
+  ${pc.cyan("/plan [auto|always|off]")}      - Planner mode: auto = only when the research says a plan is needed (default), always, off
   ${pc.cyan("/team <task>")}                 - Run one task with the team: Project Manager plans, engineers build, Safety Reviewer checks
   ${pc.cyan("/team")}                        - Toggle team mode for every task
   ${pc.cyan("/image <path> [note]")}         - Show a picture of what you want; it is read into a design brief the agents build from
@@ -807,18 +830,31 @@ program
           return;
         }
 
-        if (normalizedInput === "/triage" || normalizedInput === "/triage show") {
-          if (normalizedInput === "/triage show") {
-            console.log(triage.last ? `\n${triage.last.agentContext}\n` : pc.dim("\nNo triage plan yet.\n"));
-          } else if (!triage.hasApiKey()) {
+        // /research (toggle), /research show; /triage is the older name of the same command.
+        if (["/research", "/research show", "/triage", "/triage show"].includes(normalizedInput)) {
+          if (normalizedInput.endsWith(" show")) {
+            console.log(pipeline.last ? `\n${pipeline.last.context}\n` : pc.dim("\nNo research brief yet.\n"));
+          } else if (!pipeline.hasApiKey()) {
             console.log(pc.yellow("\n⚠ GEMINI_API_KEY is not set. Put it in .env (git-ignored) and restart.\n"));
           } else {
-            triageOn = !triageOn;
+            researchOn = !researchOn;
             console.log(
-              triageOn
-                ? pc.yellow("\n🧭 Gemini triage ON: the question and a file-name overview are sent to Google for each task.\n")
-                : pc.green("\n✔ Gemini triage OFF: everything stays local.\n"),
+              researchOn
+                ? pc.yellow(`\n🔎 Research stage ON: the question and a file-name overview are sent to Google/Gemini for each task. Planner mode: ${pipeline.plannerMode}.\n`)
+                : pc.green("\n✔ Research stage OFF: everything stays local.\n"),
             );
+          }
+          askQuestion();
+          return;
+        }
+
+        if (normalizedInput === "/plan" || normalizedInput.startsWith("/plan ")) {
+          const arg = normalizedInput.replace(/^\/plan\s*/, "").trim();
+          if (arg === "auto" || arg === "always" || arg === "off") {
+            pipeline.plannerMode = arg;
+            console.log(pc.green(`\n✔ Planner mode: ${arg}${arg === "auto" ? " (only when the research says a plan is needed)" : ""}.\n`));
+          } else {
+            console.log(pc.dim(`\nPlanner mode: ${pipeline.plannerMode}. Change with: /plan auto | /plan always | /plan off\n`));
           }
           askQuestion();
           return;
@@ -931,6 +967,32 @@ program
     }
 
     askQuestion();
+  });
+
+// Dry run of the routing and standards logic: no model, no files written. Use it to see why a task went to an
+// agent and which standards it would get, then tune DOMAIN_KEYWORDS / KNOWLEDGE_RULES in agents/orchestration.ts.
+program
+  .command("route <task...>")
+  .description("Show which agent a task would be routed to and which standards it would load (no model call)")
+  .option("-p, --project <path>", "target project (lets 'write tests' route to QA in an Appium/Playwright project)")
+  .action((taskParts: string[], opts: { project?: string }) => {
+    const task = taskParts.join(" ");
+    const workspaceRoot = opts.project ? path.resolve(expandHome(opts.project)) : undefined;
+    const { agent, scores } = keywordRoute(task, { workspaceRoot });
+    const agentId = agent?.id ?? "dev";
+    const analysis = analyzeTask(task, agentId);
+
+    console.log(`\n${pc.bold("Signals:")} ${scores.length ? describeSignals(scores) : pc.dim("none")}`);
+    console.log(
+      `${pc.bold("Agent:")} ${agentId} ${
+        agent ? pc.dim("(keyword match)") : pc.dim("(no clear keyword winner: the local model would decide, 'dev' if it cannot)")
+      }`,
+    );
+    console.log(pc.bold("Task standards:"));
+    if (analysis.knowledge.length === 0) console.log(pc.dim("  none"));
+    for (const k of analysis.knowledge) console.log(`  ${k.path} ${pc.dim(`(${k.rule}, weight ${k.weight})`)}`);
+    if (analysis.teamHint) console.log(`\n${pc.yellow(analysis.teamHint)}`);
+    console.log(pc.dim("\nStandards the agent already carries are skipped at run time.\n"));
   });
 
 program.parseAsync(process.argv);

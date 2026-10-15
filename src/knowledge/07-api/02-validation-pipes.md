@@ -1,17 +1,19 @@
-# src/knowledge/api-standards/02-validation-pipes.md
 # Request Validation & Sanitization
 
-## 1. Strict Payload Typing (DTOs)
-- All incoming payloads must map to a strictly typed Data Transfer Object (DTO) or Schema (e.g., Zod, Pydantic, class-validator).
-- **Mass-Assignment Prevention:** Validation layers MUST be configured to strip unknown properties automatically (e.g., `whitelist: true` in NestJS). If an unknown property is sent, reject the request entirely (`forbidNonWhitelisted: true`).
+## 1. Typed payloads
+- Every incoming body, query and path parameter maps to a typed schema or DTO (Zod, Pydantic, class-validator, FluentValidation, Bean Validation). Use the one the project already has.
+- Reject unknown properties (`whitelist: true` with `forbidNonWhitelisted: true` in NestJS; `extra = "forbid"` in Pydantic; `.strict()` in Zod). This blocks mass assignment (a client setting `role` or `isAdmin`).
+- Never bind a request body straight onto an entity.
 
-## 2. Deep Validation
-- Do not rely solely on structural typing (`string`, `number`). Use semantic validation:
-  - Strings must have `minLength` and `maxLength`.
-  - Numbers must have `min` and `max` constraints.
-  - Enums must be strictly validated against allowed values.
-  - Email, UUID, and URL strings must pass strict regex/format validators.
+## 2. Semantic validation
+- Strings: min and max length, trimmed where appropriate, format validators for email, UUID, URL, date.
+- Numbers: min and max, integer vs decimal. Enums: only allowed values. Arrays: max length. Nested objects: validate deeply.
+- Cross-field rules (end after start, one-of fields) live in the schema too.
 
-## 3. Path & Query Parameter Validation
-- Query parameters must be explicitly parsed and validated (e.g., ensuring `limit` is parsed as an integer and capped at a maximum of 100).
-- Path parameters (e.g., `/users/{id}`) must be validated as valid UUIDs/ULIDs or integers before reaching the controller logic.
+## 3. Path and query parameters
+- Parse and validate them: `limit` is an integer capped at a maximum, `id` is a valid UUID/ULID/integer before the controller logic runs, sort fields come from a whitelist.
+
+## 4. Where validation lives
+- Validate at the edge (pipe, middleware, schema) so handlers only see valid data. Validation passes are not authorization: still check that the caller may touch this resource.
+- The same rules back the UI form validation where possible, but the server is the source of truth.
+- Validation failures return `400` with field-level details in the shared error format (see `03-error-handling.md`).

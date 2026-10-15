@@ -19,6 +19,7 @@ import type { Executor, ExecutorResult } from "../core/executor";
 import { getAgent } from "../agents/definitions";
 import {
   ASSIGNABLE_ROLES,
+  PM_KNOWLEDGE,
   PM_SYSTEM,
   REPORT_SYSTEM,
   ROLE_TITLES,
@@ -119,7 +120,7 @@ async function planWithPm(opts: TeamOptions): Promise<PmPlan> {
 
   let lastErr = "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await lead(opts, PM_SYSTEM, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500, true);
+    const raw = await lead(opts, PM_SYSTEM + PM_KNOWLEDGE, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500, true);
     try {
       const plan = parsePlan(raw);
       // Keep only roles that exist; unknown ones fall back to the general engineer.

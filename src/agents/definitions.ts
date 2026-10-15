@@ -7,6 +7,7 @@ import { logicAgent } from "./list/logic";
 import { kbHarvesterAgent } from "./list/kb-harvester";
 import { qaAgent } from "./list/qa";
 import { debugAgent } from "./list/debug";
+import { researchAgent } from "./list/research";
 
 export interface AgentDefinition {
   id: string;
@@ -24,7 +25,7 @@ export interface AgentDefinition {
   readOnly?: boolean;
 }
 
-// 1. Register all imported agents here
+// 1. Register all imported agents here. Not listed = not routable, not lockable, missing from the dashboard.
 export const AGENTS: AgentDefinition[] = [
   devAgent,
   apiAgent,
@@ -34,6 +35,7 @@ export const AGENTS: AgentDefinition[] = [
   kbHarvesterAgent,
   qaAgent,
   debugAgent,
+  researchAgent,
 ];
 
 // 2. Helper to fetch them

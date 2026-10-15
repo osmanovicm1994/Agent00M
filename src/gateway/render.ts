@@ -110,7 +110,7 @@ export interface TriageMeta {
 
 export function printTriageSummary(plan: TriagePlan, meta: TriageMeta): void {
   const secrets = meta.redactions ? ` · ${meta.redactions} secret-looking value(s) masked before sending` : "";
-  console.log(pc.cyan(`\n🧭 Triage by ${meta.model} (${(meta.ms / 1000).toFixed(1)}s${secrets})`));
+  console.log(pc.cyan(`\n📐 Plan by ${meta.model} (${(meta.ms / 1000).toFixed(1)}s${secrets})`));
   if (plan.clarifiedProblem) console.log(`  ${pc.bold("Problem:")} ${clip(plan.clarifiedProblem, 300)}`);
   if (plan.xy.isXYProblem) console.log(`  ${pc.yellow("XY problem:")} real goal → ${clip(plan.xy.likelyRealGoal || plan.xy.note, 240)}`);
   if (plan.workspaces.length) {
@@ -130,5 +130,5 @@ export function printTriageSummary(plan: TriagePlan, meta: TriageMeta): void {
     console.log(`  ${pc.yellow("Gemini asks you:")}`);
     plan.needsUserInput.slice(0, 3).forEach((q) => console.log(`    - ${clip(q, 200)}`));
   }
-  console.log(pc.dim("  (the full plan is passed to the local agent; /triage show prints it)\n"));
+  console.log(pc.dim("  (the full plan is passed to the local agent; /research show prints it)\n"));
 }

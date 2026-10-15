@@ -1,16 +1,23 @@
-# Universal Architecture & Clean Layering
+# Architecture & Clean Layering
 
-## 1. Clean Architecture & Separation of Concerns
-- **Domain Layer:** Core business entities and interfaces. Must have ZERO dependencies on frameworks, databases, or HTTP contexts.
-- **Use Case / Application Layer:** Orchestrates business rules. Relies on injected repository interfaces, never concrete implementations.
-- **Infrastructure Layer:** Concrete database implementations, external API clients, and file system access.
-- **Presentation / Delivery Layer:** HTTP Controllers, GraphQL resolvers, or UI ViewModels. Responsible ONLY for input validation and routing.
+Follow the architecture the project already has. Apply the layering below to new code and to projects that have none; do not add layers, interfaces or abstractions to a small project that works without them.
 
-## 2. Dependency Injection (DI)
-- Hardcoded dependencies (`new Service()`) inside business logic are strictly prohibited.
-- Inject dependencies via constructors across all object-oriented languages (C#, Swift, Kotlin).
-- Rely on interfaces/protocols, not concrete classes, to allow for mocking during tests.
+## 1. Separation of concerns
+- **Domain:** business entities and rules. No dependency on frameworks, databases or HTTP.
+- **Application / use cases:** orchestrate business rules through injected interfaces, never concrete implementations.
+- **Infrastructure:** database, external API clients, file system.
+- **Delivery:** HTTP controllers, resolvers, UI view models. Only input validation, mapping and routing.
+- Dependencies point inward: delivery and infrastructure depend on the domain, never the reverse.
 
-## 3. State & Mutation
-- Favor immutability. Use readonly fields, `let` (Swift), `val` (Kotlin), and immutable records/data classes where possible.
-- Pure functions should be used for data transformations to eliminate side effects.
+## 2. Dependency injection
+- No `new Service()` inside business logic. Inject through constructors (C#, Swift, Kotlin, NestJS, FastAPI `Depends`).
+- Depend on interfaces / protocols so tests can substitute them. Create one only when there is a second implementation or a test needs it.
+
+## 3. State and mutation
+- Prefer immutability: readonly fields, `let` / `val`, records and data classes.
+- Pure functions for data transformations; keep side effects at the edges (I/O, time, randomness passed in).
+
+## 4. Boundaries
+- Validate and map data where it enters the system (DTO, schema); inside, work with trusted typed values.
+- One owner per piece of state. Do not let two modules write the same data.
+- Avoid circular dependencies between modules; if two need each other, extract the shared part.

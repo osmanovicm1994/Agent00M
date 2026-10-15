@@ -23,7 +23,11 @@ function stripFrontMatter(text: string): string {
  * are scoped to the target project, so it can never open these files itself.
  * A missing file is reported once instead of failing silently.
  */
-export function loadKnowledge(relPaths: string[], maxChars: number = DEFAULT_MAX_CHARS): string {
+export function loadKnowledge(
+  relPaths: string[],
+  maxChars: number = DEFAULT_MAX_CHARS,
+  heading: string = "ENGINEERING STANDARDS (follow these strictly)",
+): string {
   let out = "";
 
   for (const rel of relPaths) {
@@ -50,7 +54,7 @@ export function loadKnowledge(relPaths: string[], maxChars: number = DEFAULT_MAX
     }
   }
 
-  return out ? `\n\n## ENGINEERING STANDARDS (follow these strictly)${out}` : "";
+  return out ? `\n\n## ${heading}${out}` : "";
 }
 
 /** Legacy single-file helper, kept for backward compatibility. */
