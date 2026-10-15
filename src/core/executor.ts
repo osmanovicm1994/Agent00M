@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from "../llm/types";
 import type { AgentDefinition } from "../agents/definitions";
-import { detectStackKnowledge, loadKnowledge } from "../agents/helpers";
+import { detectStackKnowledge, loadKnowledge, loadProjectContext } from "../agents/helpers";
 import { FsTools, fsToolSchemas } from "../tools/fs.tool";
 import { ShellTool, shellToolSchema, clampTimeoutMs, condenseOutput } from "../tools/shell.tool";
 import { SearchTool, searchToolSchemas } from "../tools/search.tool";
@@ -31,7 +31,7 @@ const MAX_NUDGES = 6;
 // Budget for the auto-detected stack standards in the system prompt (mobile adds role-specific detail files).
 const STACK_KNOWLEDGE_CHARS = Number(process.env.AGENT_STACK_CHARS) || 9000;
 // Budget for the task-specific standards (logic, cross-domain) chosen from the task text, see agents/orchestration.ts.
-const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 6000;
+const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 8000;
 
 // True when `dir` or one of its parents is a git working tree (changes can be reviewed and reverted).
 function insideGitRepo(dir: string): boolean {
@@ -441,7 +441,7 @@ export class Executor {
       .join("\n");
   }
 
-  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = []): string {
+  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = ""): string {
     const stack = loadKnowledge(stackPaths, STACK_KNOWLEDGE_CHARS);
     const taskKnowledge = loadKnowledge(taskPaths, TASK_KNOWLEDGE_CHARS, "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
     const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
@@ -454,7 +454,7 @@ export class Executor {
             : ""
         }`;
 
-    return `${agent.systemPrompt}${stack}${taskKnowledge}
+    return `${agent.systemPrompt}${stack}${taskKnowledge}${projectContext}
 
 ${toolSection}
 
@@ -601,7 +601,11 @@ When you are done and have no more actions to take, reply normally with a final 
       this.warnedNoGit = true;
       console.log(pc.yellow("⚠ Auto mode is on but this folder is not in a git repository: there is no sandbox, and changes cannot be reviewed or reverted. Use git first."));
     }
-    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths);
+    // The target project's own rules (AGENTS.md / CLAUDE.md in its root) are part of the prompt, so the user's
+    // conventions for that project are followed without being repeated in every task.
+    const projectContext = loadProjectContext(this.workspaceRoot);
+    if (projectContext) console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
+    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext);
 
     // Ground the agent in reality before it can guess: show the real tree as the
     // first thing it sees, so a small local model can't hallucinate a layout.

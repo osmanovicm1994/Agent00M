@@ -15,12 +15,12 @@ read the relevant files before reasoning about them. Unless the user explicitly 
 change files, deliver your result as a final written answer (plan, findings, risks, ordered
 steps) and do NOT call write_file or run_command.` +
     loadKnowledge([
-      "00-agent-core/tool-execution.md",
-      "01-architecture/architecture-patterns.md",
       "08-logic/01-problem-decomposition.md",
       "08-logic/02-edge-case-analysis.md",
       "08-logic/03-distributed-systems.md",
       "08-logic/04-root-cause-debugging.md",
+      "00-agent-core/tool-execution.md",
+      "01-architecture/architecture-patterns.md",
       "08-logic/05-debugging-playbook.md",
     ]),
 };

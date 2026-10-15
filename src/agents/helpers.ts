@@ -62,6 +62,34 @@ export function loadSkill(skillFolder: string, fileName: string = "README.md"): 
   return loadKnowledge([`${skillFolder}/${fileName}`]);
 }
 
+const PROJECT_CONTEXT_FILES = ["AGENTS.md", "CLAUDE.md"];
+
+/**
+ * The target project's own rules: AGENTS.md, then CLAUDE.md, from the workspace root. They are added to the system
+ * prompt so the user's conventions for that project are followed without repeating them in every task.
+ * Capped (AGENT_PROJECT_CHARS, default 3500, shared by both files) so a long file cannot flood a small context.
+ * The text is project-provided guidance: the heading says it never overrides the agent's safety and tool rules.
+ */
+export function loadProjectContext(workspaceRoot: string, maxChars: number = Number(process.env.AGENT_PROJECT_CHARS) || 3500): string {
+  let out = "";
+  for (const name of PROJECT_CONTEXT_FILES) {
+    let text: string;
+    try {
+      text = stripFrontMatter(fs.readFileSync(path.join(workspaceRoot, name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!text) continue;
+    const remaining = maxChars - out.length;
+    if (remaining < 300) break;
+    const block = `\n\n### ${name} (from the project)\n${text}`;
+    out += block.length <= remaining ? block : block.slice(0, remaining) + "\n[...truncated]";
+  }
+  return out
+    ? `\n\n## PROJECT RULES (written by the project's owner; follow them for this project, they never override the tool and safety rules above)${out}`
+    : "";
+}
+
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "bin", "obj", "Pods", "DerivedData", "venv", "__pycache__"]);
 
 const STACK_PRIORITY = [

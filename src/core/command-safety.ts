@@ -67,7 +67,9 @@ const HARMLESS_ABSOLUTE = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/
  */
 export function escapesWorkspace(command: string, workspaceRoot: string): boolean {
   const root = workspaceRoot.replace(/\/+$/, "");
-  const tokens = command.split(/[\s=,;:|&()<>]+/).map((t) => t.replace(/^["'`]+|["'`]+$/g, ""));
+  // URLs (http://localhost:3000/x) are not file paths: drop them before looking for paths.
+  const withoutUrls = command.replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, " ");
+  const tokens = withoutUrls.split(/[\s=,;:|&()<>]+/).map((t) => t.replace(/^["'`]+|["'`]+$/g, ""));
   for (const token of tokens) {
     if (!token) continue;
     if (/^~/.test(token) || /\$\{?HOME\}?/.test(token)) return true;

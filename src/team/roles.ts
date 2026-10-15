@@ -154,5 +154,5 @@ WARNINGS:
 CHECKED: <files you read, comma separated>
 
 Use FAIL only when there is at least one blocker (a real security, data-loss or correctness problem). Warnings alone are a PASS.` +
-    loadKnowledge(["08-logic/02-edge-case-analysis.md"], 2500, "EDGE CASES TO CHECK IN THE CHANGES (report only real, pointed-at problems)"),
+    loadKnowledge(["07-api/05-owasp-checklist.md", "08-logic/02-edge-case-analysis.md"], 5500, "SECURITY AND EDGE-CASE CHECKLISTS (report only real, pointed-at problems)"),
 };
