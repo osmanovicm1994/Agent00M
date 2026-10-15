@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import * as path from "path";
 import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from "../llm/types";
 import type { AgentDefinition } from "../agents/definitions";
@@ -13,8 +14,12 @@ import { watchForInterrupt, formatElapsed } from "./interrupt";
 import prompts from "prompts";
 import pc from "picocolors";
 import { builtinModules } from "module";
+import { runWebSearch, runWebFetch, runWebResearch, webToolSchemas } from "../tools/web-search.tool";
+import { runInspectPage, browserToolSchemas } from "../tools/browser.tool";
+import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./command-safety";
+import { analyzeTask } from "../agents/orchestration";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas];
 
 const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 50;
 // Rough character budget for the running conversation. Older bulky tool output
@@ -25,54 +30,23 @@ const MAX_THINKING_CALLS = 8;
 const MAX_NUDGES = 6;
 // Budget for the auto-detected stack standards in the system prompt (mobile adds role-specific detail files).
 const STACK_KNOWLEDGE_CHARS = Number(process.env.AGENT_STACK_CHARS) || 9000;
+// Budget for the task-specific standards (logic, cross-domain) chosen from the task text, see agents/orchestration.ts.
+const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 6000;
+
+// True when `dir` or one of its parents is a git working tree (changes can be reviewed and reverted).
+function insideGitRepo(dir: string): boolean {
+  let d = path.resolve(dir);
+  for (;;) {
+    if (fs.existsSync(path.join(d, ".git"))) return true;
+    const parent = path.dirname(d);
+    if (parent === d) return false;
+    d = parent;
+  }
+}
 const FENCE = "`".repeat(3);
 const READ_ONLY_REFUSAL = "TOOL ERROR: this is a review role and cannot write files. Report findings instead; another role makes the changes.";
 
-// Read-only diagnostic commands that need no approval for agents with autoDiagnostics
-// (the debug agent). Deliberately strict: no shell metacharacters can match, so nothing can be
-// chained or redirected, and only commands that cannot change anything are listed.
-const PATH_ARG = "[\\w.\\/@-]+";
-const SAFE_DIAGNOSTIC_RES: RegExp[] = [
-  /^(node|npm|npx|pnpm|yarn|bun|deno|python3?|pip3?|dotnet|java|go|rustc|cargo|tsc|git|docker)\s+(-v|--version|version)$/,
-  /^git (status|branch|remote -v|stash list)( (-s|-sb|--short|--porcelain|-a|-vv))*$/,
-  new RegExp(`^git rev-parse( --[a-z-]+)*( ${PATH_ARG})?$`),
-  /^git log( (-n ?\d{1,3}|-\d{1,3}|--oneline|--stat|--name-only|--decorate|--graph))*$/,
-  /^git diff( (--stat|--name-only|--staged|--cached|HEAD(~\d+)?))*$/,
-  /^pwd$/,
-  new RegExp(`^ls( -[alhR]+)?( ${PATH_ARG})?$`),
-  /^lsof( -nP)? -i(TCP|UDP)? ?:\d{2,5}( -sTCP:LISTEN)?$/,
-  new RegExp(`^which ${PATH_ARG}$`),
-  /^uname( -a)?$/,
-  new RegExp(`^npm (ls|list)( --depth=\\d)?( ${PATH_ARG})?$`),
-  /^npm run$/,
-];
-
-function isSafeDiagnostic(command: string): boolean {
-  const c = command.trim().replace(/\s+/g, " ");
-  return SAFE_DIAGNOSTIC_RES.some((re) => re.test(c));
-}
-
-// Commands that still ask for approval when auto mode is on. They delete or overwrite data,
-// rewrite git history, publish, change system state, or pipe a download into a shell. The test is
-// unanchored on purpose so a risky part of a chained command (a && rm -rf x) is caught too.
-const BOUNDARY = "(^|[\\s;&|(`])";
-const DANGEROUS_COMMAND_RES: RegExp[] = [
-  new RegExp(`${BOUNDARY}(sudo|su|rm|rmdir|unlink|shred|dd|mkfs\\w*|chown|kill|pkill|killall|shutdown|reboot|halt)\\b`),
-  /\bchmod\b.*\s-\w*R/,
-  /\bgit\s+(reset\s+--hard|clean|push|rebase|checkout\s+(--|\.)|restore|stash\s+(drop|clear)|branch\s+-D|filter-branch|update-ref|rm)\b/,
-  /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/,
-  /\b(npm|pnpm|yarn)\s+(publish|unpublish|login|adduser)\b/,
-  /\b(npm|pnpm)\s+(i|install|add)\b.*\s(-g|--global)\b|\byarn\s+global\b/,
-  /\bdocker\s+(system\s+prune|rm|rmi|volume\s+(rm|prune)|compose\s+down\b.*\s-v)/,
-  /\b(drop|truncate)\s+(database|table|schema)\b/i,
-  /\bprisma\s+(migrate\s+reset|db\s+push\s+--force-reset)\b|\bmigrate:fresh\b|\bdb:drop\b|\bschema:drop\b/,
-  /\b(brew|pip3?|gem)\s+(uninstall|remove)\b/,
-  />\s*\/dev\/(sd|disk|nvme)|:\(\)\s*\{/,
-];
-
-function isDangerousCommand(command: string): boolean {
-  return DANGEROUS_COMMAND_RES.some((re) => re.test(command));
-}
+// isSafeDiagnostic / isDangerousCommand (which commands may run without asking) live in command-safety.ts.
 
 // Tools that only read state. Several of these may be executed in one turn.
 const READ_ONLY_TOOLS = new Set([
@@ -82,6 +56,10 @@ const READ_ONLY_TOOLS = new Set([
   "get_directory_tree",
   "find_files",
   "grep",
+  "web_search",
+  "web_fetch",
+  "web_research",
+  "inspect_page",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -366,6 +344,7 @@ export class Executor {
   private toolSchemas: ToolSchema[];
   private autoWrite: boolean;
   private autoRun: boolean;
+  private warnedNoGit = false;
 
   constructor(
     private readonly llm: LLMProvider,
@@ -462,8 +441,9 @@ export class Executor {
       .join("\n");
   }
 
-  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[]): string {
+  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = []): string {
     const stack = loadKnowledge(stackPaths, STACK_KNOWLEDGE_CHARS);
+    const taskKnowledge = loadKnowledge(taskPaths, TASK_KNOWLEDGE_CHARS, "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
     const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
     const native = this.llm.nativeTools !== false;
     const toolSection = native
@@ -474,7 +454,7 @@ export class Executor {
             : ""
         }`;
 
-    return `${agent.systemPrompt}${stack}
+    return `${agent.systemPrompt}${stack}${taskKnowledge}
 
 ${toolSection}
 
@@ -609,7 +589,19 @@ When you are done and have no more actions to take, reply normally with a final 
       stack: stackPaths.map((p) => basename(p)),
       autoWrite: this.autoWrite,
     });
-    const systemPrompt = this.buildSystemPrompt(agent, stackPaths);
+    // Standards this particular task needs on top of what the agent always carries (logic standards for
+    // edge cases, decomposition, distributed work, root causes; cross-domain files such as migration safety).
+    const analysis = analyzeTask(task, agent.id);
+    const taskPaths = analysis.knowledge
+      .map((k) => k.path)
+      .filter((p) => !stackPaths.includes(p) && !agent.systemPrompt.includes(`### STANDARD: ${p}`));
+    if (taskPaths.length) console.log(pc.dim(`Task standards: ${taskPaths.map(basename).join(", ")}`));
+    if (analysis.teamHint) console.log(pc.yellow(`💡 ${analysis.teamHint}`));
+    if ((this.autoWrite || this.autoRun) && !this.warnedNoGit && !insideGitRepo(this.workspaceRoot)) {
+      this.warnedNoGit = true;
+      console.log(pc.yellow("⚠ Auto mode is on but this folder is not in a git repository: there is no sandbox, and changes cannot be reviewed or reverted. Use git first."));
+    }
+    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths);
 
     // Ground the agent in reality before it can guess: show the real tree as the
     // first thing it sees, so a small local model can't hallucinate a layout.
@@ -928,6 +920,20 @@ When you are done and have no more actions to take, reply normally with a final 
         if (state.readOnly) return READ_ONLY_REFUSAL;
         return this.handleWrite(true, args, state);
 
+      // Web tools (src/tools/web-search.tool.ts): they log their own progress and never throw.
+      case "web_search":
+        return runWebSearch(args);
+
+      case "web_fetch":
+        return runWebFetch(args);
+
+      case "web_research":
+        return runWebResearch(args);
+
+      // Renders a page the user already serves (localhost) or a static file of the workspace in headless Chromium.
+      case "inspect_page":
+        return runInspectPage(args, this.workspaceRoot);
+      
       case "run_command": {
         console.log(`\n${pc.bold("Proposed command:")} ${pc.yellow(String(args.command))}`);
         if (args.reason) console.log(pc.dim(`Reason: ${args.reason}`));
@@ -939,11 +945,11 @@ When you are done and have no more actions to take, reply normally with a final 
         if (state.readOnly && !diagnostic) {
           return "TOOL ERROR: this is a review role: only read-only commands (git status, git diff, git log, ls, ...) are allowed. Do not try to change anything; report what you find.";
         }
-        const autoRun = !diagnostic && this.autoRunEnabled() && !isDangerousCommand(command);
+        const autoRun = !diagnostic && this.autoRunEnabled() && !isDangerousCommand(command) && !escapesWorkspace(command, this.workspaceRoot);
         if (autoRun) {
           console.log(pc.green(`▶ Auto-running: ${command}`));
         } else if (!diagnostic) {
-          if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command: asking even though auto mode is on."));
+          if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
           const approved = await confirm("Run this command?");
           if (!approved) {
             return "User rejected running this command. Do not repeat it; ask what to do differently or stop.";

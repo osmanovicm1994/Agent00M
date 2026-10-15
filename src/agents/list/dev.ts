@@ -14,6 +14,7 @@ accomplishes the task. Never assume file contents — read them first. When you 
 write_file action, always send the FULL new file content, not a fragment.` +
     loadKnowledge([
       "00-agent-core/tool-execution.md",
+      "08-logic/00-reasoning-core.md",
       "00-agent-core/golden-rules.md",
       "09-ai-agents/mcp-protocols.md",
       "01-architecture/architecture-patterns.md",

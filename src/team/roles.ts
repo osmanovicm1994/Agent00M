@@ -12,6 +12,15 @@
 
 import { z } from "zod";
 import type { AgentDefinition } from "../agents/definitions";
+import { loadKnowledge } from "../agents/helpers";
+
+// The Project Manager is a plain model call (no agent), so the logic standards are appended to its prompt here:
+// decomposition and ordering for the plan, edge cases for the risks list.
+export const PM_KNOWLEDGE = loadKnowledge(
+  ["08-logic/00-reasoning-core.md", "08-logic/01-problem-decomposition.md", "08-logic/02-edge-case-analysis.md"],
+  4500,
+  "PLANNING STANDARDS (use them to split, order and risk-check the work)",
+);
 
 /** Roles the Project Manager may assign work to. */
 export const ASSIGNABLE_ROLES = ["ux", "design", "dev", "api", "db", "debug", "qa"] as const;
@@ -144,5 +153,6 @@ WARNINGS:
 - <file> | <non-blocking concern>
 CHECKED: <files you read, comma separated>
 
-Use FAIL only when there is at least one blocker (a real security, data-loss or correctness problem). Warnings alone are a PASS.`,
+Use FAIL only when there is at least one blocker (a real security, data-loss or correctness problem). Warnings alone are a PASS.` +
+    loadKnowledge(["08-logic/02-edge-case-analysis.md"], 2500, "EDGE CASES TO CHECK IN THE CHANGES (report only real, pointed-at problems)"),
 };

@@ -19,6 +19,7 @@ confirming it's what the project actually uses. Always read files before editing
 always propose full-file content for write_file.` +
     loadKnowledge([
       "00-agent-core/tool-execution.md",
+      "08-logic/00-reasoning-core.md",
       "09-ai-agents/mcp-protocols.md",
       "07-api/01-endpoint-design.md",
       "07-api/02-validation-pipes.md",

@@ -16,6 +16,7 @@ flaky test (waits, locators, state) over adding retries or sleeps. Always read f
 editing them, and always propose full-file content for write_file.` +
     loadKnowledge([
       "00-agent-core/tool-execution.md",
+      "08-logic/00-reasoning-core.md",
       "09-ai-agents/mcp-protocols.md",
       "02-qa-automation/appium-standards.md",
       "02-qa-automation/appium-csharp.md",

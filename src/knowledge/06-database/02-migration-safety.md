@@ -1,15 +1,21 @@
-# src/knowledge/db-standards/02-migration-safety.md
 # Zero-Downtime Migrations
 
-## 1. The Expand and Contract Pattern
-- Destructive schema changes (renaming a column, changing a data type) are strictly prohibited in a single deployment.
-- **Step 1 (Expand):** Add the new column/table. Deploy. Both old and new code write to both columns.
-- **Step 2 (Migrate):** Run a background script to backfill data from the old column to the new column in small, non-locking batches.
-- **Step 3 (Contract):** Deploy new code that only reads/writes to the new column. Drop the old column in a final, separate migration.
+## 0. Ground rules
+- Generate migrations with the project's tool (Prisma, EF Core, Alembic, TypeORM, Flyway ...). Never edit a migration that has already been applied or committed; add a new one.
+- Read the current schema and the last migrations before writing one. State in your answer what the migration does to existing rows.
 
-## 2. Preventing Table Locks
-- **Indexes:** Never run standard `CREATE INDEX` on large tables in production—it acquires an exclusive lock and halts reads/writes. Always use `CREATE INDEX CONCURRENTLY` (PostgreSQL).
-- **Default Values:** Adding a column with a constant `DEFAULT` value to a massive table can rewrite the entire table. Add the column without a default, backfill it, and then apply the default constraint.
+## 1. Expand and contract
+- Do not rename a column or change its type in one deploy.
+  1. **Expand:** add the new column/table (nullable or with a safe default). Deploy code that writes both.
+  2. **Backfill:** copy old data to the new column in small batches, not one huge `UPDATE`.
+  3. **Contract:** deploy code that uses only the new column; drop the old one in a separate, later migration.
+- Adding `NOT NULL` to an existing column: add nullable, backfill, then add the constraint (in PostgreSQL, add it `NOT VALID` and `VALIDATE` afterwards to avoid a long lock).
 
-## 3. Migration Rollbacks
-- Every `up` migration MUST have a mathematically sound and tested `down` migration. If data is mutated or dropped, a strategy for data recovery must exist.
+## 2. Avoid long locks (PostgreSQL)
+- `CREATE INDEX CONCURRENTLY` on large tables (it cannot run inside a transaction block; configure the tool accordingly).
+- Adding a column with a constant default is fast on PostgreSQL 11+; on older versions or volatile defaults it rewrites the table, so add the column bare, backfill, then set the default.
+- Set a `lock_timeout` for DDL so a blocked migration fails fast instead of queueing every request behind it.
+
+## 3. Rollback
+- Every `up` has a `down` that works, or the migration states plainly that it is irreversible and why. Dropping data needs a backup or a retained copy first.
+- Test on a copy of realistic data: apply, roll back, apply again.

@@ -30,7 +30,7 @@ export class TriageError extends Error {
 // Minimal structural types for the parts of the SDK we use (the real types are not imported).
 interface GenAIClient {
   models: {
-    generateContent(request: unknown): Promise<{ text?: string }>;
+    generateContent(request: unknown): Promise<{ text?: string; candidates?: Array<{ groundingMetadata?: any }> }>;
     list(request?: unknown): Promise<AsyncIterable<{ name?: string; supportedActions?: string[] }>>;
   };
 }
@@ -110,6 +110,35 @@ export function parsePlan(raw: string): TriagePlan {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ---- Google Search grounding quota ---------------------------------------------------------------------------
+// Grounding with Google Search is billed separately from plain generation. On the free tier the allowance for the
+// Gemini 3.x models is a small monthly pool shared by all of them; once it is used up every grounded request answers
+// 429 RESOURCE_EXHAUSTED while ordinary requests keep working. Remember that for a while instead of failing again and
+// again, and let the callers degrade (the research stage continues without Google Search; web_search says why it
+// cannot search and the agent stops retrying).
+let groundingBlockedUntil = 0;
+let groundingBlockReason = "";
+
+export const QUOTA_HINT =
+  "Google Search grounding quota or rate limit reached (HTTP 429). On the free tier the Gemini 3.x models share one small monthly allowance for " +
+  "Google Search; check the usage in Google AI Studio (Rate limits) or enable billing. Plain Gemini requests still work.";
+
+export function isQuotaError(err: any): boolean {
+  const status: number | undefined = typeof err?.status === "number" ? err.status : typeof err?.code === "number" ? err.code : undefined;
+  return status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota|quota exceeded/i.test(String(err?.message ?? err));
+}
+
+export function blockGrounding(reason: string): void {
+  const ms = Number(process.env.AGENT_GROUNDING_BLOCK_MS) || 5 * 60_000;
+  groundingBlockedUntil = Date.now() + ms;
+  groundingBlockReason = reason.slice(0, 400);
+}
+
+export function groundingStatus(): { blocked: boolean; secondsLeft: number; reason: string } {
+  const left = groundingBlockedUntil - Date.now();
+  return left > 0 ? { blocked: true, secondsLeft: Math.ceil(left / 1000), reason: groundingBlockReason } : { blocked: false, secondsLeft: 0, reason: "" };
+}
 
 export class GeminiTriageClient {
   private client?: GenAIClient;
@@ -287,6 +316,71 @@ export class GeminiTriageClient {
   }
 
   /**
+   * Web search through Gemini's built-in Google Search grounding: returns the pages Google found for `query`
+   * (title, URL, and the sentence of the answer each page supports). Needs only the existing GEMINI_API_KEY.
+   * The URLs are Google redirect links; the caller resolves them.
+   */
+  async groundedSearch(query: string): Promise<{ sources: Array<{ title: string; url: string; snippet: string }>; model: string }> {
+    const client = await this.getClient();
+    const order = this.activeModel ? [this.activeModel, ...this.models.filter((m) => m !== this.activeModel)] : this.models;
+    const timeoutMs = Math.min(this.timeoutMs, 25_000);
+    const paused = groundingStatus();
+    if (paused.blocked) throw new TriageError(`Google Search grounding is paused for another ${paused.secondsLeft}s. ${paused.reason}`);
+    const errors: string[] = [];
+    const quotaLimit = Math.min(2, order.length);
+    let quotaHits = 0;
+    let lastError = "no attempt was made";
+
+    for (const model of order) {
+      const controller = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+      try {
+        const response = await client.models.generateContent({
+          model,
+          contents: `Search the web for: ${query}\nName the most relevant, authoritative pages (official documentation first) and say in one sentence what each one explains.`,
+          config: { tools: [{ googleSearch: {} }], maxOutputTokens: 2048, ...thinkingConfig(), abortSignal: controller.signal },
+        });
+        const meta = response.candidates?.[0]?.groundingMetadata;
+        const chunks: any[] = meta?.groundingChunks ?? [];
+        const supports: any[] = meta?.groundingSupports ?? [];
+        const sources: Array<{ title: string; url: string; snippet: string }> = [];
+        chunks.forEach((c, i) => {
+          const web = c?.web;
+          if (!web?.uri) return;
+          const snippet = supports
+            .filter((s) => (s?.groundingChunkIndices ?? []).includes(i))
+            .map((s) => String(s?.segment?.text ?? "").trim())
+            .filter(Boolean)
+            .join(" ")
+            .slice(0, 400);
+          sources.push({ title: String(web.title ?? web.uri), url: String(web.uri), snippet });
+        });
+        if (!sources.length) throw new Error("Gemini returned no web sources for this query");
+        this.activeModel = model;
+        return { sources, model };
+      } catch (err: any) {
+        const message = timedOut ? "no answer in time" : String(err?.message ?? err).split("\n")[0].slice(0, 300);
+        lastError = `${model}: ${message}`;
+        if (!errors.includes(message)) errors.push(message);
+        if (!timedOut && classify(err) === "fatal") throw new TriageError(`Gemini rejected the request (${message}). Check GEMINI_API_KEY.`, true);
+        if (!timedOut && isQuotaError(err) && ++quotaHits >= quotaLimit) {
+          // Out of quota on two models in a row: the allowance is shared, so more tries only waste time.
+          blockGrounding(`${QUOTA_HINT} (${message})`);
+          break;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (quotaHits >= quotaLimit) throw new TriageError(`${QUOTA_HINT} Details: ${errors.slice(0, 2).join(" | ")}`);
+    throw new TriageError(`Gemini search failed (tried ${order.join(", ")}). Errors: ${errors.slice(0, 3).join(" | ") || lastError}`);
+  }
+
+  /**
    * Free-text answer about one image (used by `/image` to turn a screenshot or mockup into a design brief).
    * Tries the model chain; overloaded, slow or retired models are skipped.
    */
@@ -319,6 +413,92 @@ export class GeminiTriageClient {
       }
     }
     throw new TriageError(`No Gemini model could read the image (tried ${order.join(", ")}). Last error: ${lastError}`);
+  }
+
+  /**
+   * The research stage (see src/research): one Gemini call that may search Google (grounding) while it works out what the
+   * request really is. Grounding cannot be combined with a JSON response mode on every model, so with grounding the answer
+   * is free text that the caller parses; without grounding the JSON mode is used instead.
+   * Returns the answer plus the pages and search queries Google used (the page links are Google redirect links).
+   */
+  async research(
+    systemInstruction: string,
+    userContent: string,
+    opts: { grounding?: boolean; maxTokens?: number } = {},
+  ): Promise<{ text: string; sources: Array<{ title: string; url: string }>; queries: string[]; model: string; grounded: boolean; note?: string }> {
+    const client = await this.getClient();
+    const order = this.activeModel ? [this.activeModel, ...this.models.filter((m) => m !== this.activeModel)] : this.models;
+    let grounded = opts.grounding !== false;
+    let note: string | undefined;
+    if (grounded && groundingStatus().blocked) {
+      grounded = false;
+      note = "Google Search grounding is paused (quota reached): this brief comes from the model's own knowledge, not from a search.";
+    }
+    const timeoutMs = Number(process.env.AGENT_RESEARCH_TIMEOUT_MS) || this.timeoutMs;
+    let lastError = "no attempt was made";
+
+    for (const model of order) {
+      let attempts = 0;
+      while (attempts < 2) {
+        attempts++;
+        const controller = new AbortController();
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs);
+        try {
+          const response = await client.models.generateContent({
+            model,
+            contents: userContent,
+            config: {
+              systemInstruction,
+              ...(grounded ? { tools: [{ googleSearch: {} }] } : { responseMimeType: "application/json" }),
+              maxOutputTokens: opts.maxTokens ?? 8192,
+              ...thinkingConfig(),
+              abortSignal: controller.signal,
+            },
+          });
+          const text = (response.text ?? "").trim();
+          if (!text) throw new Error("empty answer");
+
+          const meta = response.candidates?.[0]?.groundingMetadata;
+          const seen = new Set<string>();
+          const sources: Array<{ title: string; url: string }> = [];
+          for (const chunk of (meta?.groundingChunks ?? []) as any[]) {
+            const web = chunk?.web;
+            if (!web?.uri || seen.has(String(web.uri))) continue;
+            seen.add(String(web.uri));
+            sources.push({ title: String(web.title ?? web.uri), url: String(web.uri) });
+          }
+          const queries = ((meta?.webSearchQueries ?? []) as unknown[]).map((q) => String(q)).filter(Boolean);
+
+          this.activeModel = model;
+          return { text, sources, queries, model, grounded, note };
+        } catch (err: any) {
+          const message = timedOut ? "no answer in time" : String(err?.message ?? err).split("\n")[0].slice(0, 300);
+          lastError = `${model}: ${message}`;
+          if (grounded && !timedOut && isQuotaError(err)) {
+            // The Google Search allowance is used up: carry on with the same model WITHOUT searching instead of failing the stage.
+            blockGrounding(`${QUOTA_HINT} (${message})`);
+            grounded = false;
+            note = "Google Search grounding quota reached (HTTP 429): this brief comes from the model's own knowledge, not from a search.";
+            attempts--;
+            continue;
+          }
+          const kind = timedOut ? "timeout" : classify(err);
+          if (kind === "fatal") throw new TriageError(`Gemini rejected the request (${message}). Check GEMINI_API_KEY and that the API is enabled for it.`, true);
+          if (kind === "transient" && attempts < 2) {
+            await sleep(2000);
+            continue;
+          }
+          break; // retired, too slow or out of retries: next model
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    }
+    throw new TriageError(`No Gemini model finished the research step (tried ${order.join(", ")}). Last error: ${lastError}`);
   }
 
   /** Tiny real request per model: tells you which ids work and how long they take (for `triage-models --test`). */
