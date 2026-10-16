@@ -10,6 +10,40 @@
       "args": ["mcp-server-fetch"],
       "autoApprove": false,
       "disabled": true
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "tools": ["resolve-library-id", "query-docs"],
+      "autoApprove": false,
+      "disabled": true
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated", "--allowed-origins", "http://localhost:3000;http://127.0.0.1:3000;http://localhost:3001;http://127.0.0.1:3001;http://localhost:5173;http://127.0.0.1:5173"],
+      "tools": [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_fill_form",
+        "browser_press_key",
+        "browser_select_option",
+        "browser_wait_for",
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_close"
+      ],
+      "autoApproveTools": ["browser_snapshot", "browser_console_messages", "browser_network_requests", "browser_wait_for", "browser_close"],
+      "autoApprove": false,
+      "disabled": false
+    },
+    "github": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}" },
+      "autoApprove": false,
+      "disabled": true
     }
   }
 }

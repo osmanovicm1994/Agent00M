@@ -17,7 +17,26 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   // Tools of this server run without a y/n prompt (use for side-effect-free servers like sequential-thinking).
   autoApprove?: boolean;
+  // Only these tools of the server are exposed to the model. Every tool schema is sent with every request, so a
+  // server with 25 tools costs a small context window dearly: list just the ones the agent needs.
+  tools?: string[];
+  // Tools (by the server's own name) that run without a y/n prompt even when autoApprove is not set.
+  autoApproveTools?: string[];
   disabled?: boolean;
+}
+
+/** Replaces ${NAME} with the value from the environment (empty when unset), so secrets never live in the JSON file. */
+export function expandVars(value: string, env: NodeJS.ProcessEnv = process.env): string {
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name: string) => env[name] ?? "");
+}
+
+/** The tools a server config allows; all of them when no allowlist is set. */
+export function filterTools<T extends { name: string }>(tools: T[], allow?: string[]): T[] {
+  return allow && allow.length > 0 ? tools.filter((t) => allow.includes(t.name)) : tools;
+}
+
+export function isAutoApproved(cfg: McpServerConfig, toolName: string): boolean {
+  return cfg.autoApprove === true || cfg.autoApproveTools?.includes(toolName) === true;
 }
 
 export interface McpConfig {
@@ -52,9 +71,11 @@ class McpConnection {
   ) {}
 
   async start(timeoutMs = 60_000): Promise<void> {
-    this.proc = spawn(this.cfg.command, this.cfg.args ?? [], {
+    const extraEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(this.cfg.env ?? {})) extraEnv[k] = expandVars(v);
+    this.proc = spawn(this.cfg.command, (this.cfg.args ?? []).map((a) => expandVars(a)), {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...(this.cfg.env ?? {}) },
+      env: { ...process.env, ...extraEnv },
     });
 
     this.proc.stdout.setEncoding("utf8");
@@ -76,7 +97,7 @@ class McpConnection {
     this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
     const listed = await this.request("tools/list", {}, timeoutMs);
-    this.tools = Array.isArray(listed?.tools) ? listed.tools : [];
+    this.tools = filterTools(Array.isArray(listed?.tools) ? (listed.tools as McpTool[]) : [], this.cfg.tools);
   }
 
   async callTool(toolName: string, args: Record<string, unknown>, timeoutMs = 120_000): Promise<string> {
@@ -244,7 +265,8 @@ export class McpManager {
   }
 
   autoApprove(name: string): boolean {
-    return this.byName.get(name)?.conn.cfg.autoApprove === true;
+    const entry = this.byName.get(name);
+    return entry ? isAutoApproved(entry.conn.cfg, entry.tool.name) : false;
   }
 
   async call(name: string, args: Record<string, unknown>): Promise<string> {

@@ -26,6 +26,10 @@
 - After a code change run the narrowest check (typecheck, affected test, build). If the same failure comes back three times, stop varying the fix: say what you tried and what the error says.
 - Never use destructive commands (`rm -rf`, `git reset --hard`, `git clean`, `git push`, `sudo`) unless the user asked for exactly that.
 
+## Optional MCP tools (only when they appear in your tool list)
+- `query-docs` (with `resolve-library-id` first): look up the current API of a fast-moving library (Next.js, Prisma, NestJS, Tailwind) before using it, instead of relying on memory. Without it, use `web_research` on the official docs.
+- `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_fill_form`: after `start_process` brought the app up, walk the main user flow (for example sign up, log in, create, log out), then read `browser_console_messages`. Report what failed with the exact message. Use test data only, never real secrets.
+
 ## Planning (tasks with 4 or more steps)
 - First call `update_plan` with small, verifiable steps. Tick a step (`done`) only after you verified it. Call `update_plan` with no arguments to re-read the plan after a long session; the plan file survives a context reset.
 - Record decisions and blockers with `note`. Do not finish with open steps unless your answer says which remain and why.

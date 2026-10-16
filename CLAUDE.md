@@ -84,7 +84,7 @@ src/
   knowledge/             markdown standards injected into agent prompts (see below).
 web/                     separate Vite + React + Tailwind dashboard (own package.json, not part of the root tsc).
 docs/                    AGENTS.md (agent catalog), MODELS.md (models and LM Studio settings).
-mcp.config.json          MCP servers started at launch.
+mcp.config.json          MCP servers started at launch. Per server: `command`/`args`/`env` (`${NAME}` is filled from the environment, so tokens stay out of the file), `tools` (allowlist: every exposed tool schema costs context), `autoApprove`, `autoApproveTools`, `disabled`. Only `sequential-thinking` is enabled. Ready but disabled (set `"disabled": false` to use): `context7` (library docs; the query goes to Upstash's cloud, so it is opt-in), `playwright` (`@playwright/mcp`, headless, isolated, localhost origins only, 11 allowed tools: drives and checks the running app), `github` (Docker image, needs `GITHUB_PERSONAL_ACCESS_TOKEN` in `.env`; every call asks). Neon's MCP server is remote-only and not supported by the stdio client; use Prisma/Drizzle migrations instead.
 _to_delete/              git-ignored, excluded from tsconfig: leftovers of the removed Anthropic provider, the old tools/tree.ts and test-tools.ts, and the superseded 08-logic/tool-execution.md. Safe to delete by hand.
 ```
 
