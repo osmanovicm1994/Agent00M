@@ -19,11 +19,12 @@ import { runInspectPage, browserToolSchemas } from "../tools/browser.tool";
 import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./command-safety";
 import { analyzeTask } from "../agents/orchestration";
 import { ProcessManager, processToolSchemas } from "../tools/process.tool";
+import { deployToolSchemas, runDeployTemplate, runPredeployCheck } from "../tools/deploy.tool";
 import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas];
 
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
@@ -68,6 +69,8 @@ const READ_ONLY_TOOLS = new Set([
   "web_research",
   "inspect_page",
   "design_search",
+  "deploy_template",
+  "predeploy_check",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1026,12 @@ When you are done and have no more actions to take, reply normally with a final 
       
       case "design_search":
         return runDesignSearch(args);
+
+      case "deploy_template":
+        return runDeployTemplate(args);
+
+      case "predeploy_check":
+        return runPredeployCheck(this.workspaceRoot);
 
       case "update_plan": {
         if (state.readOnly) return READ_ONLY_REFUSAL;
