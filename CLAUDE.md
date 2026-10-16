@@ -49,6 +49,7 @@ src/
     diff.ts              colored diff shown before a write is approved.
     events.ts            in-process event bus (bus.emit / bus.withRun). Core code only emits; it never imports the server.
     event-types.ts       wire types shared with web/ (types only, no runtime imports).
+    plan.ts              persisted build plan: `.agent/plan.md` in the TARGET project (git-ignored via `.agent/.gitignore`). parse/render/applyPlanUpdate are pure; PlanStore reads/writes; planToolSchema = `update_plan`.
     run-feedback.ts      pure: errorSignature + RepeatTracker (same failure 3x -> stop note), summarizeFailures (failing lines of a long log), isCodeFile (what the verify gate checks).
     command-safety.ts    SAFE_DIAGNOSTIC_RES / isSafeDiagnostic and DANGEROUS_COMMAND_RES / isDangerousCommand (pure, unit-tested).
     control.ts           UI-agnostic control hook (tasks, approvals, startup questions) shared by terminal and dashboard.
@@ -99,6 +100,7 @@ Dependencies worth knowing: `zod` (all model JSON is validated), `prompts` (appr
 
 - Read tools: `read_file` (with `start_line`/`end_line`, truncated at ~40k chars), `read_multiple_files`, `list_directory`, `get_directory_tree` (`path` or legacy `rootDir`), `find_files`, `grep`, plus the web tools.
 - Write tools: `write_file`, `append_file`, `run_command`, `start_process` (same approval and auto-mode rules as `run_command`; `process_logs` and `stop_process` need none).
+- `update_plan` (no approval, refused for read-only roles): `steps` replaces the list (finished steps with the same text stay done), `done`/`reopen` take 1-based step numbers, `goal`, `note`; no arguments = read the plan. The saved plan is appended to the first message of the next run, and a run that used `update_plan` gets one nudge (step 3d) if it ends with open steps. The team-mode PM plan is still not persisted.
 - Verify gate (executor, step 3b/3c): a code-writing agent that changed a code file and ends without running any command since gets ONE nudge to run the narrowest check (or say UNVERIFIED); if its last command failed and nothing changed since, one nudge to fix it or report the failure honestly. `kb-harvester`, `research` and read-only roles are exempt. The same failure signature 3 times adds a stop-and-report note to the command result; failed runs with long output also get a `failureSummary`.
 - Writes use a **raw fenced block**, never JSON-escaped content: the opening line carries the path.
 

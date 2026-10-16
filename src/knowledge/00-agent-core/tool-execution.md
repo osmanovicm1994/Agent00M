@@ -26,6 +26,10 @@
 - After a code change run the narrowest check (typecheck, affected test, build). If the same failure comes back three times, stop varying the fix: say what you tried and what the error says.
 - Never use destructive commands (`rm -rf`, `git reset --hard`, `git clean`, `git push`, `sudo`) unless the user asked for exactly that.
 
+## Planning (tasks with 4 or more steps)
+- First call `update_plan` with small, verifiable steps. Tick a step (`done`) only after you verified it. Call `update_plan` with no arguments to re-read the plan after a long session; the plan file survives a context reset.
+- Record decisions and blockers with `note`. Do not finish with open steps unless your answer says which remain and why.
+
 ## Grounding
 - Never guess paths, frameworks or file contents. Confirm on disk first.
 - If a tool returns an error, fix the cause; do not continue as if it succeeded.

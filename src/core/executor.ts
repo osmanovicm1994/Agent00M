@@ -19,9 +19,10 @@ import { runInspectPage, browserToolSchemas } from "../tools/browser.tool";
 import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./command-safety";
 import { analyzeTask } from "../agents/orchestration";
 import { ProcessManager, processToolSchemas } from "../tools/process.tool";
+import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema];
 
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
@@ -322,6 +323,9 @@ interface SessionState {
   failNudged: boolean;
   // Identical failures seen in this run (see run-feedback.ts).
   repeats: RepeatTracker;
+  // The agent used update_plan in this run: it may not end with open steps without being asked once.
+  planUsed: boolean;
+  planNudged: boolean;
   // Review roles (AgentDefinition.readOnly): no file writes, only read-only diagnostic commands.
   readOnly: boolean;
   // The user stopped a running command with Ctrl+C: the loop ends right away.
@@ -348,6 +352,8 @@ function newSessionState(): SessionState {
     lastRunFailed: false,
     failNudged: false,
     repeats: new RepeatTracker(),
+    planUsed: false,
+    planNudged: false,
     readOnly: false,
     interrupted: false,
   };
@@ -633,7 +639,7 @@ When you are done and have no more actions to take, reply normally with a final 
       { role: "system", content: systemPrompt },
       {
         role: "user",
-        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}`,
+        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}${this.existingPlanNote()}`,
       },
     ];
 
@@ -745,6 +751,26 @@ When you are done and have no more actions to take, reply normally with a final 
               "or make your final answer say clearly that it still fails, with the error. Do not describe the work as done.",
           });
           continue;
+        }
+
+        // 3d) The agent made a plan in this run and is about to finish with steps still open.
+        if (state.planUsed && !state.readOnly && !state.planNudged && nudges < MAX_NUDGES) {
+          const plan = new PlanStore(this.workspaceRoot).load();
+          const open = plan ? openSteps(plan) : [];
+          if (open.length > 0) {
+            nudges++;
+            state.planNudged = true;
+            console.log(pc.dim(`\n(The plan still has ${open.length} open step(s) — asking the agent to continue or explain.)`));
+            messages.push({ role: "assistant", content: response.content });
+            messages.push({
+              role: "user",
+              content:
+                `Your plan (.agent/plan.md) still has ${open.length} open step(s): ` +
+                open.slice(0, 5).map((s) => `${s.n}. ${s.text}`).join("; ") +
+                ". Continue with the next one. Mark steps done only after verifying them. If you must stop early, your final answer must say which steps remain and why.",
+            });
+            continue;
+          }
         }
 
         // 4) Hallucinated success: claims changes to files that were never written.
@@ -873,6 +899,17 @@ When you are done and have no more actions to take, reply normally with a final 
     return JSON.stringify(out);
   }
 
+  /** Added to the first message when an earlier run left a plan in the project. */
+  private existingPlanNote(): string {
+    const plan = new PlanStore(this.workspaceRoot).load();
+    if (!plan) return "";
+    return (
+      "\n\nEXISTING PLAN from an earlier run (.agent/plan.md). If this task continues that work, carry on with the open steps; " +
+      "if it is a different task, replace the plan with update_plan.\n" +
+      describePlan(plan)
+    );
+  }
+
   private async handleToolCall(call: ToolCall, state: SessionState, outputWasCutOff = false): Promise<string> {
     let args: Record<string, any>;
     try {
@@ -979,6 +1016,26 @@ When you are done and have no more actions to take, reply normally with a final 
       case "inspect_page":
         return runInspectPage(args, this.workspaceRoot);
       
+      case "update_plan": {
+        if (state.readOnly) return READ_ONLY_REFUSAL;
+        const store = new PlanStore(this.workspaceRoot);
+        const current = store.load() ?? emptyPlan();
+        const hasUpdate = ["goal", "steps", "done", "reopen", "note"].some((k) => args[k] !== undefined);
+        if (!hasUpdate) {
+          return current.steps.length > 0 ? describePlan(current) : "No plan yet. Create one with update_plan and steps: [...].";
+        }
+        const { plan, warnings } = applyPlanUpdate(current, args);
+        try {
+          store.save(plan);
+        } catch (err: any) {
+          return `TOOL ERROR: could not save the plan: ${err?.message ?? err}`;
+        }
+        state.planUsed = true;
+        const done = plan.steps.filter((s) => s.done).length;
+        console.log(pc.dim(`📋 plan: ${done}/${plan.steps.length} steps done`));
+        return describePlan(plan) + (warnings.length ? `\n${warnings.join("\n")}` : "");
+      }
+
       case "start_process": {
         if (state.readOnly) return READ_ONLY_REFUSAL;
         const command = String(args.command ?? "").trim();
