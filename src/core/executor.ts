@@ -19,10 +19,11 @@ import { runInspectPage, browserToolSchemas } from "../tools/browser.tool";
 import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./command-safety";
 import { analyzeTask } from "../agents/orchestration";
 import { ProcessManager, processToolSchemas } from "../tools/process.tool";
+import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema];
 
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
@@ -66,6 +67,7 @@ const READ_ONLY_TOOLS = new Set([
   "web_fetch",
   "web_research",
   "inspect_page",
+  "design_search",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -627,8 +629,11 @@ When you are done and have no more actions to take, reply normally with a final 
     }
     // The target project's own rules (AGENTS.md / CLAUDE.md in its root) are part of the prompt, so the user's
     // conventions for that project are followed without being repeated in every task.
-    const projectContext = loadProjectContext(this.workspaceRoot);
-    if (projectContext) console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
+    // The project's own design system (design-system/MASTER.md) is followed by the agents that build UI.
+    const designContext = agent.id === "design" || agent.id === "dev" ? loadDesignSystem(this.workspaceRoot) : "";
+    if (designContext) console.log(pc.dim("Design system loaded from design-system/MASTER.md"));
+    const projectContext = loadProjectContext(this.workspaceRoot) + designContext;
+    if (projectContext && !designContext) console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
     const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext);
 
     // Ground the agent in reality before it can guess: show the real tree as the
@@ -1016,6 +1021,9 @@ When you are done and have no more actions to take, reply normally with a final 
       case "inspect_page":
         return runInspectPage(args, this.workspaceRoot);
       
+      case "design_search":
+        return runDesignSearch(args);
+
       case "update_plan": {
         if (state.readOnly) return READ_ONLY_REFUSAL;
         const store = new PlanStore(this.workspaceRoot);

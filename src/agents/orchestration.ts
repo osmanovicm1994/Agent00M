@@ -335,6 +335,14 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     weight: 4,
     skipFor: NO_CODE_AGENTS,
   },
+  // Interface work: how to use design_search and the project's design-system/MASTER.md.
+  {
+    id: "design-system",
+    test: /design system|landing page|\bdashboard\b|\bfront-?end\b|\bredesign|\bbrand(ing)?\b|look and feel|style guide|\btheme\b|color palette|colou?r scheme|master\.md|\bui\b|\bux\b|\bfull[- ]?stack\b/i,
+    files: ["10-design/design-system-workflow.md"],
+    weight: 5,
+    onlyFor: ["design", "dev"],
+  },
 ];
 
 export interface KnowledgePick {

@@ -66,6 +66,7 @@ This is how the logic standards reach every agent whose task needs them. Rules a
 | nextjs / nestjs / auth-jwt | Next.js, App Router, NestJS, JWT, refresh token | `12-fullstack/01`, `02`, `03` | 4 |
 | orm / neon / object-storage / docker-deploy / ci-testing | Prisma, Drizzle, Neon, R2, S3, Docker, VPS, deploy, GitHub Actions, e2e suite | `12-fullstack/04` to `08` | 3 |
 | owasp | OWASP, security review/audit | `07-api/05-owasp-checklist.md` | 4 |
+| design-system (design, dev only) | UI, UX, dashboard, landing page, theme, brand, full-stack | `10-design/design-system-workflow.md` | 5 |
 
 `kb-harvester` and `research` never get task standards. The Project Manager (team mode) gets reasoning-core, decomposition and edge cases appended to its prompt (`PM_KNOWLEDGE`), the Safety Reviewer gets the OWASP checklist and the edge-case standard.
 
