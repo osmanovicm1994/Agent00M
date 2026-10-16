@@ -18,8 +18,13 @@ import { runWebSearch, runWebFetch, runWebResearch, webToolSchemas } from "../to
 import { runInspectPage, browserToolSchemas } from "../tools/browser.tool";
 import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./command-safety";
 import { analyzeTask } from "../agents/orchestration";
+import { ProcessManager, processToolSchemas } from "../tools/process.tool";
+import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas];
+
+// Agents that never change code, so they are never asked to run a check after writing.
+const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
 
 const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 50;
 // Rough character budget for the running conversation. Older bulky tool output
@@ -310,6 +315,13 @@ interface SessionState {
   heavyRuns: number;
   heavyRunsAtLastWrite: number;
   verifyNudged: boolean;
+  // Commands run since the last successful file write (a write resets it): the verify gate for every code agent.
+  runsSinceWrite: number;
+  // The latest command exited non-zero and nothing was written since.
+  lastRunFailed: boolean;
+  failNudged: boolean;
+  // Identical failures seen in this run (see run-feedback.ts).
+  repeats: RepeatTracker;
   // Review roles (AgentDefinition.readOnly): no file writes, only read-only diagnostic commands.
   readOnly: boolean;
   // The user stopped a running command with Ctrl+C: the loop ends right away.
@@ -332,6 +344,10 @@ function newSessionState(): SessionState {
     heavyRuns: 0,
     heavyRunsAtLastWrite: 0,
     verifyNudged: false,
+    runsSinceWrite: 0,
+    lastRunFailed: false,
+    failNudged: false,
+    repeats: new RepeatTracker(),
     readOnly: false,
     interrupted: false,
   };
@@ -340,6 +356,7 @@ function newSessionState(): SessionState {
 export class Executor {
   private fs: FsTools;
   private shell: ShellTool;
+  private procs: ProcessManager;
   private search: SearchTool;
   private toolSchemas: ToolSchema[];
   private autoWrite: boolean;
@@ -357,6 +374,7 @@ export class Executor {
     this.workspaceRoot = path.resolve(workspaceRoot);
     this.fs = new FsTools(this.workspaceRoot);
     this.shell = new ShellTool(this.workspaceRoot);
+    this.procs = new ProcessManager(this.workspaceRoot);
     this.search = new SearchTool(this.workspaceRoot);
     this.toolSchemas = [...BUILTIN_TOOL_SCHEMAS, ...(mcp?.schemas() ?? [])];
   }
@@ -688,24 +706,43 @@ When you are done and have no more actions to take, reply normally with a final 
           continue;
         }
 
-        // 3b) Debug-style agents must prove a fix: files changed, but nothing was run since.
-        if (
-          agent.verifyFixes &&
-          state.filesWritten.length > 0 &&
-          state.heavyRuns === state.heavyRunsAtLastWrite &&
-          !state.verifyNudged &&
-          nudges < MAX_NUDGES
-        ) {
+        // 3b) Verify gate. Debug-style agents must prove a fix; every other code-writing agent must run a check
+        // (typecheck, test, build) after its last code change instead of announcing success untested.
+        const needsVerify = agent.verifyFixes
+          ? state.filesWritten.length > 0 && state.heavyRuns === state.heavyRunsAtLastWrite
+          : !state.readOnly &&
+            !NO_VERIFY_AGENTS.has(agent.id) &&
+            state.filesWritten.some(isCodeFile) &&
+            state.runsSinceWrite === 0;
+        if (needsVerify && !state.verifyNudged && nudges < MAX_NUDGES) {
           nudges++;
           state.verifyNudged = true;
-          console.log(pc.dim("\n(Files were changed but nothing was re-run — asking the agent to verify the fix.)"));
+          console.log(pc.dim("\n(Files were changed but nothing was run since — asking the agent to verify.)"));
+          messages.push({ role: "assistant", content: response.content });
+          messages.push({
+            role: "user",
+            content: agent.verifyFixes
+              ? `You changed ${state.filesWritten.join(", ")} but have not run anything since. Re-run the command that was failing ` +
+                "now (run_command, same command) and base your answer on its real output. If you truly cannot run it, say " +
+                "UNVERIFIED in your final answer and explain why."
+              : `You changed ${state.filesWritten.join(", ")} but have not run any check since. Run the narrowest check that proves it ` +
+                "(typecheck, the affected test, or the build) with run_command and base your answer on its real output. " +
+                "If the project has no such check or you cannot run it, say UNVERIFIED in your final answer and explain why.",
+          });
+          continue;
+        }
+
+        // 3c) The last command failed and nothing was changed since: do not let that end as a success story.
+        if (state.lastRunFailed && !state.readOnly && !state.failNudged && nudges < MAX_NUDGES) {
+          nudges++;
+          state.failNudged = true;
+          console.log(pc.dim("\n(The last command failed — asking the agent to fix it or report it honestly.)"));
           messages.push({ role: "assistant", content: response.content });
           messages.push({
             role: "user",
             content:
-              `You changed ${state.filesWritten.join(", ")} but have not run anything since. Re-run the command that was failing ` +
-              "now (run_command, same command) and base your answer on its real output. If you truly cannot run it, say " +
-              "UNVERIFIED in your final answer and explain why.",
+              "Your last command FAILED (non-zero exit) and you have not changed anything since. Either fix the cause and run it again, " +
+              "or make your final answer say clearly that it still fails, with the error. Do not describe the work as done.",
           });
           continue;
         }
@@ -764,6 +801,10 @@ When you are done and have no more actions to take, reply normally with a final 
         // history (it would otherwise be re-sent to the model on every later turn,
         // twice: as reply text and as tool-call arguments).
         if (/^File (written|appended):/.test(rawResult)) {
+          state.runsSinceWrite = 0;
+          state.lastRunFailed = false;
+          state.verifyNudged = false;
+          state.failNudged = false;
           this.stripWrittenContent(calls[i]);
           // Native-tool models re-read the history as structured tool calls, so the reply text can go.
           // Fenced-block models must keep seeing the exact block format they are supposed to produce.
@@ -938,6 +979,37 @@ When you are done and have no more actions to take, reply normally with a final 
       case "inspect_page":
         return runInspectPage(args, this.workspaceRoot);
       
+      case "start_process": {
+        if (state.readOnly) return READ_ONLY_REFUSAL;
+        const command = String(args.command ?? "").trim();
+        if (!command) return 'TOOL ERROR: start_process requires a non-empty "command".';
+        console.log(`\n${pc.bold("Proposed background process:")} ${pc.yellow(command)}`);
+        const auto = this.autoRunEnabled() && !isDangerousCommand(command) && !escapesWorkspace(command, this.workspaceRoot);
+        if (auto) {
+          console.log(pc.green(`▶ Auto-starting: ${command}`));
+        } else {
+          if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
+          if (!(await confirm("Start this background process?"))) {
+            return "User rejected starting this process. Do not repeat it; ask what to do differently or stop.";
+          }
+        }
+        state.commandsRun.push(command);
+        state.runsSinceWrite++;
+        return this.procs.start({
+          name: args.name,
+          command,
+          port: args.port,
+          readyPattern: args.ready_pattern,
+          waitSeconds: args.wait_seconds,
+        });
+      }
+
+      case "process_logs":
+        return this.procs.logs(args.name, args.tail_chars);
+
+      case "stop_process":
+        return this.procs.stop(args.name);
+
       case "run_command": {
         console.log(`\n${pc.bold("Proposed command:")} ${pc.yellow(String(args.command))}`);
         if (args.reason) console.log(pc.dim(`Reason: ${args.reason}`));
@@ -982,11 +1054,22 @@ When you are done and have no more actions to take, reply normally with a final 
         console.log();
         if (result.interrupted) state.interrupted = true;
         state.commandsRun.push(command);
+        state.runsSinceWrite++;
         if (!diagnostic) state.heavyRuns++;
+
+        // A failed run: a short list of the failing lines (the middle of a long log is cut), and a stop signal when
+        // the same failure keeps coming back.
+        const failed = !result.timedOut && !result.interrupted && result.exitCode !== 0;
+        state.lastRunFailed = failed;
+        const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
+        const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
+        if (repeatCount >= REPEAT_LIMIT) console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
 
         return JSON.stringify({
           exitCode: result.exitCode,
           timedOut: result.timedOut,
+          ...(failureSummary ? { failureSummary } : {}),
+          ...(repeatCount >= REPEAT_LIMIT ? { note: repeatNote(repeatCount) } : {}),
           ...(result.interrupted
             ? {
                 interrupted: true,

@@ -33,7 +33,7 @@ export function errorSignature(output: string): string {
   return line
     .toLowerCase()
     .replace(/(?:[a-z]:)?[\\/][^\s:'"()]+/g, "<path>") // file paths
-    .replace(/(?<![a-z])\d+(?:\.\d+)?(?:ms|s)?/g, "#") // numbers, but keep codes such as ts2304
+    .replace(/(?<![a-z\d])\d+(?:\.\d+)?(?:ms|s)?/g, "#") // numbers, but keep codes such as ts2304
     .replace(/\s+/g, " ")
     .slice(0, 160);
 }

@@ -69,6 +69,12 @@ This is how the logic standards reach every agent whose task needs them. Rules a
 
 `kb-harvester` and `research` never get task standards. The Project Manager (team mode) gets reasoning-core, decomposition and edge cases appended to its prompt (`PM_KNOWLEDGE`), the Safety Reviewer gets the OWASP checklist and the edge-case standard.
 
+### Whole-app tasks
+A change task that says full-stack, monorepo, scaffold, bootstrap or new app/project (`isFullstackBuild`) routes to `dev` (it scores one above the best specialist) unless it is a failure report, a research ask or an automation project, and always prints the `/team` hint.
+
+### Verify gate
+Every code-writing agent (not `kb-harvester`, `research` or read-only roles) is nudged once to run a check after its last code-file change, and once more when its last command failed. See CLAUDE.md, "Tool protocol".
+
 ### Cross-cutting tasks
 `analyzeTask().crossCutting` is true when a change task touches 3+ build domains (api, db, design, qa), or 2 domains and more than 240 chars. The executor prints a hint to use `/team <task>`; it never switches modes by itself.
 

@@ -189,7 +189,9 @@ Weak spots and fixes:
 
 ## 8. Phase-by-phase roadmap
 
-**Status (2026-10-16): Phase 1 is implemented, not yet run.** Done: knowledge packs `12-fullstack/00-08` and `07-api/05-owasp-checklist.md`; task rules for Next.js, NestJS, JWT, Prisma/Drizzle, Neon, R2, Docker/deploy, CI and OWASP (so an empty workspace gets them from the task text); `AGENTS.md`/`CLAUDE.md` injection from the target project; Safety Reviewer reads the OWASP checklist; defaults raised to 5 files / 8000 characters; tests in `src/agents/fullstack.test.ts`. Not done from Phase 1: nothing; verify with `npm run typecheck && npm test` and `npx ts-node src/cli.ts route "<task>"`. Phases 0 and 2-7 are untouched.
+**Status (2026-10-16): Phase 1 is implemented, not yet run.** Done: knowledge packs `12-fullstack/00-08` and `07-api/05-owasp-checklist.md`; task rules for Next.js, NestJS, JWT, Prisma/Drizzle, Neon, R2, Docker/deploy, CI and OWASP (so an empty workspace gets them from the task text); `AGENTS.md`/`CLAUDE.md` injection from the target project; Safety Reviewer reads the OWASP checklist; defaults raised to 5 files / 8000 characters; tests in `src/agents/fullstack.test.ts`. Not done from Phase 1: nothing; verify with `npm run typecheck && npm test` and `npx ts-node src/cli.ts route "<task>"`. 
+
+**Phase 2 is implemented, not yet run (2026-10-16).** Done: verify gate for every code-writing agent plus a failed-last-command check (`executor.ts` 3b/3c); `start_process` / `process_logs` / `stop_process` (`tools/process.tool.ts`); `failureSummary` for long failing output and a stop-and-report note after the same failure 3 times (`core/run-feedback.ts`); whole-app tasks ("full-stack", "monorepo", "new app", "scaffold") route to `dev` with a `/team` hint instead of whichever specialist keyword matched. Tests: `run-feedback.test.ts`, `process.test.ts`, `fullstack-routing.test.ts`. Not done: persisted plan (Phase 3), design search (Phase 4), MCP additions (Phase 5). Phases 0 and 3-7 are untouched.
 
 Each phase ends with a measurable check. Run `npm run typecheck && npm test` after each.
 

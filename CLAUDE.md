@@ -49,6 +49,7 @@ src/
     diff.ts              colored diff shown before a write is approved.
     events.ts            in-process event bus (bus.emit / bus.withRun). Core code only emits; it never imports the server.
     event-types.ts       wire types shared with web/ (types only, no runtime imports).
+    run-feedback.ts      pure: errorSignature + RepeatTracker (same failure 3x -> stop note), summarizeFailures (failing lines of a long log), isCodeFile (what the verify gate checks).
     command-safety.ts    SAFE_DIAGNOSTIC_RES / isSafeDiagnostic and DANGEROUS_COMMAND_RES / isDangerousCommand (pure, unit-tested).
     control.ts           UI-agnostic control hook (tasks, approvals, startup questions) shared by terminal and dashboard.
     interrupt.ts         Ctrl+C handling while a command runs (raw-mode stdin).
@@ -73,6 +74,7 @@ src/
     fs.tool.ts           workspace-scoped file tools + tool schemas.
     search.tool.ts       find_files, grep.   shell.tool.ts  run_command (async, streams output, kills the whole process group on timeout).
     web-search.tool.ts   web_search, web_fetch, web_research.
+    process.tool.ts      start_process / process_logs / stop_process: background dev servers (detached, bounded log buffer, waits for a port or ready pattern, max 4, all stopped when the CLI exits).
     browser.tool.ts      inspect_page: headless Chromium (Playwright) facts about a localhost page or workspace .html file. Read-only.
     index.ts             non-interactive ToolDispatcher (scripts/tests). Executor does NOT use it.
     tools.test.ts        unit tests for the file/search tools and dispatcher.
@@ -96,7 +98,8 @@ Dependencies worth knowing: `zod` (all model JSON is validated), `prompts` (appr
 ### Tool protocol
 
 - Read tools: `read_file` (with `start_line`/`end_line`, truncated at ~40k chars), `read_multiple_files`, `list_directory`, `get_directory_tree` (`path` or legacy `rootDir`), `find_files`, `grep`, plus the web tools.
-- Write tools: `write_file`, `append_file`, `run_command`.
+- Write tools: `write_file`, `append_file`, `run_command`, `start_process` (same approval and auto-mode rules as `run_command`; `process_logs` and `stop_process` need none).
+- Verify gate (executor, step 3b/3c): a code-writing agent that changed a code file and ends without running any command since gets ONE nudge to run the narrowest check (or say UNVERIFIED); if its last command failed and nothing changed since, one nudge to fix it or report the failure honestly. `kb-harvester`, `research` and read-only roles are exempt. The same failure signature 3 times adds a stop-and-report note to the command result; failed runs with long output also get a `failureSummary`.
 - Writes use a **raw fenced block**, never JSON-escaped content: the opening line carries the path.
 
   ````
@@ -286,5 +289,6 @@ npx ts-node src/cli.ts run "task" -p /path --serve   # one-shot run, same socket
 - The LLM response cache key includes the full message history, so it mainly helps identical re-runs (old entries are pruned by age and size).
 - Shell commands run through `run_command` after user approval, or automatically in auto mode (except the risky-command list and commands that name paths outside the project, see above). There is still no real sandbox: a script the agent wrote can touch anything. Auto mode runs model-chosen commands on your machine: use it on projects under version control.
 - `inspect_page` reports facts (errors, overflow, structure, a11y) but cannot judge how a page looks, and it needs a running dev server URL or a static .html file plus `npx playwright install chromium`. The frontend agent reports visual checks as "Not verified".
+- Phase 2 (verify gate, process tool, repeated-error stop, whole-app tasks routed to `dev` with a `/team` hint) is implemented and unit-tested, but not yet exercised against a real model. Background processes are stopped on a normal exit; a hard kill of the CLI can leave a dev server running.
 - Keyword routing and task rules are regex heuristics: tune `DOMAIN_KEYWORDS` / `KNOWLEDGE_RULES` and their tests when a task is misrouted.
 - `gateway/` is still in use (shared Gemini plumbing for `research/`); only the old triage interceptor was removed.

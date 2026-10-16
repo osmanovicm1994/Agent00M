@@ -403,7 +403,7 @@ export function analyzeTask(task: string, agentId: string = "dev", opts: RankOpt
     crossCutting,
     knowledge: selectTaskKnowledge(task, agentId),
     teamHint: crossCutting
-      ? `This task spans ${domains.length ? domains.join(" + ") : "frontend + backend + database"}. One agent works best on one layer: "/team <task>" (or run --team) lets a Project Manager split it across specialists and a Safety Reviewer check the result.`
+      ? `This task spans ${isFullstackBuild(task) ? "a whole application (frontend + backend + database)" : domains.join(" + ")}. One agent works best on one layer: "/team <task>" (or run --team) lets a Project Manager split it across specialists and a Safety Reviewer check the result.`
       : undefined,
   };
 }

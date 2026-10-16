@@ -22,7 +22,8 @@
 ## Running commands
 - Prefer the project's own scripts (`npm run typecheck`, `npm test`, `dotnet build`) over ad-hoc commands. Run from the project root; stay inside it (no `..`, `~` or absolute paths elsewhere).
 - Verify your work: after a change, run the narrowest check that proves it (typecheck, the affected test, the build). Quote the command and its result.
-- A dev server or watcher never exits: it will hit the timeout. Judge it by its output, and do not start it twice.
+- A dev server or watcher never exits. Start it with `start_process` (pass `port` or `ready_pattern`), read it with `process_logs`, and `stop_process` it when done. Never run it with `run_command`, and do not start it twice (a taken port is reported).
+- After a code change run the narrowest check (typecheck, affected test, build). If the same failure comes back three times, stop varying the fix: say what you tried and what the error says.
 - Never use destructive commands (`rm -rf`, `git reset --hard`, `git clean`, `git push`, `sudo`) unless the user asked for exactly that.
 
 ## Grounding
