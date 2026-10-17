@@ -39,9 +39,9 @@ describe("applyPlanUpdate", () => {
   });
 
   it("caps steps and notes and does not mutate its input", () => {
-    const many = Array.from({ length: 40 }, (_, i) => `step ${i}`);
+    const many = Array.from({ length: 200 }, (_, i) => `step ${i}`);
     const r = applyPlanUpdate(emptyPlan(), { steps: many });
-    expect(r.plan.steps).toHaveLength(30);
+    expect(r.plan.steps).toHaveLength(150);
     expect(r.warnings.length).toBeGreaterThan(0);
     let p = emptyPlan();
     for (let i = 0; i < 20; i++) p = applyPlanUpdate(p, { note: `n${i}` }).plan;
