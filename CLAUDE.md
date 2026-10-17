@@ -28,6 +28,8 @@ npx ts-node src/cli.ts agents
 npx ts-node src/cli.ts route "task text" [-p /path/to/project]   # dry run: signals, chosen agent, task standards (no model call); use it to tune orchestration.ts
 npm run models           # list models on the LM Studio server (+ native/fenced tool mode)
 npm run bench            # first-token time, tok/s and tool-calling check of the model in .env.local
+npm run bench:fullstack -- --baseline   # full-stack benchmark sanity check: every acceptance check must FAIL on an empty folder (no model needed)
+npm run bench:fullstack -- --workspace ~/bench-app   # runs bench/fullstack/spec.json slice by slice through `run -y --no-mcp` (LM Studio, hours); results in bench/fullstack/results/; --accept-only, --from, --only, --max, --stop-on-fail, --team, --compare a.json b.json
 npm run chat:qwen3       # profiles: chat:qwen3 | chat:devstral | chat:codestral (bench:* likewise)
 npm run triage:models    # Gemini models the API key can use, and the order they are tried (--test pings each)
 npm run search:test -- "query"   # run one web search and show which engine answered or failed
@@ -71,6 +73,8 @@ src/
   team/
     orchestrator.ts      team mode workflow.   roles.ts   PM / UX / report prompts, ROLE_TITLES, safetyAgent.
   vision/describe.ts     reference picture -> text design brief (local vision model, else Gemini).
+  bench/
+    fullstack-bench.ts   pure: spec schema, slice selection, summaries, markdown report, before/after compare.   run.ts  the runner (spawns the agent and the acceptance commands).
   tools/
     fs.tool.ts           workspace-scoped file tools + tool schemas.
     search.tool.ts       find_files, grep.   shell.tool.ts  run_command (async, streams output, kills the whole process group on timeout).

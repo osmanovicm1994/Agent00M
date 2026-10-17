@@ -273,6 +273,13 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     onlyFor: FULLSTACK_AGENTS,
   },
   {
+    id: "scaffolding",
+    test: /\bscaffold|create-next-app|\bnest new\b|@nestjs\/cli|\bmonorepo\b|\bnew (web )?(app|application|project)\b/i,
+    files: ["12-fullstack/09-scaffolding.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
     id: "nextjs",
     test: /\bnext\.?js\b|app router|server actions?|create-next-app|\bnext (app|project|page|route)\b/i,
     files: ["12-fullstack/01-nextjs-app-router.md"],
@@ -326,6 +333,28 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     test: /github actions|\bci\/cd\b|\bci pipeline\b|e2e (suite|tests?)|end-to-end tests?|\bwebserver\b/i,
     files: ["12-fullstack/08-ci-testing.md"],
     weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  // Other stacks: a new project of that kind has no marker files yet, so detectStackKnowledge cannot see it.
+  {
+    id: "ios-swift",
+    test: /\bswiftui\b|\bswift\b|\bxcode\b|\bios (app|application|project)\b|\buikit\b/i,
+    files: ["03-mobile/ios-swiftui.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "android-kotlin",
+    test: /\bkotlin\b|jetpack compose|\bandroid (app|application|project|studio)\b|\bgradle\b/i,
+    files: ["03-mobile/android-compose.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "python-api",
+    test: /\bfastapi\b|\buvicorn\b|\bpydantic\b|\bpython (api|backend|service|app)\b/i,
+    files: ["05-backend/python-fastapi.md"],
+    weight: 4,
     onlyFor: FULLSTACK_AGENTS,
   },
   {

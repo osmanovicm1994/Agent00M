@@ -211,15 +211,26 @@ function readText(file: string): string | null {
   }
 }
 
-/** The root and its direct sub-folders (apps), without dependency and build folders. */
+// Folders that hold the apps of a monorepo: apps/web, apps/api, packages/x, services/x.
+const MONOREPO_PARENTS = new Set(["apps", "packages", "services"]);
+
+function subDirs(dir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith(".") && !SKIP_DIRS.has(e.name))
+      .map((e) => path.join(dir, e.name));
+  } catch {
+    return []; // unreadable folder
+  }
+}
+
+/** The root, its direct sub-folders, and the apps inside apps/, packages/ and services/; without dependency and build folders. */
 function appDirs(root: string): string[] {
   const dirs = [root];
-  try {
-    for (const e of fs.readdirSync(root, { withFileTypes: true })) {
-      if (e.isDirectory() && !e.name.startsWith(".") && !SKIP_DIRS.has(e.name)) dirs.push(path.join(root, e.name));
-    }
-  } catch {
-    // unreadable root
+  for (const d of subDirs(root)) {
+    dirs.push(d);
+    if (MONOREPO_PARENTS.has(path.basename(d))) dirs.push(...subDirs(d));
   }
   return dirs;
 }

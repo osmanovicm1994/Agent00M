@@ -39,6 +39,44 @@ npx ts-node src/cli.ts agents
 
 Chat slash commands: `/help` lists them (`/agents`, `/use <id>`, `/auto`, `/model`, `/auto-write`, `/auto-run`, `/research`, `/plan`, `/team`, `/image`, `/clear`, `/exit`).
 
+## Building a full-stack app with the agent (Next.js + NestJS)
+
+A whole app does not fit in one prompt. The agent works reliably on one slice at a time: one prompt, one result you can check with a command. Run each prompt as its own task, in this order, on a folder that is a git repository (auto mode asks for that).
+
+```bash
+mkdir ~/my-app && cd ~/my-app && git init     # a new, empty project folder
+cd /path/to/agent-cli
+npx ts-node src/cli.ts run "<prompt 1>" -p ~/my-app -y --no-mcp
+```
+
+Or start `npm run chat`, answer the startup questions (existing project: yes, the folder; auto-write and auto-run: yes), and paste the prompts one after the other. Wait for each one to finish and read its summary (what ran, what passed, what was NOT verified) before sending the next.
+
+**Do you have to name the stack in every prompt?** No, but one of two places must name it, because a small local model picks its stack from habit (often older or different from yours) and the matching standards are only loaded when the stack is recognised. Either put it in the project once: copy `docs/templates/AGENTS.fullstack.md` to the project root as `AGENTS.md` (the agent reads it on every task, so it builds in your stack) and edit it; or name it in the prompt. Standards are loaded from two things: the words of the task (a prompt that says Next.js or Prisma or Docker loads those standards) and the files already in the project (`package.json` with Next, Nest or Prisma, `.csproj`, `Package.swift`, `build.gradle` and similar). So a brand-new project gets the Nest/Prisma/Docker standards only if the prompt mentions them; once the app exists on disk, they load by themselves. Standards exist for Next.js, NestJS, Prisma, JWT, R2, Docker, CI, Playwright, Appium, C#, Python FastAPI, iOS (SwiftUI) and Android (Compose). A stack without a standard still works, but without the agent's own guidance for it.
+
+**Prompt rules that matter**
+1. Name the exact paths (`apps/web`, `apps/api`, `apps/api/src/health/health.controller.ts`). The agent stops guessing and your checks can find the files.
+2. End every prompt with the command that must pass: `npm --prefix apps/api run build` must succeed, `npm --prefix apps/api test` must pass. The agent runs it, reads the failure and fixes it. Without that sentence it often stops after writing files.
+3. One concern per prompt. Do not combine "auth and uploads and the login page".
+4. Say what must NOT happen when it matters (no secrets in code, no tokens in localStorage, no `next/font/google`).
+
+**First prompt: scaffold** (the agent loads a scaffolding standard with the exact commands: `mkdir -p apps`, `npx --yes create-next-app@latest apps/web ...`, `cd apps && npx --yes @nestjs/cli@latest new api ...`)
+
+> Create a monorepo in this folder with two apps: apps/web (Next.js App Router, TypeScript, Tailwind CSS) and apps/api (NestJS, TypeScript). Add a root package.json WITHOUT npm workspaces (each app keeps its own package.json, node_modules and package-lock.json) whose scripts are dev:api, dev:web, build and test, each forwarding with `npm --prefix apps/<app> run ...`. Add a root .gitignore that ignores node_modules, .next, dist and .env files, and a short root README.md. Do not use next/font/google. Then run `npm --prefix apps/api run build` and `npm --prefix apps/web run build`; both must succeed.
+
+**Next prompts**: use the `task` text of each slice in `bench/fullstack/spec.json`, in order (health endpoint, typed config, Prisma schema, users, JWT auth, refresh rotation, guard, tasks CRUD, ownership test, pagination, R2 upload, design system, login page, tasks page, API URL env, Docker, CI, Playwright, README). Every one of them already names its paths and its verify command. Read the file, copy the slice you want, change names to your app.
+
+When something fails: paste the error into a new task (`run "npm --prefix apps/api test fails: <error>" -a debug`) or `/use debug` in chat. Do not ask for the next feature while the current slice is red: the next slice then builds on a broken one.
+
+### How the agent tests what it builds
+
+- After it changes code, it is asked once to run a check (typecheck, test or build) before it may finish (verify gate). If the last command failed and nothing changed since, it is asked once to fix it or say plainly that it still fails. After the same error three times in a row it is told to stop and report instead of looping.
+- It only runs what exists: the check is the prompt's "X must pass" command or a `typecheck` / `test` / `build` script in `package.json`. A project with no tests gets none unless the prompt asks for them (slices ask for unit tests, the ownership test and Playwright tests).
+- It cannot prove that the app looks right or works against a real database or R2. `inspect_page` reports console errors, failed requests and overflow for a page that is running; the rest is "Not verified" in its summary.
+
+### Benchmark (optional)
+
+`npm run bench:fullstack` is NOT needed to build an app. It runs the slices of `bench/fullstack/spec.json` through the agent automatically in a fresh folder and checks each with plain commands (files exist, build passes, tests pass), to measure how far the agent and model get and to compare before and after a change. Try it first without a model: `npm run bench:fullstack -- --baseline`. Details: `docs/FULLSTACK_READINESS.md`, Phase 0.
+
 ## How a task is handled
 
 1. **Routing** (`src/agents/router.ts`, signals in `src/agents/orchestration.ts`): forced agent (`-a`, `/use`) > research-stage recommendation > keyword score with one strict winner > one capped model call > `dev`.

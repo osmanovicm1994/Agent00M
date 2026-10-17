@@ -21,7 +21,7 @@ export interface Plan {
 
 export const PLAN_DIR = ".agent";
 export const PLAN_FILE = "plan.md";
-const MAX_STEPS = 30;
+const MAX_STEPS = 150;
 const MAX_STEP_CHARS = 200;
 const MAX_GOAL_CHARS = 300;
 const MAX_NOTES = 12;

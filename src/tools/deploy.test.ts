@@ -26,6 +26,30 @@ function put(root: string, rel: string, content: string): void {
   fs.writeFileSync(file, content);
 }
 
+describe("monorepo layout (apps/web, apps/api)", () => {
+  it("finds Dockerfiles, .dockerignore and the Next config two levels down", () => {
+    const root = tmp();
+    put(root, "apps/web/Dockerfile", body("next-dockerfile"));
+    put(root, "apps/api/Dockerfile", body("nest-dockerfile"));
+    put(root, "apps/web/.dockerignore", body("dockerignore"));
+    put(root, "apps/api/.dockerignore", body("dockerignore"));
+    put(root, "apps/web/package.json", '{"dependencies":{"next":"16.0.0"}}');
+    put(root, "apps/web/next.config.ts", "export default { output: 'standalone' };\n");
+    put(root, ".gitignore", "node_modules\n.env\n");
+    const results = checkDeployReadiness(root);
+    expect(results.find((r) => r.id === "dockerfile")).toBeUndefined();
+    expect(results.filter((r) => r.id === "non-root" && r.level === "pass")).toHaveLength(2);
+    expect(results.find((r) => r.id === "next-standalone")?.level).toBe("pass");
+    expect(results.filter((r) => r.level === "fail")).toEqual([]);
+  });
+
+  it("still reports a missing Dockerfile when apps/ has none", () => {
+    const root = tmp();
+    put(root, "apps/web/package.json", "{}");
+    expect(checkDeployReadiness(root).find((r) => r.id === "dockerfile")?.level).toBe("fail");
+  });
+});
+
 /** A project laid out the way the templates expect, built only from the templates. */
 function projectFromTemplates(): string {
   const root = tmp();

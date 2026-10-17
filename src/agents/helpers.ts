@@ -96,6 +96,8 @@ const STACK_PRIORITY = [
   "05-backend/csharp-dotnet.md",
   "05-backend/python-fastapi.md",
   "04-frontend/react-nextjs.md",
+  "12-fullstack/02-nestjs.md",
+  "12-fullstack/04-prisma-drizzle.md",
   "03-mobile/ios-swiftui.md",
   "03-mobile/android-compose.md",
   "02-qa-automation/appium-csharp.md",
@@ -184,6 +186,8 @@ function inspectDir(dir: string, found: Set<string>): void {
         const pkg = JSON.parse(readSmall(name));
         const deps = { ...pkg.dependencies, ...pkg.devDependencies };
         if (deps.react || deps.next) found.add("04-frontend/react-nextjs.md");
+        if (deps["@nestjs/core"]) found.add("12-fullstack/02-nestjs.md");
+        if (deps.prisma || deps["@prisma/client"]) found.add("12-fullstack/04-prisma-drizzle.md");
         if (deps["@playwright/test"] || deps.playwright) found.add("02-qa-automation/playwright-standards.md");
       } catch {
         // malformed package.json — ignore

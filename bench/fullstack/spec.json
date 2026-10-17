@@ -1,0 +1,231 @@
+{
+  "name": "Task manager SaaS (Next.js + NestJS + Prisma + R2 + Docker)",
+  "version": 2,
+  "slices": [
+    {
+      "id": "scaffold",
+      "title": "Monorepo scaffold",
+      "task": "Create a monorepo in this folder with two apps: apps/web (Next.js App Router, TypeScript, Tailwind CSS) and apps/api (NestJS, TypeScript). Add a root package.json WITHOUT npm workspaces (each app keeps its own package.json, node_modules and package-lock.json) whose scripts are dev:api, dev:web, build and test, each forwarding with `npm --prefix apps/<app> run ...`. Add a root .gitignore that ignores node_modules, .next, dist and .env files, and a short root README.md. Do not use next/font/google (no network at build time).",
+      "accept": [
+        { "label": "api package.json", "cmd": "test -f apps/api/package.json && grep -q '\"@nestjs/core\"' apps/api/package.json" },
+        { "label": "web package.json", "cmd": "test -f apps/web/package.json && grep -q '\"next\"' apps/web/package.json && grep -q 'tailwindcss' apps/web/package.json" },
+        { "label": "root scripts", "cmd": "grep -q 'dev:api' package.json && grep -q 'dev:web' package.json && ! grep -q workspaces package.json" },
+        { "label": "root gitignore", "cmd": "test -f .gitignore && grep -q node_modules .gitignore && grep -q '^\\.env' .gitignore" }
+      ]
+    },
+    {
+      "id": "install-build",
+      "title": "Both apps install and build",
+      "task": "Install dependencies for both apps and make sure both build: `npm --prefix apps/api run build` and `npm --prefix apps/web run build` must succeed. Fix anything that fails. Start no long-running servers for this step.",
+      "accept": [
+        { "label": "api builds", "cmd": "npm --prefix apps/api run build", "timeoutSec": 600 },
+        { "label": "web builds", "cmd": "npm --prefix apps/web run build", "timeoutSec": 900 }
+      ]
+    },
+    {
+      "id": "health",
+      "title": "Health endpoint with a test",
+      "task": "In apps/api add GET /health returning {\"status\":\"ok\"}. Put it in apps/api/src/health/health.controller.ts and add a unit test next to it (health.controller.spec.ts). `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "controller file", "cmd": "test -f apps/api/src/health/health.controller.ts && grep -q health apps/api/src/health/health.controller.ts" },
+        { "label": "spec file", "cmd": "test -f apps/api/src/health/health.controller.spec.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "config",
+      "title": "Typed, validated configuration",
+      "task": "In apps/api add typed configuration under apps/api/src/config/ that reads process.env and fails at startup with a clear message when a required variable is missing. Required: DATABASE_URL, JWT_SECRET, JWT_REFRESH_SECRET, PORT. Add apps/api/.env.example listing the variable NAMES with placeholder values only. No secret value may appear in source code.",
+      "accept": [
+        { "label": "config folder", "cmd": "test -d apps/api/src/config && ls apps/api/src/config | grep -q ." },
+        { "label": "env example lists names", "cmd": "test -f apps/api/.env.example && grep -q '^JWT_SECRET=' apps/api/.env.example && grep -q '^DATABASE_URL=' apps/api/.env.example" },
+        { "label": "no hardcoded jwt secret", "cmd": "test -d apps/api/src && ! grep -rEq \"JWT_(REFRESH_)?SECRET.{0,20}['\\\"][A-Za-z0-9+/=_-]{12,}['\\\"]\" apps/api/src && grep -rq JWT_SECRET apps/api/src" },
+        { "label": "api still builds", "cmd": "npm --prefix apps/api run build", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "prisma-schema",
+      "title": "Prisma schema",
+      "task": "Add Prisma to apps/api with a PostgreSQL schema at apps/api/prisma/schema.prisma. Models: User (id, email unique, passwordHash, createdAt), Project (id, name, ownerId -> User, createdAt), Task (id, title, done default false, projectId -> Project, ownerId -> User, createdAt). Add @@index on the foreign keys. The connection string comes from DATABASE_URL. Do not run migrations against a real database.",
+      "accept": [
+        { "label": "schema models", "cmd": "grep -q 'model User' apps/api/prisma/schema.prisma && grep -q 'model Project' apps/api/prisma/schema.prisma && grep -q 'model Task' apps/api/prisma/schema.prisma" },
+        { "label": "ownership columns", "cmd": "grep -q 'ownerId' apps/api/prisma/schema.prisma && grep -q '@@index' apps/api/prisma/schema.prisma" },
+        { "label": "url from env", "cmd": "grep -q 'DATABASE_URL' apps/api/prisma/schema.prisma || grep -rq DATABASE_URL apps/api/prisma.config.ts" }
+      ]
+    },
+    {
+      "id": "users-service",
+      "title": "Users service with password hashing",
+      "task": "In apps/api/src/users add a UsersService that creates users and finds them by email. Passwords are hashed with argon2 or bcrypt before storing, never stored or returned in plain text. Add a unit test (users.service.spec.ts) with a mocked Prisma client that proves the stored value differs from the plain password and that verifying the right and wrong password works. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "service file", "cmd": "test -f apps/api/src/users/users.service.ts" },
+        { "label": "uses a real hash", "cmd": "grep -rEq 'argon2|bcrypt' apps/api/src/users" },
+        { "label": "spec file", "cmd": "test -f apps/api/src/users/users.service.spec.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "auth-jwt",
+      "title": "Register and login with custom JWT",
+      "task": "In apps/api/src/auth add POST /auth/register and POST /auth/login using @nestjs/jwt (custom JWT, no Auth0/Clerk/Supabase). Access tokens are short-lived (15 minutes) and signed with JWT_SECRET from the typed config. Responses never contain passwordHash. Add auth.service.spec.ts covering a successful login, a wrong password and a duplicate email. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "auth files", "cmd": "test -f apps/api/src/auth/auth.service.ts && test -f apps/api/src/auth/auth.controller.ts" },
+        { "label": "uses nestjs jwt", "cmd": "grep -rq '@nestjs/jwt' apps/api/src/auth" },
+        { "label": "spec file", "cmd": "test -f apps/api/src/auth/auth.service.spec.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "refresh-rotation",
+      "title": "Refresh tokens with rotation and an httpOnly cookie",
+      "task": "Add POST /auth/refresh and POST /auth/logout. The refresh token is set as an httpOnly, SameSite cookie (Secure in production), signed with JWT_REFRESH_SECRET. Every refresh rotates the token: the old one is invalidated (store a hash of the current refresh token per user) and reusing an old token is rejected. Add tests for rotation and for reuse rejection. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "httpOnly cookie", "cmd": "grep -rq 'httpOnly' apps/api/src" },
+        { "label": "refresh endpoint", "cmd": "grep -rq \"refresh\" apps/api/src/auth/auth.controller.ts" },
+        { "label": "rotation tested", "cmd": "grep -rEqi 'rotat|reuse' apps/api/src --include=*.spec.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "auth-guard",
+      "title": "Auth guard and @CurrentUser",
+      "task": "Add a JWT auth guard (apps/api/src/auth/jwt-auth.guard.ts) and a @CurrentUser() parameter decorator (apps/api/src/auth/current-user.decorator.ts). Protect everything except /health, /auth/register, /auth/login and /auth/refresh. Add GET /me returning the current user's id and email. Add a test that /me without a token is rejected with 401. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "guard and decorator files", "cmd": "test -f apps/api/src/auth/jwt-auth.guard.ts && test -f apps/api/src/auth/current-user.decorator.ts" },
+        { "label": "guard is applied", "cmd": "grep -rEq 'APP_GUARD|UseGuards' apps/api/src" },
+        { "label": "401 tested", "cmd": "grep -rEq '401|Unauthorized' apps/api/src --include=*.spec.ts --include=*.e2e-spec.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "tasks-crud",
+      "title": "Tasks CRUD with DTO validation",
+      "task": "In apps/api/src/tasks add create, list, get, update and delete for tasks of the current user. Use class-validator DTOs and a global ValidationPipe with whitelist and forbidNonWhitelisted. Title is required, 1-200 characters. Add unit tests for the service. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "tasks files", "cmd": "test -f apps/api/src/tasks/tasks.service.ts && test -f apps/api/src/tasks/tasks.controller.ts" },
+        { "label": "class-validator in use", "cmd": "grep -q class-validator apps/api/package.json && grep -rEq 'IsString|IsNotEmpty|Length' apps/api/src/tasks" },
+        { "label": "whitelist pipe", "cmd": "grep -rq 'whitelist' apps/api/src" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "ownership",
+      "title": "Ownership check (IDOR) with a test",
+      "task": "Every task read, update and delete must be scoped to the current user's id in the database query. A task that belongs to another user must answer 404 (not 403, not the data). Add apps/api/src/tasks/tasks.ownership.spec.ts where user B tries to read, update and delete user A's task and gets NotFound each time. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "ownership spec", "cmd": "test -f apps/api/src/tasks/tasks.ownership.spec.ts" },
+        { "label": "expects not found", "cmd": "grep -Eq 'NotFound|404' apps/api/src/tasks/tasks.ownership.spec.ts" },
+        { "label": "query scoped by owner", "cmd": "grep -Eq 'ownerId|userId' apps/api/src/tasks/tasks.service.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "pagination",
+      "title": "Pagination capped at 100",
+      "task": "Add pagination to the task list: query params page (default 1) and pageSize (default 20, maximum 100, validated in a DTO). The response contains items and total. Add a test that pageSize=1000 is rejected or clamped to 100. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "cap is in code", "cmd": "grep -rEq 'Max\\(100\\)|MAX_PAGE_SIZE|Math\\.min\\([^)]*100' apps/api/src/tasks" },
+        { "label": "cap is tested", "cmd": "grep -rq '1000' apps/api/src --include=*.spec.ts" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "r2-upload",
+      "title": "R2 presigned upload with limits",
+      "task": "Add POST /uploads/presign in apps/api/src/uploads that returns a presigned PUT URL for Cloudflare R2 (S3-compatible, @aws-sdk/client-s3 and @aws-sdk/s3-request-presigner). Only image/png, image/jpeg and application/pdf are allowed, maximum 5 MB, and the object key is generated server-side under the current user's id (never taken from the client). R2 settings come from env (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET) through the typed config and are listed by name in .env.example. Add tests for the type and size limits. `npm --prefix apps/api test` must pass.",
+      "accept": [
+        { "label": "presign in use", "cmd": "grep -rq 'getSignedUrl' apps/api/src/uploads" },
+        { "label": "type allowlist", "cmd": "grep -rq 'image/png' apps/api/src/uploads && grep -rq 'application/pdf' apps/api/src/uploads" },
+        { "label": "env names documented", "cmd": "grep -q '^R2_BUCKET=' apps/api/.env.example && grep -q '^R2_SECRET_ACCESS_KEY=' apps/api/.env.example" },
+        { "label": "no literal keys", "cmd": "test -d apps/api/src/uploads && ! grep -rEq 'AKIA[0-9A-Z]{16}|secretAccessKey[[:space:]]*:[[:space:]]*[\"'\\'']' apps/api/src" },
+        { "label": "api tests pass", "cmd": "npm --prefix apps/api test", "timeoutSec": 600 }
+      ]
+    },
+    {
+      "id": "design-system",
+      "title": "Web design system",
+      "task": "Create the design system for apps/web before any page: use design_search (brief) for a productivity SaaS task manager, write design-system/MASTER.md in the workspace root, and put the colour, font, radius and spacing tokens in ONE place (Tailwind theme / CSS variables in apps/web). Build a shared layout with a header and main area that uses only those tokens. No next/font/google. `npm --prefix apps/web run build` must pass.",
+      "accept": [
+        { "label": "MASTER.md", "cmd": "test -f design-system/MASTER.md && test $(wc -c < design-system/MASTER.md) -gt 400" },
+        { "label": "tokens defined", "cmd": "grep -rEq -e '--(color|background|primary)' apps/web --include=*.css --exclude-dir=node_modules --exclude-dir=.next || grep -rEq 'colors\\s*:' apps/web --include=tailwind.config.* --exclude-dir=node_modules" },
+        { "label": "layout exists", "cmd": "test -f apps/web/app/layout.tsx || test -f apps/web/src/app/layout.tsx" },
+        { "label": "web builds", "cmd": "npm --prefix apps/web run build", "timeoutSec": 900 }
+      ]
+    },
+    {
+      "id": "login-page",
+      "title": "Login page without localStorage tokens",
+      "task": "Add apps/web/app/login/page.tsx with an accessible email and password form (labels, error message region, disabled submit while sending). It calls the API with fetch and credentials: 'include' so the httpOnly refresh cookie is used. Never store tokens in localStorage or sessionStorage (keep the access token in memory). `npm --prefix apps/web run build` must pass.",
+      "accept": [
+        { "label": "login page", "cmd": "test -f apps/web/app/login/page.tsx || test -f apps/web/src/app/login/page.tsx" },
+        { "label": "credentials include", "cmd": "grep -rq \"credentials: *['\\\"]include['\\\"]\" apps/web --include=*.ts --include=*.tsx --exclude-dir=node_modules --exclude-dir=.next" },
+        { "label": "no web storage for tokens", "cmd": "(test -f apps/web/app/login/page.tsx || test -f apps/web/src/app/login/page.tsx) && ! grep -rEq 'localStorage|sessionStorage' apps/web --include=*.ts --include=*.tsx --exclude-dir=node_modules --exclude-dir=.next" },
+        { "label": "web builds", "cmd": "npm --prefix apps/web run build", "timeoutSec": 900 }
+      ]
+    },
+    {
+      "id": "tasks-page",
+      "title": "Tasks page with loading, empty and error states",
+      "task": "Add apps/web/app/tasks/page.tsx that lists the user's tasks from the API with pagination controls. It must show a loading state, an empty state with a call to action, and an error state with a retry button. Use the design tokens only. `npm --prefix apps/web run build` must pass.",
+      "accept": [
+        { "label": "tasks page", "cmd": "test -f apps/web/app/tasks/page.tsx || test -f apps/web/src/app/tasks/page.tsx" },
+        { "label": "loading state", "cmd": "grep -rEqi 'loading' apps/web/app/tasks apps/web/src/app/tasks 2>/dev/null" },
+        { "label": "empty state", "cmd": "grep -rEqi 'empty|no tasks' apps/web/app/tasks apps/web/src/app/tasks 2>/dev/null" },
+        { "label": "error state with retry", "cmd": "grep -rEqi 'retry|try again' apps/web/app/tasks apps/web/src/app/tasks 2>/dev/null" },
+        { "label": "web builds", "cmd": "npm --prefix apps/web run build", "timeoutSec": 900 }
+      ]
+    },
+    {
+      "id": "api-url-env",
+      "title": "API URL from the environment",
+      "task": "Make the web app read the API base URL from NEXT_PUBLIC_API_URL in one small API client module (apps/web/lib/api.ts or similar) used by every page. No hardcoded http://localhost URLs in source. Add apps/web/.env.example with the variable name and a placeholder. `npm --prefix apps/web run build` must pass.",
+      "accept": [
+        { "label": "env var used", "cmd": "grep -rq 'NEXT_PUBLIC_API_URL' apps/web --include=*.ts --include=*.tsx --exclude-dir=node_modules --exclude-dir=.next" },
+        { "label": "env example", "cmd": "grep -q '^NEXT_PUBLIC_API_URL=' apps/web/.env.example" },
+        { "label": "no hardcoded localhost", "cmd": "grep -rq 'NEXT_PUBLIC_API_URL' apps/web --include=*.ts --include=*.tsx --exclude-dir=node_modules --exclude-dir=.next && ! grep -rEq 'https?://localhost' apps/web --include=*.ts --include=*.tsx --exclude-dir=node_modules --exclude-dir=.next" },
+        { "label": "web builds", "cmd": "npm --prefix apps/web run build", "timeoutSec": 900 }
+      ]
+    },
+    {
+      "id": "docker",
+      "title": "Docker, compose and Caddy",
+      "task": "Prepare a Docker VPS deploy: a multi-stage Dockerfile for apps/api and one for apps/web (Next.js standalone output), each with a non-root USER, a pinned base image tag (for example node:22-alpine), a HEALTHCHECK and a .dockerignore listing node_modules and .env. Add docker-compose.yml in the root with api, web and caddy services (restart: unless-stopped, env_file for secrets, no database port published) and a Caddyfile that reverse-proxies to both. Use deploy_template for the starting files and run predeploy_check; fix every FAIL.",
+      "accept": [
+        { "label": "predeploy check has no FAIL", "predeploy": true },
+        { "label": "compose and caddy files", "cmd": "test -f docker-compose.yml && test -f Caddyfile" },
+        { "label": "both dockerfiles", "cmd": "test -f apps/api/Dockerfile && test -f apps/web/Dockerfile" }
+      ]
+    },
+    {
+      "id": "ci",
+      "title": "CI workflow",
+      "task": "Add .github/workflows/ci.yml that runs on push and pull_request: install, then build and test the api, and build the web app. Cache npm. Use no secrets in the file.",
+      "accept": [
+        { "label": "workflow file", "cmd": "test -f .github/workflows/ci.yml" },
+        { "label": "runs build and test", "cmd": "grep -Eq 'npm .*test' .github/workflows/ci.yml && grep -Eq 'npm .*build' .github/workflows/ci.yml" },
+        { "label": "triggers", "cmd": "grep -q 'pull_request' .github/workflows/ci.yml && grep -q 'push' .github/workflows/ci.yml" },
+        { "label": "predeploy check has no FAIL", "predeploy": true }
+      ]
+    },
+    {
+      "id": "e2e",
+      "title": "Playwright end-to-end tests",
+      "task": "Add Playwright to apps/web: playwright.config.ts (baseURL from env, webServer for the dev server) and e2e tests in apps/web/e2e that cover: the login page renders, a wrong password shows an error, and the tasks page redirects to login when signed out. Use role and label locators, no fixed sleeps. Do not require the real API: mock network responses with page.route. `npx playwright test --list` in apps/web must list the tests.",
+      "accept": [
+        { "label": "config", "cmd": "test -f apps/web/playwright.config.ts" },
+        { "label": "tests are listed", "cmd": "cd apps/web && npx playwright test --list | grep -Eq 'Total: [1-9]'", "timeoutSec": 300 },
+        { "label": "no fixed sleeps", "cmd": "test -d apps/web/e2e && ! grep -rEq 'waitForTimeout' apps/web/e2e" }
+      ]
+    },
+    {
+      "id": "readme",
+      "title": "README",
+      "task": "Write the root README.md: what the app is, the stack, local setup (install, env files by name, run api and web, run tests), how to deploy with docker compose, and the environment variables table (names and purpose, no values). No placeholder text such as TODO.",
+      "accept": [
+        { "label": "readme sections", "cmd": "grep -qi 'setup' README.md && grep -qi 'deploy' README.md && grep -qi 'environment' README.md" },
+        { "label": "documents the key variables", "cmd": "grep -q 'DATABASE_URL' README.md && grep -q 'NEXT_PUBLIC_API_URL' README.md" },
+        { "label": "no TODO", "cmd": "test -f README.md && ! grep -q 'TODO' README.md" }
+      ]
+    }
+  ]
+}

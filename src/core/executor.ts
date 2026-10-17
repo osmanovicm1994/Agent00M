@@ -22,6 +22,7 @@ import { ProcessManager, processToolSchemas } from "../tools/process.tool";
 import { deployToolSchemas, runDeployTemplate, runPredeployCheck } from "../tools/deploy.tool";
 import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
+import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 
 const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas];
@@ -29,7 +30,7 @@ const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, .
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
 
-const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 50;
+const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 100;
 // Rough character budget for the running conversation. Older bulky tool output
 // is elided once this is exceeded so a local model's context never overflows.
 const CONTEXT_CHAR_BUDGET = Number(process.env.AGENT_CONTEXT_CHARS) || 60_000;
@@ -263,6 +264,11 @@ async function confirm(message: string): Promise<boolean> {
   if (via === "dashboard") {
     console.log(pc.yellow(`⏸ Waiting for approval in the dashboard: ${message}`));
     approved = await control.requestApproval();
+  } else if (!process.stdin.isTTY) {
+    // Unattended run (benchmark, cron, piped input): nobody can answer. Waiting would end the process silently in the
+    // middle of the task, so the question is declined and the agent is told to take another way.
+    console.log(pc.yellow(`⏭ Declined automatically (no terminal to ask): ${message}`));
+    approved = false;
   } else {
     const response = await prompts({ type: "confirm", name: "ok", message, initial: false });
     approved = Boolean(response.ok);
@@ -878,7 +884,7 @@ When you are done and have no more actions to take, reply normally with a final 
     try {
       const a = JSON.parse(call.arguments);
       if (typeof a.content === "string") {
-        a.content = `[${a.content.length} chars written to ${a.path}]`;
+        a.content = omittedContentNote(a.content.length, String(a.path ?? "the file"));
         call.arguments = JSON.stringify(a);
       }
     } catch {
@@ -1102,6 +1108,13 @@ When you are done and have no more actions to take, reply normally with a final 
           if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
           const approved = await confirm("Run this command?");
           if (!approved) {
+            if (!process.stdin.isTTY) {
+              return (
+                "This command was NOT run: it needs approval and nobody is available to give it (unattended run). " +
+                "Do not repeat it. Reach the same goal another way inside the project: no `cd ..`, no absolute paths outside the project, " +
+                "no rm, no global installs; use `npm --prefix <dir>` and `mkdir -p <dir>` from the project root."
+              );
+            }
             return "User rejected running this command. Do not repeat it; ask what to do differently or stop.";
           }
         } else {
@@ -1202,6 +1215,8 @@ When you are done and have no more actions to take, reply normally with a final 
       return `TOOL ERROR: ${toolName} requires non-empty string "content".`;
     }
     if (this.fs.isDirectory(p)) return `TOOL ERROR: ${p} is a directory, not a file.`;
+    // The history shows a note instead of earlier written content; a model sometimes copies the note as content.
+    if (containsOmittedContentNote(args.content)) return OMITTED_CONTENT_REFUSAL;
 
     const content = ensureTrailingNewline(args.content.replace(/\r\n/g, "\n"));
     const exists = this.fs.fileExists(p);

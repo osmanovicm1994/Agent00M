@@ -11,4 +11,6 @@ node_modules/
 dist/
 .agent_cache/
 _to_delete/
+bench/fullstack/workspace/
+bench/fullstack/results/
 .env
