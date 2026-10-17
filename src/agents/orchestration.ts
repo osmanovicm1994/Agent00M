@@ -81,6 +81,17 @@ export const DOMAIN_KEYWORDS: Record<string, RegExp[]> = {
 /** Verbs that mean "change the project". A research question that also asks for a change is not research-only. */
 export const CHANGE_VERB_RE = /\b(add|create|implement|build|write|update|change|modify|fix|refactor|migrate|install|upgrade|rename|remove|delete|generate|scaffold)\b/i;
 
+/**
+ * Building a whole application (not one layer of it). Such a task names several technologies, so one keyword
+ * domain ("prisma" -> db) would win by accident and hand the whole app to a specialist. It goes to the general
+ * `dev` agent instead, with a /team hint. Deliberately narrow: "from scratch" alone is not enough.
+ */
+export const FULLSTACK_BUILD_RE = /\bfull[- ]?stack\b|\bmonorepo\b|\bscaffold|\bbootstrap\b|\bnew (web )?(app|application|project)\b/i;
+
+export function isFullstackBuild(task: string): boolean {
+  return FULLSTACK_BUILD_RE.test(task) && CHANGE_VERB_RE.test(task);
+}
+
 /** Domains that build or change code. A task that touches several of them is cross-cutting. */
 const BUILD_DOMAINS = ["api", "db", "design", "qa"] as const;
 
@@ -112,6 +123,12 @@ export function rankDomains(task: string, opts: RankOptions = {}): DomainScore[]
   // Generic test words only mean "QA" in a project that is itself test automation.
   if (opts.automationProject && TEST_WORDS_RE.test(task) && !scores.debug) {
     scores.qa = (scores.qa ?? 0) + 2;
+  }
+
+  // Whole-app build: the general dev agent leads, unless the task is really a failure report or a research ask.
+  if (isFullstackBuild(task) && !scores.debug && !scores.research && !opts.automationProject) {
+    const best = Math.max(0, ...Object.values(scores));
+    scores.dev = best + 1;
   }
 
   return Object.entries(scores)
@@ -150,6 +167,9 @@ interface KnowledgeRule {
 }
 
 const NO_CODE_AGENTS = ["kb-harvester", "research"];
+
+/** Agents that build or review application code and therefore get the full-stack building-block standards. */
+const FULLSTACK_AGENTS = ["dev", "api", "db", "design", "qa", "logic"];
 
 const BULLET_LIST_RE = /(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*(?:\n\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*){2,}/;
 
@@ -243,6 +263,115 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     weight: 3,
     skipFor: ["qa", ...NO_CODE_AGENTS],
   },
+  // --- Full-stack building blocks (Next.js + NestJS + Neon + R2 + Docker). Matched on the task text because a
+  // brand-new project has no marker files for detectStackKnowledge to find yet. ------------------------------
+  {
+    id: "fullstack-build",
+    test: /\bfull[- ]?stack\b|from scratch|\bscaffold|\bbootstrap|\bmonorepo\b|production[- ]ready|\bnew (web )?(app|application|project)\b/i,
+    files: ["12-fullstack/00-build-protocol.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "scaffolding",
+    test: /\bscaffold|create-next-app|\bnest new\b|@nestjs\/cli|\bmonorepo\b|\bnew (web )?(app|application|project)\b/i,
+    files: ["12-fullstack/09-scaffolding.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "nextjs",
+    test: /\bnext\.?js\b|app router|server actions?|create-next-app|\bnext (app|project|page|route)\b/i,
+    files: ["12-fullstack/01-nextjs-app-router.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "nestjs",
+    test: /\bnest\.?js\b|@nestjs|\bnest (app|module|controller|service|api)\b/i,
+    files: ["12-fullstack/02-nestjs.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "auth-jwt",
+    test: /\bjwt\b|json web token|refresh tokens?|access tokens?|\bpassport\b|authentication (system|flow|module)|auth (module|guard|flow)/i,
+    files: ["12-fullstack/03-auth-jwt.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "orm",
+    test: /\bprisma\b|\bdrizzle\b/i,
+    files: ["12-fullstack/04-prisma-drizzle.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "neon",
+    test: /\bneon\b|serverless postgres|pooled connection|pgbouncer/i,
+    files: ["12-fullstack/05-neon-postgres.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "object-storage",
+    test: /\bcloudflare\b|\br2\b|\bs3\b|object storage|presign|\bbuckets?\b/i,
+    files: ["12-fullstack/06-cloudflare-r2.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "docker-deploy",
+    test: /\bdocker(file)?\b|docker[- ]compose|\bvps\b|\bdeploy(ment|ing)?\b|\bnginx\b|\bcaddy\b|reverse proxy|\bci\/cd\b/i,
+    files: ["12-fullstack/07-docker-deploy.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "ci-testing",
+    test: /github actions|\bci\/cd\b|\bci pipeline\b|e2e (suite|tests?)|end-to-end tests?|\bwebserver\b/i,
+    files: ["12-fullstack/08-ci-testing.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  // Other stacks: a new project of that kind has no marker files yet, so detectStackKnowledge cannot see it.
+  {
+    id: "ios-swift",
+    test: /\bswiftui\b|\bswift\b|\bxcode\b|\bios (app|application|project)\b|\buikit\b/i,
+    files: ["03-mobile/ios-swiftui.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "android-kotlin",
+    test: /\bkotlin\b|jetpack compose|\bandroid (app|application|project|studio)\b|\bgradle\b/i,
+    files: ["03-mobile/android-compose.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "python-api",
+    test: /\bfastapi\b|\buvicorn\b|\bpydantic\b|\bpython (api|backend|service|app)\b/i,
+    files: ["05-backend/python-fastapi.md"],
+    weight: 4,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "owasp",
+    test: /owasp|security (review|audit|hardening)|penetration|vulnerabilit/i,
+    files: ["07-api/05-owasp-checklist.md"],
+    weight: 4,
+    skipFor: NO_CODE_AGENTS,
+  },
+  // Interface work: how to use design_search and the project's design-system/MASTER.md.
+  {
+    id: "design-system",
+    test: /design system|landing page|\bdashboard\b|\bfront-?end\b|\bredesign|\bbrand(ing)?\b|look and feel|style guide|\btheme\b|color palette|colou?r scheme|master\.md|\bui\b|\bux\b|\bfull[- ]?stack\b/i,
+    files: ["10-design/design-system-workflow.md"],
+    weight: 5,
+    onlyFor: ["design", "dev"],
+  },
 ];
 
 export interface KnowledgePick {
@@ -255,7 +384,7 @@ export interface KnowledgePick {
 
 /** Hard cap on how many task-specific files one task may add (a small local model has a small context). */
 export function maxTaskFiles(): number {
-  return Math.max(0, Number(process.env.AGENT_TASK_FILES) || 4);
+  return Math.max(0, Number(process.env.AGENT_TASK_FILES) || 5);
 }
 
 /** The extra standards a task needs, most important first, at most `limit` files. */
@@ -303,7 +432,7 @@ export function analyzeTask(task: string, agentId: string = "dev", opts: RankOpt
   const scores = rankDomains(task, opts);
   const domains = scores.filter((s) => (BUILD_DOMAINS as readonly string[]).includes(s.id)).map((s) => s.id);
   const building = CHANGE_VERB_RE.test(task) && !scores.some((s) => s.id === "debug" && s.score >= 2);
-  const crossCutting = building && (domains.length >= 3 || (domains.length >= 2 && task.length > 240));
+  const crossCutting = building && (domains.length >= 3 || (domains.length >= 2 && task.length > 240) || isFullstackBuild(task));
 
   return {
     scores,
@@ -311,7 +440,7 @@ export function analyzeTask(task: string, agentId: string = "dev", opts: RankOpt
     crossCutting,
     knowledge: selectTaskKnowledge(task, agentId),
     teamHint: crossCutting
-      ? `This task spans ${domains.join(" + ")}. One agent works best on one layer: "/team <task>" (or run --team) lets a Project Manager split it across specialists and a Safety Reviewer check the result.`
+      ? `This task spans ${isFullstackBuild(task) ? "a whole application (frontend + backend + database)" : domains.join(" + ")}. One agent works best on one layer: "/team <task>" (or run --team) lets a Project Manager split it across specialists and a Safety Reviewer check the result.`
       : undefined,
   };
 }

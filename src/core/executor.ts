@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from "../llm/types";
 import type { AgentDefinition } from "../agents/definitions";
-import { detectStackKnowledge, loadKnowledge } from "../agents/helpers";
+import { detectStackKnowledge, loadKnowledge, loadProjectContext } from "../agents/helpers";
 import { FsTools, fsToolSchemas } from "../tools/fs.tool";
 import { ShellTool, shellToolSchema, clampTimeoutMs, condenseOutput } from "../tools/shell.tool";
 import { SearchTool, searchToolSchemas } from "../tools/search.tool";
@@ -18,10 +18,19 @@ import { runWebSearch, runWebFetch, runWebResearch, webToolSchemas } from "../to
 import { runInspectPage, browserToolSchemas } from "../tools/browser.tool";
 import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./command-safety";
 import { analyzeTask } from "../agents/orchestration";
+import { ProcessManager, processToolSchemas } from "../tools/process.tool";
+import { deployToolSchemas, runDeployTemplate, runPredeployCheck } from "../tools/deploy.tool";
+import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
+import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
+import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
+import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas];
 
-const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 50;
+// Agents that never change code, so they are never asked to run a check after writing.
+const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
+
+const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS) || 100;
 // Rough character budget for the running conversation. Older bulky tool output
 // is elided once this is exceeded so a local model's context never overflows.
 const CONTEXT_CHAR_BUDGET = Number(process.env.AGENT_CONTEXT_CHARS) || 60_000;
@@ -31,7 +40,7 @@ const MAX_NUDGES = 6;
 // Budget for the auto-detected stack standards in the system prompt (mobile adds role-specific detail files).
 const STACK_KNOWLEDGE_CHARS = Number(process.env.AGENT_STACK_CHARS) || 9000;
 // Budget for the task-specific standards (logic, cross-domain) chosen from the task text, see agents/orchestration.ts.
-const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 6000;
+const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 8000;
 
 // True when `dir` or one of its parents is a git working tree (changes can be reviewed and reverted).
 function insideGitRepo(dir: string): boolean {
@@ -60,6 +69,9 @@ const READ_ONLY_TOOLS = new Set([
   "web_fetch",
   "web_research",
   "inspect_page",
+  "design_search",
+  "deploy_template",
+  "predeploy_check",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -252,6 +264,11 @@ async function confirm(message: string): Promise<boolean> {
   if (via === "dashboard") {
     console.log(pc.yellow(`⏸ Waiting for approval in the dashboard: ${message}`));
     approved = await control.requestApproval();
+  } else if (!process.stdin.isTTY) {
+    // Unattended run (benchmark, cron, piped input): nobody can answer. Waiting would end the process silently in the
+    // middle of the task, so the question is declined and the agent is told to take another way.
+    console.log(pc.yellow(`⏭ Declined automatically (no terminal to ask): ${message}`));
+    approved = false;
   } else {
     const response = await prompts({ type: "confirm", name: "ok", message, initial: false });
     approved = Boolean(response.ok);
@@ -310,6 +327,16 @@ interface SessionState {
   heavyRuns: number;
   heavyRunsAtLastWrite: number;
   verifyNudged: boolean;
+  // Commands run since the last successful file write (a write resets it): the verify gate for every code agent.
+  runsSinceWrite: number;
+  // The latest command exited non-zero and nothing was written since.
+  lastRunFailed: boolean;
+  failNudged: boolean;
+  // Identical failures seen in this run (see run-feedback.ts).
+  repeats: RepeatTracker;
+  // The agent used update_plan in this run: it may not end with open steps without being asked once.
+  planUsed: boolean;
+  planNudged: boolean;
   // Review roles (AgentDefinition.readOnly): no file writes, only read-only diagnostic commands.
   readOnly: boolean;
   // The user stopped a running command with Ctrl+C: the loop ends right away.
@@ -332,6 +359,12 @@ function newSessionState(): SessionState {
     heavyRuns: 0,
     heavyRunsAtLastWrite: 0,
     verifyNudged: false,
+    runsSinceWrite: 0,
+    lastRunFailed: false,
+    failNudged: false,
+    repeats: new RepeatTracker(),
+    planUsed: false,
+    planNudged: false,
     readOnly: false,
     interrupted: false,
   };
@@ -340,6 +373,7 @@ function newSessionState(): SessionState {
 export class Executor {
   private fs: FsTools;
   private shell: ShellTool;
+  private procs: ProcessManager;
   private search: SearchTool;
   private toolSchemas: ToolSchema[];
   private autoWrite: boolean;
@@ -357,6 +391,7 @@ export class Executor {
     this.workspaceRoot = path.resolve(workspaceRoot);
     this.fs = new FsTools(this.workspaceRoot);
     this.shell = new ShellTool(this.workspaceRoot);
+    this.procs = new ProcessManager(this.workspaceRoot);
     this.search = new SearchTool(this.workspaceRoot);
     this.toolSchemas = [...BUILTIN_TOOL_SCHEMAS, ...(mcp?.schemas() ?? [])];
   }
@@ -441,7 +476,7 @@ export class Executor {
       .join("\n");
   }
 
-  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = []): string {
+  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = ""): string {
     const stack = loadKnowledge(stackPaths, STACK_KNOWLEDGE_CHARS);
     const taskKnowledge = loadKnowledge(taskPaths, TASK_KNOWLEDGE_CHARS, "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
     const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
@@ -454,7 +489,7 @@ export class Executor {
             : ""
         }`;
 
-    return `${agent.systemPrompt}${stack}${taskKnowledge}
+    return `${agent.systemPrompt}${stack}${taskKnowledge}${projectContext}
 
 ${toolSection}
 
@@ -601,7 +636,14 @@ When you are done and have no more actions to take, reply normally with a final 
       this.warnedNoGit = true;
       console.log(pc.yellow("⚠ Auto mode is on but this folder is not in a git repository: there is no sandbox, and changes cannot be reviewed or reverted. Use git first."));
     }
-    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths);
+    // The target project's own rules (AGENTS.md / CLAUDE.md in its root) are part of the prompt, so the user's
+    // conventions for that project are followed without being repeated in every task.
+    // The project's own design system (design-system/MASTER.md) is followed by the agents that build UI.
+    const designContext = agent.id === "design" || agent.id === "dev" ? loadDesignSystem(this.workspaceRoot) : "";
+    if (designContext) console.log(pc.dim("Design system loaded from design-system/MASTER.md"));
+    const projectContext = loadProjectContext(this.workspaceRoot) + designContext;
+    if (projectContext && !designContext) console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
+    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext);
 
     // Ground the agent in reality before it can guess: show the real tree as the
     // first thing it sees, so a small local model can't hallucinate a layout.
@@ -611,7 +653,7 @@ When you are done and have no more actions to take, reply normally with a final 
       { role: "system", content: systemPrompt },
       {
         role: "user",
-        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}`,
+        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}${this.existingPlanNote()}`,
       },
     ];
 
@@ -684,26 +726,65 @@ When you are done and have no more actions to take, reply normally with a final 
           continue;
         }
 
-        // 3b) Debug-style agents must prove a fix: files changed, but nothing was run since.
-        if (
-          agent.verifyFixes &&
-          state.filesWritten.length > 0 &&
-          state.heavyRuns === state.heavyRunsAtLastWrite &&
-          !state.verifyNudged &&
-          nudges < MAX_NUDGES
-        ) {
+        // 3b) Verify gate. Debug-style agents must prove a fix; every other code-writing agent must run a check
+        // (typecheck, test, build) after its last code change instead of announcing success untested.
+        const needsVerify = agent.verifyFixes
+          ? state.filesWritten.length > 0 && state.heavyRuns === state.heavyRunsAtLastWrite
+          : !state.readOnly &&
+            !NO_VERIFY_AGENTS.has(agent.id) &&
+            state.filesWritten.some(isCodeFile) &&
+            state.runsSinceWrite === 0;
+        if (needsVerify && !state.verifyNudged && nudges < MAX_NUDGES) {
           nudges++;
           state.verifyNudged = true;
-          console.log(pc.dim("\n(Files were changed but nothing was re-run — asking the agent to verify the fix.)"));
+          console.log(pc.dim("\n(Files were changed but nothing was run since — asking the agent to verify.)"));
+          messages.push({ role: "assistant", content: response.content });
+          messages.push({
+            role: "user",
+            content: agent.verifyFixes
+              ? `You changed ${state.filesWritten.join(", ")} but have not run anything since. Re-run the command that was failing ` +
+                "now (run_command, same command) and base your answer on its real output. If you truly cannot run it, say " +
+                "UNVERIFIED in your final answer and explain why."
+              : `You changed ${state.filesWritten.join(", ")} but have not run any check since. Run the narrowest check that proves it ` +
+                "(typecheck, the affected test, or the build) with run_command and base your answer on its real output. " +
+                "If the project has no such check or you cannot run it, say UNVERIFIED in your final answer and explain why.",
+          });
+          continue;
+        }
+
+        // 3c) The last command failed and nothing was changed since: do not let that end as a success story.
+        if (state.lastRunFailed && !state.readOnly && !state.failNudged && nudges < MAX_NUDGES) {
+          nudges++;
+          state.failNudged = true;
+          console.log(pc.dim("\n(The last command failed — asking the agent to fix it or report it honestly.)"));
           messages.push({ role: "assistant", content: response.content });
           messages.push({
             role: "user",
             content:
-              `You changed ${state.filesWritten.join(", ")} but have not run anything since. Re-run the command that was failing ` +
-              "now (run_command, same command) and base your answer on its real output. If you truly cannot run it, say " +
-              "UNVERIFIED in your final answer and explain why.",
+              "Your last command FAILED (non-zero exit) and you have not changed anything since. Either fix the cause and run it again, " +
+              "or make your final answer say clearly that it still fails, with the error. Do not describe the work as done.",
           });
           continue;
+        }
+
+        // 3d) The agent made a plan in this run and is about to finish with steps still open.
+        if (state.planUsed && !state.readOnly && !state.planNudged && nudges < MAX_NUDGES) {
+          const plan = new PlanStore(this.workspaceRoot).load();
+          const open = plan ? openSteps(plan) : [];
+          if (open.length > 0) {
+            nudges++;
+            state.planNudged = true;
+            console.log(pc.dim(`\n(The plan still has ${open.length} open step(s) — asking the agent to continue or explain.)`));
+            messages.push({ role: "assistant", content: response.content });
+            messages.push({
+              role: "user",
+              content:
+                `Your plan (.agent/plan.md) still has ${open.length} open step(s): ` +
+                open.slice(0, 5).map((s) => `${s.n}. ${s.text}`).join("; ") +
+                ". Continue with the next one. Mark steps done only after verifying them. If you must stop early, your final answer must say which steps remain and why.",
+            });
+            continue;
+          }
         }
 
         // 4) Hallucinated success: claims changes to files that were never written.
@@ -760,6 +841,10 @@ When you are done and have no more actions to take, reply normally with a final 
         // history (it would otherwise be re-sent to the model on every later turn,
         // twice: as reply text and as tool-call arguments).
         if (/^File (written|appended):/.test(rawResult)) {
+          state.runsSinceWrite = 0;
+          state.lastRunFailed = false;
+          state.verifyNudged = false;
+          state.failNudged = false;
           this.stripWrittenContent(calls[i]);
           // Native-tool models re-read the history as structured tool calls, so the reply text can go.
           // Fenced-block models must keep seeing the exact block format they are supposed to produce.
@@ -799,7 +884,7 @@ When you are done and have no more actions to take, reply normally with a final 
     try {
       const a = JSON.parse(call.arguments);
       if (typeof a.content === "string") {
-        a.content = `[${a.content.length} chars written to ${a.path}]`;
+        a.content = omittedContentNote(a.content.length, String(a.path ?? "the file"));
         call.arguments = JSON.stringify(a);
       }
     } catch {
@@ -826,6 +911,17 @@ When you are done and have no more actions to take, reply normally with a final 
       out[k] = typeof v === "string" && v.length > 120 ? `${v.slice(0, 120)}… (${v.length} chars)` : v;
     }
     return JSON.stringify(out);
+  }
+
+  /** Added to the first message when an earlier run left a plan in the project. */
+  private existingPlanNote(): string {
+    const plan = new PlanStore(this.workspaceRoot).load();
+    if (!plan) return "";
+    return (
+      "\n\nEXISTING PLAN from an earlier run (.agent/plan.md). If this task continues that work, carry on with the open steps; " +
+      "if it is a different task, replace the plan with update_plan.\n" +
+      describePlan(plan)
+    );
   }
 
   private async handleToolCall(call: ToolCall, state: SessionState, outputWasCutOff = false): Promise<string> {
@@ -934,6 +1030,66 @@ When you are done and have no more actions to take, reply normally with a final 
       case "inspect_page":
         return runInspectPage(args, this.workspaceRoot);
       
+      case "design_search":
+        return runDesignSearch(args);
+
+      case "deploy_template":
+        return runDeployTemplate(args);
+
+      case "predeploy_check":
+        return runPredeployCheck(this.workspaceRoot);
+
+      case "update_plan": {
+        if (state.readOnly) return READ_ONLY_REFUSAL;
+        const store = new PlanStore(this.workspaceRoot);
+        const current = store.load() ?? emptyPlan();
+        const hasUpdate = ["goal", "steps", "done", "reopen", "note"].some((k) => args[k] !== undefined);
+        if (!hasUpdate) {
+          return current.steps.length > 0 ? describePlan(current) : "No plan yet. Create one with update_plan and steps: [...].";
+        }
+        const { plan, warnings } = applyPlanUpdate(current, args);
+        try {
+          store.save(plan);
+        } catch (err: any) {
+          return `TOOL ERROR: could not save the plan: ${err?.message ?? err}`;
+        }
+        state.planUsed = true;
+        const done = plan.steps.filter((s) => s.done).length;
+        console.log(pc.dim(`📋 plan: ${done}/${plan.steps.length} steps done`));
+        return describePlan(plan) + (warnings.length ? `\n${warnings.join("\n")}` : "");
+      }
+
+      case "start_process": {
+        if (state.readOnly) return READ_ONLY_REFUSAL;
+        const command = String(args.command ?? "").trim();
+        if (!command) return 'TOOL ERROR: start_process requires a non-empty "command".';
+        console.log(`\n${pc.bold("Proposed background process:")} ${pc.yellow(command)}`);
+        const auto = this.autoRunEnabled() && !isDangerousCommand(command) && !escapesWorkspace(command, this.workspaceRoot);
+        if (auto) {
+          console.log(pc.green(`▶ Auto-starting: ${command}`));
+        } else {
+          if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
+          if (!(await confirm("Start this background process?"))) {
+            return "User rejected starting this process. Do not repeat it; ask what to do differently or stop.";
+          }
+        }
+        state.commandsRun.push(command);
+        state.runsSinceWrite++;
+        return this.procs.start({
+          name: args.name,
+          command,
+          port: args.port,
+          readyPattern: args.ready_pattern,
+          waitSeconds: args.wait_seconds,
+        });
+      }
+
+      case "process_logs":
+        return this.procs.logs(args.name, args.tail_chars);
+
+      case "stop_process":
+        return this.procs.stop(args.name);
+
       case "run_command": {
         console.log(`\n${pc.bold("Proposed command:")} ${pc.yellow(String(args.command))}`);
         if (args.reason) console.log(pc.dim(`Reason: ${args.reason}`));
@@ -952,6 +1108,13 @@ When you are done and have no more actions to take, reply normally with a final 
           if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
           const approved = await confirm("Run this command?");
           if (!approved) {
+            if (!process.stdin.isTTY) {
+              return (
+                "This command was NOT run: it needs approval and nobody is available to give it (unattended run). " +
+                "Do not repeat it. Reach the same goal another way inside the project: no `cd ..`, no absolute paths outside the project, " +
+                "no rm, no global installs; use `npm --prefix <dir>` and `mkdir -p <dir>` from the project root."
+              );
+            }
             return "User rejected running this command. Do not repeat it; ask what to do differently or stop.";
           }
         } else {
@@ -978,11 +1141,22 @@ When you are done and have no more actions to take, reply normally with a final 
         console.log();
         if (result.interrupted) state.interrupted = true;
         state.commandsRun.push(command);
+        state.runsSinceWrite++;
         if (!diagnostic) state.heavyRuns++;
+
+        // A failed run: a short list of the failing lines (the middle of a long log is cut), and a stop signal when
+        // the same failure keeps coming back.
+        const failed = !result.timedOut && !result.interrupted && result.exitCode !== 0;
+        state.lastRunFailed = failed;
+        const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
+        const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
+        if (repeatCount >= REPEAT_LIMIT) console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
 
         return JSON.stringify({
           exitCode: result.exitCode,
           timedOut: result.timedOut,
+          ...(failureSummary ? { failureSummary } : {}),
+          ...(repeatCount >= REPEAT_LIMIT ? { note: repeatNote(repeatCount) } : {}),
           ...(result.interrupted
             ? {
                 interrupted: true,
@@ -1041,6 +1215,8 @@ When you are done and have no more actions to take, reply normally with a final 
       return `TOOL ERROR: ${toolName} requires non-empty string "content".`;
     }
     if (this.fs.isDirectory(p)) return `TOOL ERROR: ${p} is a directory, not a file.`;
+    // The history shows a note instead of earlier written content; a model sometimes copies the note as content.
+    if (containsOmittedContentNote(args.content)) return OMITTED_CONTENT_REFUSAL;
 
     const content = ensureTrailingNewline(args.content.replace(/\r\n/g, "\n"));
     const exists = this.fs.fileExists(p);

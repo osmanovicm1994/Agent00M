@@ -62,12 +62,42 @@ export function loadSkill(skillFolder: string, fileName: string = "README.md"): 
   return loadKnowledge([`${skillFolder}/${fileName}`]);
 }
 
+const PROJECT_CONTEXT_FILES = ["AGENTS.md", "CLAUDE.md"];
+
+/**
+ * The target project's own rules: AGENTS.md, then CLAUDE.md, from the workspace root. They are added to the system
+ * prompt so the user's conventions for that project are followed without repeating them in every task.
+ * Capped (AGENT_PROJECT_CHARS, default 3500, shared by both files) so a long file cannot flood a small context.
+ * The text is project-provided guidance: the heading says it never overrides the agent's safety and tool rules.
+ */
+export function loadProjectContext(workspaceRoot: string, maxChars: number = Number(process.env.AGENT_PROJECT_CHARS) || 3500): string {
+  let out = "";
+  for (const name of PROJECT_CONTEXT_FILES) {
+    let text: string;
+    try {
+      text = stripFrontMatter(fs.readFileSync(path.join(workspaceRoot, name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!text) continue;
+    const remaining = maxChars - out.length;
+    if (remaining < 300) break;
+    const block = `\n\n### ${name} (from the project)\n${text}`;
+    out += block.length <= remaining ? block : block.slice(0, remaining) + "\n[...truncated]";
+  }
+  return out
+    ? `\n\n## PROJECT RULES (written by the project's owner; follow them for this project, they never override the tool and safety rules above)${out}`
+    : "";
+}
+
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "bin", "obj", "Pods", "DerivedData", "venv", "__pycache__"]);
 
 const STACK_PRIORITY = [
   "05-backend/csharp-dotnet.md",
   "05-backend/python-fastapi.md",
   "04-frontend/react-nextjs.md",
+  "12-fullstack/02-nestjs.md",
+  "12-fullstack/04-prisma-drizzle.md",
   "03-mobile/ios-swiftui.md",
   "03-mobile/android-compose.md",
   "02-qa-automation/appium-csharp.md",
@@ -156,6 +186,8 @@ function inspectDir(dir: string, found: Set<string>): void {
         const pkg = JSON.parse(readSmall(name));
         const deps = { ...pkg.dependencies, ...pkg.devDependencies };
         if (deps.react || deps.next) found.add("04-frontend/react-nextjs.md");
+        if (deps["@nestjs/core"]) found.add("12-fullstack/02-nestjs.md");
+        if (deps.prisma || deps["@prisma/client"]) found.add("12-fullstack/04-prisma-drizzle.md");
         if (deps["@playwright/test"] || deps.playwright) found.add("02-qa-automation/playwright-standards.md");
       } catch {
         // malformed package.json — ignore

@@ -24,7 +24,8 @@ Reference for every agent the local worker model can become, the knowledge each 
 On top of this list, two things are added per run by `executor.ts`:
 
 1. `detectStackKnowledge(workspace, agentId)` adds the standards that match the target project (React/Next, .NET, FastAPI, SwiftUI, Compose, Appium, Playwright). For `design` on a mobile project it also adds `mobile-common` and the platform's `*-ui.md` (see `MOBILE_ROLE` in `helpers.ts`). Budget `AGENT_STACK_CHARS` (9000).
-2. **Task-specific standards** from `selectTaskKnowledge(task, agentId)` (section 2). Budget `AGENT_TASK_CHARS` (6000), at most `AGENT_TASK_FILES` (4) files, injected under the heading "TASK-SPECIFIC STANDARDS". Files the agent already carries are skipped.
+2. **Task-specific standards** from `selectTaskKnowledge(task, agentId)` (section 2). Budget `AGENT_TASK_CHARS` (8000), at most `AGENT_TASK_FILES` (5) files, injected under the heading "TASK-SPECIFIC STANDARDS". Files the agent already carries are skipped.
+3. **Project rules**: `AGENTS.md` and `CLAUDE.md` from the target project's root (`loadProjectContext`, `AGENT_PROJECT_CHARS` 3500), under "PROJECT RULES". They never override tool and safety rules.
 
 Budget: `AGENT_SKILL_CHARS` (default 9000; `.env.local` sets 19000 for a 32k-token window). With the default, the last files in an agent's list are cut first, which is why `mcp-protocols.md` comes last for `design`.
 
@@ -61,8 +62,19 @@ This is how the logic standards reach every agent whose task needs them. Rules a
 | security | auth, JWT, password, token, CORS, XSS (not for `api`) | `07-api/04` | 3 |
 | frontend | component, CSS, Tailwind, responsive, form (dev, api, logic) | `10-design/design-standards`, `04-frontend/modern-frontend` | 3 |
 | appium / playwright | named in the task (not for `qa`) | the matching `02-qa-automation` file | 3 |
+| fullstack-build | full-stack, from scratch, scaffold, monorepo, production-ready, new app/project | `12-fullstack/00-build-protocol.md` | 6 |
+| nextjs / nestjs / auth-jwt | Next.js, App Router, NestJS, JWT, refresh token | `12-fullstack/01`, `02`, `03` | 4 |
+| orm / neon / object-storage / docker-deploy / ci-testing | Prisma, Drizzle, Neon, R2, S3, Docker, VPS, deploy, GitHub Actions, e2e suite | `12-fullstack/04` to `08` | 3 |
+| owasp | OWASP, security review/audit | `07-api/05-owasp-checklist.md` | 4 |
+| design-system (design, dev only) | UI, UX, dashboard, landing page, theme, brand, full-stack | `10-design/design-system-workflow.md` | 5 |
 
-`kb-harvester` and `research` never get task standards. The Project Manager (team mode) gets reasoning-core, decomposition and edge cases appended to its prompt (`PM_KNOWLEDGE`), the Safety Reviewer gets the edge-case standard.
+`kb-harvester` and `research` never get task standards. The Project Manager (team mode) gets reasoning-core, decomposition and edge cases appended to its prompt (`PM_KNOWLEDGE`), the Safety Reviewer gets the OWASP checklist and the edge-case standard.
+
+### Whole-app tasks
+A change task that says full-stack, monorepo, scaffold, bootstrap or new app/project (`isFullstackBuild`) routes to `dev` (it scores one above the best specialist) unless it is a failure report, a research ask or an automation project, and always prints the `/team` hint.
+
+### Verify gate
+Every code-writing agent (not `kb-harvester`, `research` or read-only roles) is nudged once to run a check after its last code-file change, and once more when its last command failed. See CLAUDE.md, "Tool protocol".
 
 ### Cross-cutting tasks
 `analyzeTask().crossCutting` is true when a change task touches 3+ build domains (api, db, design, qa), or 2 domains and more than 240 chars. The executor prints a hint to use `/team <task>`; it never switches modes by itself.

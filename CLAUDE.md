@@ -9,7 +9,7 @@ Guidance for Claude Code when working in this repository.
 - Model: set by `AI_MODEL_NAME`. `.env.example` ships `qwen2.5-coder-32b-instruct-abliterated`; the current `.env.local` uses `qwen/qwen3-coder-30b`. Other profiles: `.env.qwen3coder`, `.env.devstral`, `.env.codestral`.
 - Everything must be able to run locally. Cloud backends (`.env.nim` for NVIDIA NIM) are optional and only reachable through the same OpenAI-compatible provider. The Gemini research stage is the only feature that sends data off the machine and is opt-in.
 - TypeScript, CommonJS, Node 20+, run with `ts-node` (dev) or `tsc` (build). The dashboard in `web/` is a separate ESM project (Vite + React 19 + Tailwind 4).
-- Further docs: `docs/AGENTS.md` (agent catalog, routing, team roles, how to add an agent), `docs/MODELS.md` (model comparison and LM Studio settings), `src/knowledge/README.md` (knowledge index).
+- Further docs: `docs/AGENTS.md` (agent catalog, routing, team roles, how to add an agent), `docs/MODELS.md` (model comparison and LM Studio settings), `docs/FULLSTACK_READINESS.md` (gap analysis and roadmap for building a full-stack app from a prompt), `src/knowledge/README.md` (knowledge index).
 
 ## Commands
 
@@ -28,6 +28,8 @@ npx ts-node src/cli.ts agents
 npx ts-node src/cli.ts route "task text" [-p /path/to/project]   # dry run: signals, chosen agent, task standards (no model call); use it to tune orchestration.ts
 npm run models           # list models on the LM Studio server (+ native/fenced tool mode)
 npm run bench            # first-token time, tok/s and tool-calling check of the model in .env.local
+npm run bench:fullstack -- --baseline   # full-stack benchmark sanity check: every acceptance check must FAIL on an empty folder (no model needed)
+npm run bench:fullstack -- --workspace ~/bench-app   # runs bench/fullstack/spec.json slice by slice through `run -y --no-mcp` (LM Studio, hours); results in bench/fullstack/results/; --accept-only, --from, --only, --max, --stop-on-fail, --team, --compare a.json b.json
 npm run chat:qwen3       # profiles: chat:qwen3 | chat:devstral | chat:codestral (bench:* likewise)
 npm run triage:models    # Gemini models the API key can use, and the order they are tried (--test pings each)
 npm run search:test -- "query"   # run one web search and show which engine answered or failed
@@ -49,6 +51,8 @@ src/
     diff.ts              colored diff shown before a write is approved.
     events.ts            in-process event bus (bus.emit / bus.withRun). Core code only emits; it never imports the server.
     event-types.ts       wire types shared with web/ (types only, no runtime imports).
+    plan.ts              persisted build plan: `.agent/plan.md` in the TARGET project (git-ignored via `.agent/.gitignore`). parse/render/applyPlanUpdate are pure; PlanStore reads/writes; planToolSchema = `update_plan`.
+    run-feedback.ts      pure: errorSignature + RepeatTracker (same failure 3x -> stop note), summarizeFailures (failing lines of a long log), isCodeFile (what the verify gate checks).
     command-safety.ts    SAFE_DIAGNOSTIC_RES / isSafeDiagnostic and DANGEROUS_COMMAND_RES / isDangerousCommand (pure, unit-tested).
     control.ts           UI-agnostic control hook (tasks, approvals, startup questions) shared by terminal and dashboard.
     interrupt.ts         Ctrl+C handling while a command runs (raw-mode stdin).
@@ -69,10 +73,15 @@ src/
   team/
     orchestrator.ts      team mode workflow.   roles.ts   PM / UX / report prompts, ROLE_TITLES, safetyAgent.
   vision/describe.ts     reference picture -> text design brief (local vision model, else Gemini).
+  bench/
+    fullstack-bench.ts   pure: spec schema, slice selection, summaries, markdown report, before/after compare.   run.ts  the runner (spawns the agent and the acceptance commands).
   tools/
     fs.tool.ts           workspace-scoped file tools + tool schemas.
     search.tool.ts       find_files, grep.   shell.tool.ts  run_command (async, streams output, kills the whole process group on timeout).
     web-search.tool.ts   web_search, web_fetch, web_research.
+    deploy.tool.ts       deploy_template (Dockerfiles for Next/Nest, compose, Caddyfile, CI workflow, .dockerignore) and predeploy_check (read-only facts: non-root user, .dockerignore, literal secrets in deploy files, healthchecks, restart policy, published DB ports, Next standalone output, CI; it lists what it cannot verify). A test builds a project from the templates and requires zero FAIL/WARN, so templates and checks cannot drift apart.
+    design-search.tool.ts  design_search: TypeScript port of the uupm BM25 search over its CSV catalogs (domains brief/style/color/typography/landing/product/ux/chart/web/react, or stack=nextjs|react|html-tailwind|shadcn|...). Data folder: `knowledge/uupm/src/knowledge/uupm/src/ui-ux-pro-max/data` or `UUPM_DATA_DIR`; a missing pack gives a plain "not available" message. Also `loadDesignSystem`: the target project's `design-system/MASTER.md` is added to the prompt of the `design` and `dev` agents (`AGENT_DESIGN_CHARS`, default 2500).
+    process.tool.ts      start_process / process_logs / stop_process: background dev servers (detached, bounded log buffer, waits for a port or ready pattern, max 4, all stopped when the CLI exits).
     browser.tool.ts      inspect_page: headless Chromium (Playwright) facts about a localhost page or workspace .html file. Read-only.
     index.ts             non-interactive ToolDispatcher (scripts/tests). Executor does NOT use it.
     tools.test.ts        unit tests for the file/search tools and dispatcher.
@@ -80,7 +89,7 @@ src/
   knowledge/             markdown standards injected into agent prompts (see below).
 web/                     separate Vite + React + Tailwind dashboard (own package.json, not part of the root tsc).
 docs/                    AGENTS.md (agent catalog), MODELS.md (models and LM Studio settings).
-mcp.config.json          MCP servers started at launch.
+mcp.config.json          MCP servers started at launch. Per server: `command`/`args`/`env` (`${NAME}` is filled from the environment, so tokens stay out of the file), `tools` (allowlist: every exposed tool schema costs context), `autoApprove`, `autoApproveTools`, `disabled`. Only `sequential-thinking` is enabled. Ready but disabled (set `"disabled": false` to use): `context7` (library docs; the query goes to Upstash's cloud, so it is opt-in), `playwright` (`@playwright/mcp`, headless, isolated, localhost origins only, 11 allowed tools: drives and checks the running app), `github` (Docker image, needs `GITHUB_PERSONAL_ACCESS_TOKEN` in `.env`; every call asks). Neon's MCP server is remote-only and not supported by the stdio client; use Prisma/Drizzle migrations instead.
 _to_delete/              git-ignored, excluded from tsconfig: leftovers of the removed Anthropic provider, the old tools/tree.ts and test-tools.ts, and the superseded 08-logic/tool-execution.md. Safe to delete by hand.
 ```
 
@@ -96,7 +105,11 @@ Dependencies worth knowing: `zod` (all model JSON is validated), `prompts` (appr
 ### Tool protocol
 
 - Read tools: `read_file` (with `start_line`/`end_line`, truncated at ~40k chars), `read_multiple_files`, `list_directory`, `get_directory_tree` (`path` or legacy `rootDir`), `find_files`, `grep`, plus the web tools.
-- Write tools: `write_file`, `append_file`, `run_command`.
+- Write tools: `write_file`, `append_file`, `run_command`, `start_process` (same approval and auto-mode rules as `run_command`; `process_logs` and `stop_process` need none).
+- `deploy_template`, `predeploy_check` (read-only, batchable): see tools/deploy.tool.ts; the agent adapts a template and writes it with `write_file`.
+- `design_search` (read-only, batchable): see tools/design-search.tool.ts. Workflow standard: `10-design/design-system-workflow.md` (task rule `design-system`, design and dev agents): a new UI starts with domain `brief`, saves `design-system/MASTER.md`, then builds tokens before components.
+- `update_plan` (no approval, refused for read-only roles): `steps` replaces the list (finished steps with the same text stay done), `done`/`reopen` take 1-based step numbers, `goal`, `note`; no arguments = read the plan. The saved plan is appended to the first message of the next run, and a run that used `update_plan` gets one nudge (step 3d) if it ends with open steps. The team-mode PM plan is still not persisted.
+- Verify gate (executor, step 3b/3c): a code-writing agent that changed a code file and ends without running any command since gets ONE nudge to run the narrowest check (or say UNVERIFIED); if its last command failed and nothing changed since, one nudge to fix it or report the failure honestly. `kb-harvester`, `research` and read-only roles are exempt. The same failure signature 3 times adds a stop-and-report note to the command result; failed runs with long output also get a `failureSummary`.
 - Writes use a **raw fenced block**, never JSON-escaped content: the opening line carries the path.
 
   ````
@@ -125,7 +138,7 @@ Full catalog, knowledge per agent, routing keywords and the "add an agent" check
 
 - Registered in `agents/definitions.ts`: `dev`, `api`, `db`, `design`, `logic`, `kb-harvester`, `qa`, `debug`, `research`. `agents/registry.test.ts` fails if an agent file is not registered, a routing group has no agent, or a prompt/rule points at a missing knowledge file.
 - Routing order: forced agent (`-a`, `/use`, dashboard picker) > research-stage `recommendedAgent` > keyword score (one strict winner, `rankDomains` in `agents/orchestration.ts`) > one capped LLM call (sees the keyword signals) > `dev`. Keywords are deliberately specific. A research-style task that also has a change verb is not routed to `research`.
-- **Task-specific standards**: besides the agent's own list and the detected stack standards, `selectTaskKnowledge(task, agentId)` adds up to `AGENT_TASK_FILES` (4) files within `AGENT_TASK_CHARS` (6000) from `KNOWLEDGE_RULES`, under "TASK-SPECIFIC STANDARDS" (logic standards weigh highest: edge cases, decomposition, root cause, distributed, debugging playbook; plus database/api/security/frontend/qa rules). `08-logic/00-reasoning-core.md` is part of every code-writing agent's own list. The PM and Safety Reviewer in team mode also get logic standards. When a change task spans 3+ build domains the executor prints a hint to use `/team`; it never switches modes itself.
+- **Task-specific standards**: besides the agent's own list and the detected stack standards, `selectTaskKnowledge(task, agentId)` adds up to `AGENT_TASK_FILES` (5) files within `AGENT_TASK_CHARS` (8000) from `KNOWLEDGE_RULES`, under "TASK-SPECIFIC STANDARDS" (logic standards weigh highest: edge cases, decomposition, root cause, distributed, debugging playbook; plus database/api/security/frontend/qa rules, and the full-stack packs in `12-fullstack/` matched on words like Next.js, NestJS, Prisma, Neon, R2, Docker, JWT, because a new project has no marker files for stack detection yet). `08-logic/00-reasoning-core.md` is part of every code-writing agent's own list. The PM and Safety Reviewer in team mode also get logic standards. When a change task spans 3+ build domains the executor prints a hint to use `/team`; it never switches modes itself.
 - `safety` lives in `team/roles.ts`, is not in `AGENTS` (not routable, not lockable).
 - Every agent file follows the same shape: `id`, `name`, `description` (short: the dashboard clamps it to two lines and the router lists it), `systemPrompt` built from a template string plus `loadKnowledge([...])`. Avoid backticks and `${` inside a prompt template string.
 
@@ -177,12 +190,13 @@ Three layers, all needed:
 The agent's file tools are scoped to the **target** project, so the agent can never open `src/knowledge` itself. Knowledge is therefore **injected into the system prompt**:
 
 - `loadKnowledge([...paths])` (paths relative to `src/knowledge`) is called in each `agents/list/*.ts`, capped by `AGENT_SKILL_CHARS` (default 9000; `.env.local` sets 19000 for a 32k window). Files are added in list order and the **end is cut first**, so put the least important file last. A missing file prints a one-time warning; keep paths in sync with the folder names.
+- The target project's own `AGENTS.md` and `CLAUDE.md` (workspace root) are added to the system prompt by `loadProjectContext` under "PROJECT RULES", capped by `AGENT_PROJECT_CHARS` (3500); they never override tool and safety rules.
 - Task-specific files come from `selectTaskKnowledge` (see Agents) and are skipped when the agent already carries them. `08-logic/00-reasoning-core.md` (short) is second in every code agent's list so it survives small budgets.
 - `detectStackKnowledge(workspace, agentId)` inspects the target project (package.json deps, `*.csproj`, FastAPI, Xcode/Gradle markers, Appium references) and adds the matching standards (`05-backend`, `04-frontend`, `03-mobile`, `02-qa-automation`), capped at 6000 chars. Mobile detail files are chosen per agent role (`MOBILE_ROLE` in `helpers.ts`).
-- Folders: `00-agent-core`, `01-architecture`, `02-qa-automation`, `03-mobile`, `04-frontend` (`react-nextjs.md`, `modern-frontend.md`), `05-backend`, `06-database`, `07-api`, `08-logic`, `09-ai-agents`, `10-design` (`design-standards.md`, `css-and-tailwind.md`), `11-kb`. `src/knowledge/README.md` has the table of what is injected for whom.
+- Folders: `00-agent-core`, `01-architecture`, `02-qa-automation`, `03-mobile`, `04-frontend` (`react-nextjs.md`, `modern-frontend.md`), `05-backend`, `06-database`, `07-api`, `08-logic`, `09-ai-agents`, `10-design` (`design-standards.md`, `css-and-tailwind.md`), `11-kb`, `12-fullstack` (build protocol, Next.js, NestJS, JWT auth, Prisma/Drizzle, Neon, R2, Docker/VPS, CI/testing; task-matched, see `docs/FULLSTACK_READINESS.md`). `src/knowledge/README.md` has the table of what is injected for whom.
 - Writing standards: no path-comment headers or hard-wrapped bullets (they cost prompt budget), no LaTeX, no rule that contradicts "match the project" (say "follow the project first" when a standard names a specific library). Never mention folders the agent cannot open (for example `uupm`). Reviewed in full on 2026-10-15; the `ios-*` mobile files were read and left unchanged.
 - Add a file: keep it short and imperative (~1.5-2 KB), then reference it in an agent's list or in `STACK_PRIORITY`/`inspectDir` in `helpers.ts`.
-- `knowledge/uupm/` is a vendored UI/UX Pro Max skill pack. It is a **nested git clone with its own `.git`** and contains fonts, CSV catalogs, Python scripts and skills for Tailwind/shadcn, design tokens and slides. It is **not injected anywhere**; `10-design/design-standards.md` is the condensed version the frontend agent uses. Do not recurse into it when exploring the repo.
+- `knowledge/uupm/` is a vendored UI/UX Pro Max skill pack. It is a **nested git clone with its own `.git`** and contains fonts, CSV catalogs, Python scripts and skills for Tailwind/shadcn, design tokens and slides. Its CSV catalogs are searched natively by the `design_search` tool (the Python scripts are not used). The folder itself is **not injected anywhere**; `10-design/design-standards.md` is the condensed version the frontend agent uses. Do not recurse into it when exploring the repo.
 
 ## Models & speed
 
@@ -198,7 +212,7 @@ See `docs/MODELS.md` for the model comparison, LM Studio settings and why number
 
 Files: `.env.example` (documented reference, copy to `.env`), `.env.local` (default local profile, committed, no secrets), `.env.qwen3coder` / `.env.devstral` / `.env.codestral` (model profiles), `.env.nim` (real cloud key, git-ignored, never print or commit), `.env` (git-ignored; **keys go here**: `GEMINI_API_KEY`, `BRAVE_API_KEY`, `TAVILY_API_KEY`). Current `.env.local` values: `AI_MODEL_NAME=qwen/qwen3-coder-30b`, `AI_MAX_TOKENS=16384`, `AI_TEMPERATURE=0.3`, `AGENT_CONTEXT_CHARS=60000`, `AGENT_SKILL_CHARS=19000`, `WEB_SEARCH_ENGINES=searxng`, `SEARXNG_URL=http://localhost:8080`.
 
-Variables: `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AI_VISION_MODEL`, `AGENT_MAX_STEPS`, `AGENT_AUTO_WRITE`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_STACK_CHARS`, `AGENT_TASK_FILES`, `AGENT_TASK_CHARS`, `AI_CACHE_TTL_DAYS`, `AI_CACHE_MAX_MB`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`, `AGENT_CMD_TIMEOUT_MIN`, `AGENT_DEFAULT_WORKSPACE`; research stage: `GEMINI_API_KEY`, `AGENT_RESEARCH` (`AGENT_TRIAGE` = old name), `AGENT_PLANNER`, `AGENT_RESEARCH_GROUNDING`, `AGENT_RESEARCH_TIMEOUT_MS`, `AGENT_RESEARCH_MAX_CHARS`, `AGENT_RESEARCH_CONFIRM` (`AGENT_TRIAGE_CONFIRM`), `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `AGENT_TRIAGE_TIMEOUT_MS`, `AGENT_TRIAGE_MAX_CHARS`, `AGENT_GROUNDING_BLOCK_MS`; web: `WEB_SEARCH_ENGINES`, `SEARXNG_URL`, `SEARXNG_ENGINES`, `SEARXNG_LANGUAGE`, `BRAVE_API_KEY`, `TAVILY_API_KEY`, `WEB_TIMEOUT_MS`, `WEB_MAX_PAGE_BYTES`, `WEB_MAX_PDF_BYTES`, `WEB_PDF_MAX_PAGES`; dashboard: `AGENT_UI_PORT`, `AGENT_UI_TOKEN`, `AGENT_UI_URL`, `AGENT_UI_HISTORY`, `AGENT_UI_ORIGINS`, `AGENT_UI_WEB`, `AGENT_UI_OPEN`, `AGENT_UI_LAN`, `VITE_AGENT_WS`. See `.env.example` for what each does.
+Variables: `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL_NAME`, `AI_MAX_TOKENS`, `AI_TEMPERATURE` (default 0.2), `AI_MAX_CONTINUATIONS`, `AI_TIMEOUT_MS`, `AI_STREAM_PROGRESS`, `AI_CACHE=off`, `AI_NATIVE_TOOLS`, `AI_NO_THINK`, `AI_STATS`, `AI_PROVIDER`, `AI_VISION_MODEL`, `AGENT_MAX_STEPS`, `AGENT_AUTO_WRITE`, `AGENT_AUTO_DIAG`, `AGENT_AUTO_RUN`, `AGENT_ROUTER`, `AGENT_CONTEXT_CHARS`, `AGENT_SKILL_CHARS`, `AGENT_STACK_CHARS`, `AGENT_TASK_FILES`, `AGENT_TASK_CHARS`, `AGENT_PROJECT_CHARS`, `AI_CACHE_TTL_DAYS`, `AI_CACHE_MAX_MB`, `AGENT_MCP_CONFIG`, `AGENT_CACHE_DIR`, `AGENT_CMD_TIMEOUT_MIN`, `AGENT_DEFAULT_WORKSPACE`; research stage: `GEMINI_API_KEY`, `AGENT_RESEARCH` (`AGENT_TRIAGE` = old name), `AGENT_PLANNER`, `AGENT_RESEARCH_GROUNDING`, `AGENT_RESEARCH_TIMEOUT_MS`, `AGENT_RESEARCH_MAX_CHARS`, `AGENT_RESEARCH_CONFIRM` (`AGENT_TRIAGE_CONFIRM`), `GEMINI_MODEL`, `GEMINI_FALLBACK_MODELS`, `AGENT_TRIAGE_TIMEOUT_MS`, `AGENT_TRIAGE_MAX_CHARS`, `AGENT_GROUNDING_BLOCK_MS`; web: `WEB_SEARCH_ENGINES`, `SEARXNG_URL`, `SEARXNG_ENGINES`, `SEARXNG_LANGUAGE`, `BRAVE_API_KEY`, `TAVILY_API_KEY`, `WEB_TIMEOUT_MS`, `WEB_MAX_PAGE_BYTES`, `WEB_MAX_PDF_BYTES`, `WEB_PDF_MAX_PAGES`; dashboard: `AGENT_UI_PORT`, `AGENT_UI_TOKEN`, `AGENT_UI_URL`, `AGENT_UI_HISTORY`, `AGENT_UI_ORIGINS`, `AGENT_UI_WEB`, `AGENT_UI_OPEN`, `AGENT_UI_LAN`, `VITE_AGENT_WS`. See `.env.example` for what each does.
 
 ## Conventions
 
@@ -285,5 +299,6 @@ npx ts-node src/cli.ts run "task" -p /path --serve   # one-shot run, same socket
 - The LLM response cache key includes the full message history, so it mainly helps identical re-runs (old entries are pruned by age and size).
 - Shell commands run through `run_command` after user approval, or automatically in auto mode (except the risky-command list and commands that name paths outside the project, see above). There is still no real sandbox: a script the agent wrote can touch anything. Auto mode runs model-chosen commands on your machine: use it on projects under version control.
 - `inspect_page` reports facts (errors, overflow, structure, a11y) but cannot judge how a page looks, and it needs a running dev server URL or a static .html file plus `npx playwright install chromium`. The frontend agent reports visual checks as "Not verified".
+- Phase 2 (verify gate, process tool, repeated-error stop, whole-app tasks routed to `dev` with a `/team` hint) is implemented and unit-tested, but not yet exercised against a real model. Background processes are stopped on a normal exit; a hard kill of the CLI can leave a dev server running.
 - Keyword routing and task rules are regex heuristics: tune `DOMAIN_KEYWORDS` / `KNOWLEDGE_RULES` and their tests when a task is misrouted.
 - `gateway/` is still in use (shared Gemini plumbing for `research/`); only the old triage interceptor was removed.

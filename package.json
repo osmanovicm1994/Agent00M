@@ -31,7 +31,8 @@
     "bench": "dotenv -e .env.local -- ts-node src/cli.ts bench",
     "bench:qwen3": "dotenv -e .env.qwen3coder -- ts-node src/cli.ts bench",
     "bench:devstral": "dotenv -e .env.devstral -- ts-node src/cli.ts bench",
-    "bench:codestral": "dotenv -e .env.codestral -- ts-node src/cli.ts bench"
+    "bench:codestral": "dotenv -e .env.codestral -- ts-node src/cli.ts bench",
+    "bench:fullstack": "ts-node src/bench/run.ts"
   },
   "dependencies": {
     "@fastify/websocket": "^11.0.0",
