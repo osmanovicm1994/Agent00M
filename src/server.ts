@@ -15,6 +15,7 @@ import { AGENTS } from "./agents/definitions";
 import { bus } from "./core/events";
 import { control, MAX_ANSWER_CHARS } from "./core/control";
 import type { AgentInfo, ClientCommand, ServerMessage } from "./core/event-types";
+import { REMOTE_MODE, detectTailscale, resolveRemoteHost } from "./remote";
 
 export interface DashboardServer {
   port: number;
@@ -29,12 +30,20 @@ export const UI_BASE_URL = process.env.AGENT_UI_URL || "http://localhost:5173";
 const WS_OPEN = 1;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const WEB_PORT = Number(process.env.AGENT_UI_WEB_PORT) || 5173;
+const MIN_REMOTE_TOKEN_CHARS = 24;
 
 // LAN mode (AGENT_UI_LAN=1, or `npm run chat:ui:lan`): the socket and the web app are reachable from
 // other devices on your home network, e.g. your phone. Off by default (loopback only).
 // Because the agent can run commands and write files, LAN mode requires the token for EVERY connection
 // (no read-only guests) and only accepts browser origins that are one of this machine's own addresses.
 export const LAN_MODE = ["1", "on", "true", "yes"].includes((process.env.AGENT_UI_LAN ?? "").trim().toLowerCase());
+
+// Remote mode (AGENT_UI_REMOTE=1, or `npm run chat:ui:remote`): reachable from outside your home
+// network through Tailscale (works behind CGNAT). The socket STILL binds to 127.0.0.1: Tailscale
+// Serve proxies HTTPS to the Vite dev server, which forwards /ws to this server. The token is
+// required for every connection and the Tailscale host name is added to the origin allowlist.
+// See src/remote.ts and docs/REMOTE.md.
+export { REMOTE_MODE };
 
 // This machine's private IPv4 addresses (Wi-Fi / Ethernet), without loopback.
 export function lanAddresses(): string[] {
@@ -49,13 +58,14 @@ export function lanAddresses(): string[] {
 
 // The dashboard exposes what the agent reads, runs and writes, so only the local Vite dev server
 // (or origins you list in AGENT_UI_ORIGINS, comma separated) may connect from a browser.
-function allowedOrigins(): Set<string> {
+function allowedOrigins(remoteHost?: string): Set<string> {
   const extra = (process.env.AGENT_UI_ORIGINS ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
   const lan = LAN_MODE ? [...lanAddresses(), os.hostname()].map((h) => `http://${h}:${WEB_PORT}`) : [];
-  return new Set(["http://localhost:5173", "http://127.0.0.1:5173", ...lan, ...extra]);
+  const remote = remoteHost ? [`https://${remoteHost}`] : [];
+  return new Set(["http://localhost:5173", "http://127.0.0.1:5173", ...lan, ...remote, ...extra]);
 }
 
 function tokenMatches(given: string | undefined, expected: string): boolean {
@@ -85,8 +95,16 @@ function parseCommand(raw: unknown): ClientCommand | undefined {
 }
 
 export async function startServer(port: number = DEFAULT_PORT): Promise<DashboardServer> {
-  const origins = allowedOrigins();
-  const token = process.env.AGENT_UI_TOKEN?.trim() || randomBytes(16).toString("hex");
+  // Remote mode: find this machine's tailnet host name BEFORE the origin list is built. It is also
+  // exported to the environment so the Vite dev server (started right after by ui-launcher.ts)
+  // accepts that Host header.
+  const remoteHost = REMOTE_MODE ? resolveRemoteHost() : undefined;
+  if (remoteHost) process.env.AGENT_UI_REMOTE_HOST = remoteHost;
+
+  const origins = allowedOrigins(remoteHost);
+  const fixedToken = process.env.AGENT_UI_TOKEN?.trim();
+  const token = fixedToken || randomBytes(16).toString("hex");
+  const requireToken = LAN_MODE || REMOTE_MODE;
   const roster: AgentInfo[] = AGENTS.map((a) => ({ id: a.id, name: a.name, description: a.description }));
   const agentIds = new Set(AGENTS.map((a) => a.id));
 
@@ -106,7 +124,7 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
 
     const query = req.query as { token?: string };
     const canControl = tokenMatches(query.token, token);
-    if (LAN_MODE && !canControl) {
+    if (requireToken && !canControl) {
       socket.close(1008, "token required");
       return;
     }
@@ -174,7 +192,8 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
     socket.on("error", cleanup);
   });
 
-  // Loopback only unless LAN mode is on.
+  // Loopback only unless LAN mode is on. Remote mode never widens the bind: Tailscale Serve and
+  // the Vite proxy reach this server over 127.0.0.1.
   await app.listen({ port, host: LAN_MODE ? "0.0.0.0" : "127.0.0.1" });
   const url = `${UI_BASE_URL}/?token=${token}`;
   console.log(pc.cyan(`📡 Dashboard socket: ws://127.0.0.1:${port}/ws`));
@@ -188,9 +207,27 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
       console.log(pc.green(`📱 Open on your phone (same Wi-Fi): http://${ip}:${WEB_PORT}/?token=${token}`));
     }
     console.log(pc.yellow("   LAN mode: anyone with this URL can control the agent. Keep it private; it changes every start."));
-  } else {
+  } else if (!REMOTE_MODE) {
     console.log(pc.dim("   Without the token it is read-only. Keep this URL private."));
-    console.log(pc.dim("   Want it on your phone? Use `npm run chat:ui:lan`."));
+    console.log(pc.dim("   Want it on your phone? Use `npm run chat:ui:lan` (home Wi-Fi) or `npm run chat:ui:remote` (anywhere, via Tailscale)."));
+  }
+
+  if (REMOTE_MODE) {
+    if (remoteHost) {
+      console.log(pc.green(`🌍 Remote (Tailscale): https://${remoteHost}/?token=${token}`));
+      console.log(pc.dim("   Needs `npm run remote:on` once (Tailscale Serve), and Tailscale running on the device you open it from."));
+    } else {
+      const info = detectTailscale();
+      const why = info.state && info.state !== "Running" ? `Tailscale reports '${info.state}'.` : "The Tailscale CLI was not found or you are not signed in.";
+      console.log(pc.yellow(`⚠ Remote mode is on but no tailnet host name was found. ${why}`));
+      console.log(pc.yellow("   Install Tailscale and sign in, or set AGENT_UI_REMOTE_HOST=<name>.<tailnet>.ts.net in .env. See docs/REMOTE.md."));
+    }
+    if (!fixedToken) {
+      console.log(pc.yellow("   The token changes every start. Set a fixed AGENT_UI_TOKEN in .env (not .env.local) so a phone bookmark keeps working."));
+    } else if (fixedToken.length < MIN_REMOTE_TOKEN_CHARS) {
+      console.log(pc.yellow(`⚠ AGENT_UI_TOKEN is only ${fixedToken.length} characters. Use at least ${MIN_REMOTE_TOKEN_CHARS} (for example: openssl rand -hex 24).`));
+    }
+    console.log(pc.yellow("   Anyone on your tailnet with the token URL can run commands on this machine. Never use Tailscale Funnel for this."));
   }
 
   return { port, token, url, close: () => app.close() };

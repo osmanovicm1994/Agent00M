@@ -5,11 +5,15 @@ import { RunHeader } from "./components/RunHeader";
 import { TaskComposer } from "./components/TaskComposer";
 import { SetupPanel } from "./components/SetupPanel";
 
-// The socket lives on the same host that served this page, so it also works from a phone on the
-// LAN (http://192.168.x.x:5173 -> ws://192.168.x.x:3001). Override with VITE_AGENT_WS if the agent
-// runs on another port (AGENT_UI_PORT).
+// Where the socket lives:
+//  - Page served over HTTPS (remote access through Tailscale Serve): same origin, wss://<host>/ws.
+//    Vite forwards /ws to the agent, so one HTTPS URL carries both the page and the socket.
+//  - Plain HTTP (localhost or a phone on the LAN): the same host on port 3001, e.g.
+//    http://192.168.x.x:5173 -> ws://192.168.x.x:3001/ws.
+// Override with VITE_AGENT_WS if the agent runs on another port (AGENT_UI_PORT).
 const WS_HOST = window.location.hostname === "localhost" ? "127.0.0.1" : window.location.hostname;
-const WS_BASE: string = import.meta.env.VITE_AGENT_WS ?? `ws://${WS_HOST}:3001/ws`;
+const WS_DEFAULT = window.location.protocol === "https:" ? `wss://${window.location.host}/ws` : `ws://${WS_HOST}:3001/ws`;
+const WS_BASE: string = import.meta.env.VITE_AGENT_WS ?? WS_DEFAULT;
 const TOKEN_KEY = "agent-ui-token";
 
 // The control token comes from the URL the agent prints in the terminal (?token=...). It is kept
