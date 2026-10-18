@@ -15,7 +15,7 @@ import type { LLMProvider } from "./llm/types";
 import { routeTask, announceForcedAgent, announceTriageAgent, keywordRoute } from "./agents/router";
 import { analyzeTask, describeSignals } from "./agents/orchestration";
 import { getAgent, AGENTS } from "./agents/definitions";
-import { Executor } from "./core/executor";
+import { createExecutor, makeParallelOptions } from "./orchestra/wire";
 import { McpManager } from "./mcp/client";
 import { bus } from "./core/events";
 import { control } from "./core/control";
@@ -23,8 +23,8 @@ import { startServer, type DashboardServer } from "./server";
 import { interruptRunningCommands } from "./tools/shell.tool";
 import { launchDashboard, stopDashboard } from "./ui-launcher";
 import { GeminiTriageClient, resolveModels } from "./gateway";
-import { ResearchPipeline, confirmPlan, confirmRequired, researchEnv } from "./research";
-import { searchWeb } from "./tools/web-search.tool";
+import { ResearchPipeline, confirmPlan, confirmRequired, researchEnv, isGeneralRealtime, prefetchRealtime } from "./research";
+import { searchWeb, verifySearxng } from "./tools/web-search.tool";
 import { runTeam } from "./team/orchestrator";
 import { describeImage, renderBriefForAgents, type DesignBrief } from "./vision/describe";
 
@@ -191,6 +191,8 @@ program
   .option("--team", "Team mode: Project Manager plans, engineers build, Safety Reviewer checks the result")
   .option("-i, --image <path>", "A picture of what you want (png/jpg/webp); it is read into a design brief the agents build from")
   .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
+  .option("--parallel", "With --team: engineer tasks that do not depend on each other run at the same time, each confined to its own folders (needs -y)")
+  .option("--auto-debug", "When a command fails (npm 404, version conflict, Prisma error...), run the Debug Agent on the exact output right away and resume (needs auto mode; same as AGENT_AUTO_DEBUG=1)")
   .action(
     async (
       task: string,
@@ -205,8 +207,11 @@ program
         triage?: boolean;
         team?: boolean;
         image?: string;
+        autoDebug?: boolean;
+        parallel?: boolean;
       },
     ) => {
+      if (opts.autoDebug) process.env.AGENT_AUTO_DEBUG = "1";
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
 
@@ -245,7 +250,7 @@ program
 
         // One observable run: routing + execution share a runId on the event bus.
         const result = await bus.withRun({ task, workspace: workspaceRoot }, async () => {
-          const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
+          const executor = createExecutor(llm, workspaceRoot, mcp, { autoWrite: Boolean(opts.autoWrite) });
 
           // Optional Gemini front stage: research first (Google Search), a planner only when needed.
           // The result is extra context for the local agent, plus a suggested agent.
@@ -265,15 +270,26 @@ program
             }
           }
 
+          if (!agent && !opts.team && isGeneralRealtime(task)) {
+            const live = await prefetchRealtime(task);
+            if (live) planContext = live;
+          }
+
           const combinedContext = [planContext, briefText].filter(Boolean).join("\n\n") || undefined;
 
           if (opts.team) {
+            let parallel;
+            if (opts.parallel) {
+              if (executor.isAutoWrite() && executor.isAutoRun()) parallel = makeParallelOptions({ llm, workspaceRoot, mcp });
+              else console.log(pc.yellow("⚠ --parallel needs auto mode (-y): parallel agents cannot ask for approval. Running the team one task at a time."));
+            }
             const team = await runTeam({
               llm,
               executor,
               task,
               workspaceRoot,
               context: combinedContext,
+              parallel,
               approvePlan: !executor.isAutoWrite(),
               // Gemini leads (PM + UX) when you opted into Gemini; the local model is the worker.
               think: useResearch && pipeline.hasApiKey() ? (s, u, m, j) => pipeline.think(s, u, m, j) : undefined,
@@ -402,8 +418,7 @@ program
   .action(async (words: string[]) => {
     const query = words.join(" ").trim() || "typescript 5 release notes";
     console.log(pc.bold("Web search test"));
-    console.log(`  WEB_SEARCH_ENGINES = ${process.env.WEB_SEARCH_ENGINES ?? "(not set, default: gemini)"}`);
-    console.log(`  GEMINI_API_KEY     = ${GeminiTriageClient.resolveApiKey() ? "set" : pc.red("NOT set (put it in .env)")}`);
+    console.log(`  SEARXNG_URL        = ${process.env.SEARXNG_URL?.trim() || "http://localhost:8080 (default)"}`);
     console.log(`  query              = ${query}\n`);
     try {
       const out = await searchWeb(query, 5);
@@ -416,6 +431,27 @@ program
     } finally {
       process.exit();
     }
+  });
+
+program
+  .command("search-verify")
+  .description("Check that the local SearXNG answers with clean JSON for code, error, general-fact, news and weather queries")
+  .action(async () => {
+    const base = process.env.SEARXNG_URL?.trim() || "http://localhost:8080";
+    console.log(pc.bold(`SearXNG check: ${base}\n`));
+    const checks = await verifySearxng();
+    for (const c of checks) {
+      const head = c.ok ? pc.green("✔") : pc.red("✖");
+      console.log(`${head} ${pc.bold(c.label.padEnd(13))} ${String(c.ms).padStart(5)} ms  ${c.results} results  [${c.plan}]${c.fallback ? pc.yellow(" (fell back to general)") : ""}`);
+      console.log(pc.dim(`    query: ${c.query}`));
+      if (c.first) console.log(pc.dim(`    first: ${c.first}`));
+      if (c.engines.length) console.log(pc.dim(`    engines: ${c.engines.join(", ")}`));
+      if (c.unresponsive.length) console.log(pc.yellow(`    did not answer: ${c.unresponsive.join("; ")}`));
+      if (c.problem) console.log(pc.red(`    problem: ${c.problem}`));
+    }
+    const failed = checks.filter((c) => !c.ok).length;
+    console.log(failed ? pc.red(`\n${failed} of ${checks.length} checks failed.`) : pc.green(`\nAll ${checks.length} checks passed: SearXNG answers with clean JSON.`));
+    process.exit(failed ? 1 : 0);
   });
 
 program
@@ -598,7 +634,10 @@ program
     }
 
     const mcp = await setupMcp(!opts.mcp);
-    const executor = new Executor(llm, workspaceRoot, mcp, { autoWrite, autoRun });
+    const executor = createExecutor(llm, workspaceRoot, mcp, { autoWrite, autoRun });
+    if (/^(1|true|yes|on)$/i.test(process.env.AGENT_AUTO_DEBUG ?? "")) {
+      console.log(pc.yellow("\u{1F6E0}  Auto-debug ON (AGENT_AUTO_DEBUG=1): a failed command starts the Debug Agent right away; it needs auto-write and auto-run."));
+    }
 
     console.log(pc.bold("Type 'help' or '/help' for options, your task, or 'exit' to quit.\n"));
 
@@ -626,6 +665,7 @@ program
     let lockedAgentId: string | undefined = undefined;
     // Team mode (PM plans, engineers build, Safety Reviewer checks) and a reference picture read into a design brief.
     let teamOn = false;
+    let parallelOn = false;
     let brief: DesignBrief | undefined;
 
     // Routes and runs one task as one observable run. Used by the terminal and the dashboard.
@@ -657,15 +697,27 @@ program
             }
           }
 
+          // Plain real-time question (weather, news, prices ...): fetch the web results locally first, the agent only answers.
+          if (!forcedId && !useTeam && isGeneralRealtime(task)) {
+            const live = await prefetchRealtime(task);
+            if (live) planContext = live;
+          }
+
           const combinedContext = [planContext, briefText].filter(Boolean).join("\n\n") || undefined;
 
           if (useTeam) {
+            let parallel;
+            if (parallelOn) {
+              if (executor.isAutoWrite() && executor.isAutoRun()) parallel = makeParallelOptions({ llm, workspaceRoot, mcp });
+              else console.log(pc.yellow("⚠ Parallel team needs auto-write and auto-run ON (parallel agents cannot ask for approval). Running the team one task at a time."));
+            }
             const team = await runTeam({
               llm,
               executor,
               task,
               workspaceRoot,
               context: combinedContext,
+              parallel,
               // You approve the plan in the terminal; auto-write mode and dashboard runs start without asking.
               approvePlan: origin === "terminal" && !executor.isAutoWrite(),
               // Gemini leads (PM + UX) while the research stage is ON; the local model is the worker.
@@ -743,6 +795,7 @@ program
   ${pc.cyan("/plan [auto|always|off]")}      - Planner mode: auto = only when the research says a plan is needed (default), always, off
   ${pc.cyan("/team <task>")}                 - Run one task with the team: Project Manager plans, engineers build, Safety Reviewer checks
   ${pc.cyan("/team")}                        - Toggle team mode for every task
+  ${pc.cyan("/parallel")}                    - Toggle parallel team: independent engineer tasks run at the same time (needs auto-write + auto-run)
   ${pc.cyan("/image <path> [note]")}         - Show a picture of what you want; it is read into a design brief the agents build from
   ${pc.cyan("/image show")} | ${pc.cyan("/image clear")} - Print or drop the current design brief
   ${pc.cyan("Ctrl+C")}                       - Stops a running command (a second Ctrl+C when idle exits)
@@ -856,6 +909,17 @@ program
           } else {
             console.log(pc.dim(`\nPlanner mode: ${pipeline.plannerMode}. Change with: /plan auto | /plan always | /plan off\n`));
           }
+          askQuestion();
+          return;
+        }
+
+        if (normalizedInput === "/parallel") {
+          parallelOn = !parallelOn;
+          console.log(
+            parallelOn
+              ? pc.yellow("\n\u{1F3BC} Parallel team ON: in team mode, tasks that do not depend on each other run at the same time (needs auto-write and auto-run; model calls are limited by AGENT_LLM_CONCURRENCY, default 2).\n")
+              : pc.green("\n✔ Parallel team OFF: team tasks run one after another.\n"),
+          );
           askQuestion();
           return;
         }

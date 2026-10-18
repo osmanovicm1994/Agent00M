@@ -24,6 +24,7 @@ import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
+import type { ExecutorHooks } from "./executor-hooks";
 
 const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas];
 
@@ -293,6 +294,10 @@ export interface ExecutorOptions {
   // Run shell commands without asking (risky ones still ask). Independent of autoWrite so the chat
   // setup can ask about files and commands separately. Default: follows autoWrite (and AGENT_AUTO_RUN).
   autoRun?: boolean;
+  // Optional extension points (write guard, command interceptor, team updates). See executor-hooks.ts.
+  hooks?: ExecutorHooks;
+  // Step limit for this executor (default: AGENT_MAX_STEPS). The auto-debug run uses a small one.
+  maxSteps?: number;
 }
 
 export interface ExecutorResult {
@@ -341,6 +346,8 @@ interface SessionState {
   readOnly: boolean;
   // The user stopped a running command with Ctrl+C: the loop ends right away.
   interrupted: boolean;
+  // Id of the agent running in this session (used by the hooks).
+  agentId: string;
 }
 
 function newSessionState(): SessionState {
@@ -367,6 +374,7 @@ function newSessionState(): SessionState {
     planNudged: false,
     readOnly: false,
     interrupted: false,
+    agentId: "agent",
   };
 }
 
@@ -379,6 +387,8 @@ export class Executor {
   private autoWrite: boolean;
   private autoRun: boolean;
   private warnedNoGit = false;
+  private hooks: ExecutorHooks;
+  private maxSteps: number;
 
   constructor(
     private readonly llm: LLMProvider,
@@ -388,6 +398,8 @@ export class Executor {
   ) {
     this.autoWrite = options.autoWrite ?? process.env.AGENT_AUTO_WRITE === "1";
     this.autoRun = options.autoRun ?? (this.autoWrite && process.env.AGENT_AUTO_RUN !== "0");
+    this.hooks = options.hooks ?? {};
+    this.maxSteps = options.maxSteps ?? MAX_STEPS;
     this.workspaceRoot = path.resolve(workspaceRoot);
     this.fs = new FsTools(this.workspaceRoot);
     this.shell = new ShellTool(this.workspaceRoot);
@@ -607,6 +619,7 @@ When you are done and have no more actions to take, reply normally with a final 
     state.thinkingBudget = agent.thinkingBudget ?? MAX_THINKING_CALLS;
     state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
     state.readOnly = Boolean(agent.readOnly);
+    state.agentId = agent.id;
 
     const stackPaths = detectStackKnowledge(this.workspaceRoot, agent.id);
     if (stackPaths.length) {
@@ -660,9 +673,12 @@ When you are done and have no more actions to take, reply normally with a final 
     let steps = 0;
     let nudges = 0;
 
-    while (steps < MAX_STEPS) {
+    while (steps < this.maxSteps) {
       steps++;
       this.compactHistory(messages);
+      // Updates from the other agents (parallel runs only): what they wrote or published since the last step.
+      const teamUpdate = this.hooks.teamUpdates?.(state.agentId);
+      if (teamUpdate) messages.push({ role: "user", content: teamUpdate });
       // Models without a tool template get no tools payload (they use fenced blocks).
       bus.emit("llm_request", { step: steps });
       const response = await this.llm.chat(messages, this.llm.nativeTools === false ? undefined : this.toolSchemas);
@@ -1106,6 +1122,13 @@ When you are done and have no more actions to take, reply normally with a final 
           console.log(pc.green(`▶ Auto-running: ${command}`));
         } else if (!diagnostic) {
           if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
+          if (this.hooks.unattended) {
+            return (
+              "This command was NOT run: it needs approval and this agent runs alongside others with nobody to ask. " +
+              "Do not repeat it. Reach the same goal another way inside the project: no `cd ..`, no absolute paths outside the project, " +
+              "no rm, no global installs; use `npm --prefix <dir>` and `mkdir -p <dir>` from the project root."
+            );
+          }
           const approved = await confirm("Run this command?");
           if (!approved) {
             if (!process.stdin.isTTY) {
@@ -1152,11 +1175,19 @@ When you are done and have no more actions to take, reply normally with a final 
         const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
         if (repeatCount >= REPEAT_LIMIT) console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
 
+        // Reactive debugging: the agent is paused here until the interceptor (Debug Agent) is done.
+        let autoDebug: { note: string; verified: boolean } | null = null;
+        if (failed && this.hooks.commandInterceptor) {
+          autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, command, output: result.output, exitCode: result.exitCode });
+          if (autoDebug?.verified) state.lastRunFailed = false;
+        }
+
         return JSON.stringify({
           exitCode: result.exitCode,
           timedOut: result.timedOut,
           ...(failureSummary ? { failureSummary } : {}),
-          ...(repeatCount >= REPEAT_LIMIT ? { note: repeatNote(repeatCount) } : {}),
+          ...(repeatCount >= REPEAT_LIMIT && !autoDebug?.verified ? { note: repeatNote(repeatCount) } : {}),
+          ...(autoDebug ? { autoDebug: autoDebug.note } : {}),
           ...(result.interrupted
             ? {
                 interrupted: true,
@@ -1211,6 +1242,8 @@ When you are done and have no more actions to take, reply normally with a final 
     const p = this.np(args.path);
 
     if (!p || p === ".") return `TOOL ERROR: ${toolName} requires a file "path".`;
+    const guard = this.hooks.writeGuard?.(state.agentId, p);
+    if (guard && !guard.allowed) return `TOOL ERROR: ${guard.reason ?? "this path is not yours to write."}`;
     if (typeof args.content !== "string" || args.content.trim() === "") {
       return `TOOL ERROR: ${toolName} requires non-empty string "content".`;
     }
@@ -1324,6 +1357,7 @@ When you are done and have no more actions to take, reply normally with a final 
     state.verifyNudged = false;
     state.filesRead.add(p);
     if (!state.filesWritten.includes(p)) state.filesWritten.push(p);
+    this.hooks.onFileWritten?.(state.agentId, p);
     return `File written: ${p} (${newLines - 1} lines). The file now ends with:\n${this.tailOf(p)}\nIf this is only the first chunk of a longer file, continue with append_file starting right after these lines; otherwise move on.`;
   }
 

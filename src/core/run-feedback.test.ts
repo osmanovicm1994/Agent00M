@@ -33,6 +33,11 @@ describe("RepeatTracker", () => {
     expect(t.record("a")).toBe(REPEAT_LIMIT);
     expect(repeatNote(3)).toContain("3 times");
   });
+
+  it("asks for a structured report that names what is missing", () => {
+    const note = repeatNote(3);
+    for (const field of ["STUCK REPORT", "Command:", "First error:", "Tried:", "Missing:", "Next step for the user:"]) expect(note).toContain(field);
+  });
 });
 
 describe("summarizeFailures", () => {

@@ -25,6 +25,7 @@ import pc from "picocolors";
 import prompts from "prompts";
 import { GeminiTriageClient } from "../gateway/gemini";
 import { redactSecrets } from "../gateway/redact";
+import { runWebResearch } from "../tools/web-search.tool";
 import { PlannerAgent, type PlanOutcome } from "./planner-agent";
 import { renderResearchContext } from "./render";
 import { ResearchAgent, type PreviousTurn, type ResearchOutcome } from "./research-agent";
@@ -59,6 +60,37 @@ export async function confirmPlan(): Promise<boolean> {
   return answer.ok !== false;
 }
 
+const REALTIME_RE = /\b(weather|forecast|temperature|news|headlines?|exchange rate|stock price|share price|bitcoin|score|standings|who won|results? of|today'?s|tonight|tomorrow)\b/i;
+const CODE_RE = /\b(code|bug|error|exception|stack ?trace|function|class|component|api|endpoint|repo|repository|file|npm|package|install|build|compile|test|deploy|docker|database|sql|typescript|javascript|python|react|node|playwright|appium|git|refactor|implement|fix)\b|\.(ts|tsx|js|json|py|cs|md)\b/i;
+
+/** A plain real-time question (weather, news, prices, scores) that has nothing to do with the project: Gemini adds nothing here. */
+export function isGeneralRealtime(task: string): boolean {
+  return REALTIME_RE.test(task) && !CODE_RE.test(task);
+}
+
+/**
+ * For a plain real-time question the live web results are fetched HERE (local SearXNG, the user's own words as the query)
+ * and handed to the agent as context. A small local model otherwise wanders through the repository or searches for
+ * "how do I get the weather" instead of the weather. Returns null when the search fails (the agent then searches itself).
+ */
+export async function prefetchRealtime(task: string): Promise<string | null> {
+  console.log(pc.dim("🌐 Real-time question: searching the web locally first …"));
+  try {
+    const text = await runWebResearch({ question: task, maxPages: 3 });
+    if (!text || /^\s*(❌|error|web research failed)/i.test(text)) return null;
+    return [
+      "## LIVE WEB RESULTS",
+      "These were fetched just now from the web for the user's question. Answer from them. Do NOT call file tools (get_directory_tree, grep, read_file, find_files): the question has nothing to do with the project. Do not search again unless these results clearly miss the answer.",
+      "Give the numbers or facts the pages report, say which place and date/time they refer to, and cite the URLs. If the user named no place and the pages assume one, say which place you used and offer to check another. If the results do not contain the answer, say so plainly.",
+      "",
+      text.length > 5500 ? text.slice(0, 5500) + "\n[results shortened]" : text,
+    ].join("\n");
+  } catch (err: any) {
+    console.log(pc.yellow(`⚠ Local pre-search failed: ${String(err?.message ?? err).split("\n")[0]}. The agent will search itself.`));
+    return null;
+  }
+}
+
 export interface PipelineOutcome {
   /** Text to hand to Executor.run() as extra context: the research brief first, then the plan if one was made. */
   context: string;
@@ -88,6 +120,10 @@ export class ResearchPipeline {
    * (warnings were printed; the caller continues with the local agent only).
    */
   async run(task: string, workspaceRoot: string, toolNames: string[]): Promise<PipelineOutcome | null> {
+    if (isGeneralRealtime(task)) {
+      console.log(pc.dim("🔎 Research stage skipped: plain real-time question, the local agent searches with local SearXNG."));
+      return null;
+    }
     const research = await this.researcher.run(task, workspaceRoot, this.previous);
 
     const wantPlan = this.plannerMode === "always" || (this.plannerMode === "auto" && Boolean(research?.brief.needsPlan));

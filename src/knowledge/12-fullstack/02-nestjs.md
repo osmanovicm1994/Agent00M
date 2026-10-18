@@ -5,6 +5,11 @@ Check the installed `@nestjs/*` major and follow the project's structure. Generi
 ## Creating the app
 - `npx @nestjs/cli new <dir> --package-manager npm --skip-git` (run with `--help` to confirm flags). Generate pieces with `nest g module|controller|service|resource <name>`; check the result with `get_directory_tree`.
 
+## ESM or CommonJS: check BEFORE writing any import
+- Read the app's `package.json` (`"type"`) and `tsconfig.json` (`module`, `moduleResolution`). Newer Nest scaffolds use `"type": "module"` with `nodenext`: every RELATIVE import then needs the `.js` extension, even though the file is `.ts` (`import { UsersService } from './users.service.js'`, `from '../prisma/prisma.service.js'`). Without it TypeScript says `Cannot find module './users.service'` for a file that exists, and every new file you write breaks the build the same way.
+- Open one scaffolded file (`app.module.ts`, `main.ts`) and copy its import style for every file you create. In a CommonJS project (no `"type": "module"`, `module: commonjs`) imports have no extension.
+- Packages (`@nestjs/common`, `@prisma/client`) never get an extension; only relative paths do.
+
 ## Structure
 - One feature module per domain (`users`, `auth`, `files`): controller, service, DTOs, entities/repository, tests together. Modules export only what others need. Shared concerns (config, database, logging) in `common/` or core modules.
 - Controllers are thin: bind input, call a service, return a DTO. Business rules live in services; data access in a repository or the ORM service. No business logic in guards or controllers.

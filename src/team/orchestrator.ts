@@ -10,6 +10,11 @@
 // Each engineer gets a fresh, small context (the assignment, the
 // acceptance criteria and a short summary of earlier steps) rather than one ever-growing conversation,
 // which keeps a local model fast and focused.
+//
+// Parallel mode (`opts.parallel`): the PM also gives every task a write scope and the tasks it waits for. UX runs
+// first; the engineer tasks then run through the OrchestraMaster, independent ones at the same time, each confined to
+// its scope. A plan that cannot be run safely in parallel (no scope, overlapping scopes, a cycle) runs one after
+// another exactly as before.
 
 import * as fs from "fs";
 import pc from "picocolors";
@@ -17,9 +22,14 @@ import prompts from "prompts";
 import type { LLMProvider } from "../llm/types";
 import type { Executor, ExecutorResult } from "../core/executor";
 import { getAgent } from "../agents/definitions";
+import { OrchestraMaster, type TaskRunner } from "../orchestra/orchestra-master";
+import type { WorkspaceLocks } from "../orchestra/workspace-locks";
+import type { Blackboard } from "../orchestra/blackboard";
+import { planToOrchTasks } from "./parallel";
 import {
   ASSIGNABLE_ROLES,
   PM_KNOWLEDGE,
+  PM_PARALLEL_ADDENDUM,
   PM_SYSTEM,
   REPORT_SYSTEM,
   ROLE_TITLES,
@@ -50,6 +60,15 @@ export interface TeamResult {
   report: string;
 }
 
+export interface ParallelOptions {
+  /** Runs one task as an agent loop (see makeTaskRunner in orchestra/wire.ts). */
+  runner: TaskRunner;
+  locks: WorkspaceLocks;
+  /** How many tasks may run at once. Default 2. */
+  concurrency?: number;
+  board?: Blackboard;
+}
+
 export interface TeamOptions {
   llm: LLMProvider;
   executor: Executor;
@@ -61,6 +80,8 @@ export interface TeamOptions {
   approvePlan: boolean;
   /** Gemini hook for the lead roles. Returns null on failure (the local model then does the step). */
   think?: (system: string, user: string, maxTokens: number, json?: boolean) => Promise<string | null>;
+  /** Run independent engineer tasks at the same time. Needs auto-write and auto-run (nobody can answer prompts). */
+  parallel?: ParallelOptions;
 }
 
 const MAX_SUMMARY = 700;
@@ -117,10 +138,11 @@ async function planWithPm(opts: TeamOptions): Promise<PmPlan> {
   const user =
     `<request>\n${opts.task}\n</request>\n\n<project_files_top_level>\n${projectListing(opts.workspaceRoot)}\n</project_files_top_level>` +
     (opts.context ? `\n\n<extra_context>\n${clip(opts.context, 5000)}\n</extra_context>` : "");
+  const system = PM_SYSTEM + (opts.parallel ? PM_PARALLEL_ADDENDUM : "") + PM_KNOWLEDGE;
 
   let lastErr = "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await lead(opts, PM_SYSTEM + PM_KNOWLEDGE, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500, true);
+    const raw = await lead(opts, system, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500, true);
     try {
       const plan = parsePlan(raw);
       // Keep only roles that exist; unknown ones fall back to the general engineer.
@@ -136,10 +158,14 @@ async function planWithPm(opts: TeamOptions): Promise<PmPlan> {
   throw new Error(`could not get a usable plan from the Project Manager (${lastErr})`);
 }
 
-function printPlan(plan: PmPlan): void {
+function printPlan(plan: PmPlan, parallel: boolean): void {
   console.log(pc.bold(`\n📋 Project Manager: ${plan.goal}`));
   plan.tasks.forEach((t, i) => {
     console.log(`  ${i + 1}. ${pc.cyan(`[${ROLE_TITLES[t.role] ?? t.role}]`)} ${t.title}`);
+    if (parallel && t.role !== "ux") {
+      const after = t.dependsOn.length ? `after ${t.dependsOn.join(", ")}` : "no wait";
+      console.log(pc.dim(`       ⇢ writes: ${t.scope.join(", ") || "(no scope given)"} · ${after}`));
+    }
     t.acceptance.forEach((a) => console.log(pc.dim(`       ✓ ${a}`)));
   });
   if (plan.assumptions.length) console.log(pc.dim(`  Assumptions: ${plan.assumptions.join("; ")}`));
@@ -210,7 +236,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     return null;
   }
 
-  printPlan(plan);
+  printPlan(plan, Boolean(opts.parallel));
 
   if (plan.questions.length && opts.approvePlan) {
     console.log(pc.yellow("The planner has open questions. Answer them in your next message if they matter; the team can still start now.\n"));
@@ -227,11 +253,15 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
   const files = new Set<string>();
   const commands: string[] = [];
   const notes: string[] = [];
+  const blockedWrites: string[] = [];
+  const handled = new Set<number>();
   let uxSpec = "";
   let interrupted = false;
   let lastEngineer = "dev";
 
-  for (let i = 0; i < plan.tasks.length && !interrupted; i++) {
+  // One task, one after another. Also runs the UX tasks in parallel mode.
+  const runTask = async (i: number): Promise<void> => {
+    handled.add(i);
     const t = plan.tasks[i];
     const title = ROLE_TITLES[t.role] ?? t.role;
     console.log(pc.bold(`\n━━ [${i + 1}/${plan.tasks.length}] ${title}: ${t.title}`));
@@ -250,14 +280,14 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         console.log(pc.yellow(`⚠ UX spec failed: ${err?.message ?? err}`));
         outcomes.push({ role: t.role, title: t.title, status: "incomplete", summary: "UX spec could not be written" });
       }
-      continue;
+      return;
     }
 
     const agent = getAgent(t.role);
     if (!agent) {
       console.log(pc.yellow(`⚠ No agent for role '${t.role}', skipped.`));
       outcomes.push({ role: t.role, title: t.title, status: "skipped", summary: "no such agent" });
-      continue;
+      return;
     }
 
     if (t.role !== "qa") lastEngineer = t.role;
@@ -270,6 +300,55 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     outcomes.push({ role: t.role, title: t.title, status, summary });
     notes.push(`- ${title} (${status}): ${t.title}. Files: ${res.filesWritten.join(", ") || "none"}. ${clip(res.finalMessage, 300)}`);
     if (res.interrupted) interrupted = true;
+  };
+
+  // Parallel mode: UX first (its spec goes into every task), then the engineer tasks side by side.
+  if (opts.parallel) {
+    for (let i = 0; i < plan.tasks.length && !interrupted; i++) if (plan.tasks[i].role === "ux") await runTask(i);
+
+    const graph = planToOrchTasks(plan, uxSpec);
+    if (interrupted) {
+      // nothing more to do
+    } else if (graph.problems.length > 0) {
+      console.log(pc.yellow(`\n⚠ This plan cannot run in parallel, so the tasks run one after another:`));
+      graph.problems.forEach((p) => console.log(pc.yellow(`   - ${p}`)));
+    } else {
+      const concurrency = Math.max(1, opts.parallel.concurrency ?? 2);
+      console.log(pc.bold(`\n🎼 Orchestra: ${graph.tasks.length} tasks, up to ${concurrency} at the same time`));
+      const master = new OrchestraMaster({
+        runner: opts.parallel.runner,
+        locks: opts.parallel.locks,
+        board: opts.parallel.board,
+        concurrency,
+        log: (line) => console.log(pc.dim(line)),
+      });
+      const res = await master.run(graph.tasks);
+      for (const id of res.order) {
+        const idx = graph.indexOf.get(id);
+        if (idx === undefined) continue;
+        handled.add(idx);
+        const t = plan.tasks[idx];
+        const o = res.outcomes[id];
+        const status: TaskStatus = o.status === "done" ? "done" : o.status === "interrupted" ? "interrupted" : o.status === "skipped" ? "skipped" : "incomplete";
+        o.filesWritten.forEach((f) => files.add(f));
+        commands.push(...o.commandsRun);
+        outcomes.push({ role: t.role, title: t.title, status, summary: clip(o.summary, MAX_SUMMARY) });
+        notes.push(`- ${ROLE_TITLES[t.role] ?? t.role} (${status}): ${t.title}. Files: ${o.filesWritten.join(", ") || "none"}.`);
+        if (t.role !== "qa") lastEngineer = t.role;
+        if (o.status === "interrupted") interrupted = true;
+      }
+      const denied = [...new Set(res.denials.map((d) => `${d.owner}: ${d.path}`))];
+      if (denied.length) {
+        blockedWrites.push(...denied);
+        console.log(pc.yellow(`\n⚠ ${denied.length} write(s) were refused because they were outside the task's scope:`));
+        denied.slice(0, 10).forEach((d) => console.log(pc.yellow(`   - ${d}`)));
+      }
+    }
+  }
+
+  for (let i = 0; i < plan.tasks.length && !interrupted; i++) {
+    if (handled.has(i)) continue;
+    await runTask(i);
   }
 
   // Safety review of whatever was written.
@@ -328,6 +407,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         safetyNotes: clip(safetyNotes, 1500),
         stoppedByUser: interrupted,
         plannerRisks: plan.risks,
+        ...(blockedWrites.length ? { writesRefusedOutsideScope: blockedWrites.slice(0, 10) } : {}),
       },
       null,
       2,

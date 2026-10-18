@@ -8,17 +8,17 @@
 //   web_research  question -> runs several searches, reads the best pages in parallel and returns the relevant
 //                          passages with sources and dates: one call instead of a long search/fetch loop
 //
-// Default: WEB_SEARCH_ENGINES=gemini = Google Search through Gemini grounding (no scraping, no CAPTCHA, needs GEMINI_API_KEY).
+// SEARCH IS LOCAL ONLY: every query goes to your own SearXNG instance (SEARXNG_URL, default http://localhost:8080). No cloud search
+// API (Gemini, Brave, Tavily ...) is called. The other engine functions below are legacy code that nothing routes to any more.
 //
 // Engines, in order (the first that returns enough results wins, the rest are only used to fill up):
 //   google    Google Search website via Playwright/Chromium; requires explicit permission opt-in. It hits Google's
-//             challenge page quickly and is NOT part of the default; prefer "gemini" for Google results
+//             challenge page quickly (legacy, not routed to)
 //   searxng   only if SEARXNG_URL is set (e.g. a local instance, the most private option)
 //   brave     Brave Search API, only if BRAVE_API_KEY is set (free tier)
 //   tavily    Tavily API, only if TAVILY_API_KEY is set (free tier)
 //   ddg       DuckDuckGo HTML
 //   mojeek    Mojeek
-//   gemini    Google Search through Gemini grounding, only if GEMINI_API_KEY is set (free tier)
 //   bing      Bing HTML
 //   ddg-lite  DuckDuckGo Lite
 // Scraped engines are paced and put on cooldown after access challenges. Do not bypass CAPTCHA, consent, or rate limits.
@@ -33,7 +33,7 @@
 // Env (all optional):
 //   SEARXNG_URL            base URL of a SearXNG instance with the json format enabled
 //   BRAVE_API_KEY / TAVILY_API_KEY   optional keys for the most reliable search
-//   WEB_SEARCH_ENGINES     comma list, default "gemini" (Google via Gemini grounding); set other engines explicitly to use them
+//   WEB_SEARCH_ENGINES     ignored: search always uses SearXNG only
 //   GOOGLE_SEARCH_AUTOMATION_ALLOWED=true only when you are authorized to automate Google Search queries
 //   WEB_TIMEOUT_MS         per request timeout, default 12000
 //   WEB_MAX_PAGE_BYTES     download cap per page, default 2500000
@@ -48,7 +48,6 @@ import { chromium, type Browser, type Page } from "playwright";
 import pc from "picocolors";
 import type { ToolSchema } from "../llm/types";
 import { redactSecrets } from "../gateway/redact";
-import { GeminiTriageClient } from "../gateway/gemini";
 
 // ---------------------------------------------------------------------------
 // Tool schemas
@@ -57,8 +56,10 @@ import { GeminiTriageClient } from "../gateway/gemini";
 export const webSearchToolSchema: ToolSchema = {
   name: "web_search",
   description:
-    "Searches the live web and returns ranked results (title, URL, snippet). Use specific queries (library + version + exact error or API name). " +
-    "To read a result use web_fetch. For a question that needs several sources prefer web_research. " +
+    "Searches the live web (through the local SearXNG) and returns ranked results (title, URL, snippet). Use it for technical documentation, APIs and error messages " +
+    "AND for current real-world information: news, weather, prices, scores, facts about people, places and events. " +
+    "Technical queries: library + version + exact error or API name. General queries: the subject plus what you want to know (add 'today' or a recency window for anything that changes). " +
+    "Snippets can be outdated: for weather, prices, scores and news read the best result with web_fetch. For a question that needs several sources prefer web_research. " +
     "Search operators work: site:domain, filetype:pdf (finds PDF documents, which web_fetch can read), \"exact phrase\", -excluded.",
   parameters: {
     type: "object",
@@ -67,6 +68,11 @@ export const webSearchToolSchema: ToolSchema = {
       maxResults: { type: "number", description: "How many results to return (default 8, max 15)." },
       site: { type: "string", description: "Optional domain to restrict to, e.g. developer.apple.com or docs.nestjs.com." },
       recency: { type: "string", enum: ["day", "week", "month", "year"], description: "Optional: only recent results." },
+      category: {
+        type: "string",
+        enum: ["general", "it", "news", "science"],
+        description: "Optional, detected automatically: it = code, docs and errors; news = current events (recent results by default); science = papers and studies; general = everything else (weather, facts, people, places, prices).",
+      },
     },
     required: ["query"],
   },
@@ -95,7 +101,8 @@ export const webResearchToolSchema: ToolSchema = {
   name: "web_research",
   description:
     "Researches a question on the web in one call: runs up to 3 searches, reads the best pages in parallel and returns the relevant passages " +
-    "with source URLs and page dates. Use it for documentation, version or compatibility questions, error explanations and comparisons.",
+    "with source URLs and page dates. Use it for documentation, version or compatibility questions, error explanations and comparisons, and for current real-world questions " +
+    "(news, weather, prices, scores, facts) that need more than one source.",
   parameters: {
     type: "object",
     properties: {
@@ -108,6 +115,7 @@ export const webResearchToolSchema: ToolSchema = {
       maxPages: { type: "number", description: "How many pages to read (default 4, max 6)." },
       site: { type: "string", description: "Optional domain restriction, e.g. developer.android.com." },
       recency: { type: "string", enum: ["day", "week", "month", "year"], description: "Optional: only recent results." },
+      category: { type: "string", enum: ["general", "it", "news", "science"], description: "Optional, detected automatically (it = code/docs, news = current events, science = papers, general = the rest)." },
     },
     required: ["question"],
   },
@@ -128,6 +136,7 @@ const MAX_PDF_PAGES = Number(process.env.WEB_PDF_MAX_PAGES) || 80;
 const CACHE_TTL_MS = 10 * 60_000;
 
 type Recency = "day" | "week" | "month" | "year";
+type Category = "general" | "it" | "news" | "science";
 
 export interface WebResult {
   title: string;
@@ -167,6 +176,11 @@ const num = (v: unknown, fallback: number, min: number, max: number): number => 
 function asRecency(v: unknown): Recency | undefined {
   const s = String(v ?? "").toLowerCase();
   return s === "day" || s === "week" || s === "month" || s === "year" ? s : undefined;
+}
+
+function asCategory(v: unknown): Category | undefined {
+  const s = String(v ?? "").toLowerCase();
+  return s === "general" || s === "it" || s === "news" || s === "science" ? s : undefined;
 }
 
 function cleanDomain(host: string): string {
@@ -367,32 +381,87 @@ function listEnv(name: string, fallback: string): string[] {
   return (process.env[name] ?? fallback).split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-/**
- * SearXNG is a meta search engine; by default it asks the engines enabled in its own settings (that is what works out of the box), and
- * results that several engines agree on get a ranking bonus. Optional overrides: SEARXNG_ENGINES (force a list of engines) and
- * SEARXNG_LANGUAGE. Which engines answered is listed in the notes (npm run search:test).
- */
-async function searchSearxng(query: string, recency?: Recency): Promise<RawResult[]> {
-  const base = (process.env.SEARXNG_URL ?? "").trim().replace(/\/+$/, "");
-  if (!base) throw new Error("SEARXNG_URL is not set");
+// Which SearXNG categories (and time window) a question needs. `general` engines answer most things; `it` adds GitHub, Stack Overflow, MDN and
+// package indexes; `news` goes to the news engines (recent by default); `science` adds the paper engines. Weather, prices and facts stay `general`.
+const NEWS_RE =
+  /\b(news|headlines?|breaking|press release|announce[ds]?|announcement|election results?|match results?|live scores?|final scores?|standings|latest (on|about|from)|just (released|announced|happened))\b/i;
+const SCIENCE_RE = /\b(arxiv|pubmed|preprint|peer[- ]reviewed|clinical trials?|journal article|scientific (paper|study)|research papers?)\b/i;
+
+export function chooseSearch(query: string, explicit?: Category, recency?: Recency): { categories: string; recency?: Recency; label: Category } {
+  const label: Category = explicit ?? (TECH_RE.test(query) ? "it" : NEWS_RE.test(query) ? "news" : SCIENCE_RE.test(query) ? "science" : "general");
+  let when = recency;
+  if (!when && label === "news") {
+    when = /\b(today|tonight|breaking|right now|this morning|just )/i.test(query) ? "day" : /\bthis week\b|\byesterday\b/i.test(query) ? "week" : "month";
+  }
+  const categories = label === "it" ? "general,it" : label === "science" ? "general,science" : label;
+  return { categories, recency: when, label };
+}
+
+const SEARXNG_TIMEOUT_MS = Number(process.env.SEARXNG_TIMEOUT_MS) || 15_000;
+
+interface SearxngReply {
+  results: Array<{ title?: string; url?: string; content?: string; engines?: string[] }>;
+  unresponsive: Array<[string, string]>;
+}
+
+/** One request to SearXNG. Throws a short, actionable Error when it is down, slow, blocked or does not answer with JSON. */
+async function searxngRequest(query: string, categories: string, recency?: Recency): Promise<SearxngReply> {
+  const base = (process.env.SEARXNG_URL ?? "").trim().replace(/\/+$/, "") || "http://localhost:8080";
   const forced = listEnv("SEARXNG_ENGINES", "");
   const params = new URLSearchParams({ q: query, format: "json", safesearch: "0" });
   if (forced.length) params.set("engines", forced.join(","));
-  else if (TECH_RE.test(query)) params.set("categories", "general,it");
+  else if (categories !== "general") params.set("categories", categories);
   const language = process.env.SEARXNG_LANGUAGE?.trim();
   if (language) params.set("language", language);
   if (recency) params.set("time_range", recency);
-  const { status, text } = await httpText(`${base}/search?${params.toString()}`, { headers: { Accept: "application/json" } });
-  if (status >= 400) throw new Error(`SearXNG answered HTTP ${status} (json format not enabled in settings.yml, or the bot limiter blocks API calls: set server.limiter: false)`);
-  const data = JSON.parse(text) as {
-    results?: Array<{ title?: string; url?: string; content?: string; engines?: string[] }>;
-    unresponsive_engines?: Array<[string, string]>;
-  };
-  for (const [name, why] of data.unresponsive_engines ?? []) engineNotes.push(`searxng/${name}: ${why}`);
+
+  let status: number;
+  let text: string;
+  try {
+    ({ status, text } = await httpText(`${base}/search?${params.toString()}`, { headers: { Accept: "application/json" } }, SEARXNG_TIMEOUT_MS));
+  } catch (err: any) {
+    const msg = String(err?.cause?.code ?? err?.message ?? err);
+    throw new Error(
+      /timeout/i.test(msg)
+        ? `SearXNG did not answer within ${Math.round(SEARXNG_TIMEOUT_MS / 1000)}s (a slow upstream engine; SEARXNG_TIMEOUT_MS raises the limit)`
+        : `SearXNG is not reachable at ${base} (${msg}). Start it with: cd ../searxng && docker compose up -d`,
+    );
+  }
+  if (status === 429) throw new Error("SearXNG answered HTTP 429 (its bot limiter): set server.limiter: false in settings.yml");
+  if (status >= 400) throw new Error(`SearXNG answered HTTP ${status} (json format not enabled in settings.yml?)`);
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("SearXNG did not return JSON (is `json` listed under search.formats in settings.yml?)");
+  }
+  if (!data || !Array.isArray(data.results)) throw new Error("SearXNG answered without a results list");
+  return { results: data.results, unresponsive: Array.isArray(data.unresponsive_engines) ? data.unresponsive_engines : [] };
+}
+
+/**
+ * SearXNG is a meta search engine; by default it asks the engines enabled in its own settings (that is what works out of the box), and
+ * results that several engines agree on get a ranking bonus. A narrow category (news, science, it) that comes back empty is retried with
+ * the general engines. Optional overrides: SEARXNG_ENGINES (force a list of engines), SEARXNG_LANGUAGE, SEARXNG_TIMEOUT_MS.
+ * Which engines answered is listed in the notes (npm run search:test).
+ */
+async function searchSearxng(query: string, recency?: Recency, category?: Category): Promise<RawResult[]> {
+  const plan = chooseSearch(query, category, recency);
+  let reply = await searxngRequest(query, plan.categories, plan.recency);
+  let used = plan.categories;
+  let window = plan.recency;
+  if (!reply.results.length && plan.categories !== "general") {
+    engineNotes.push(`searxng: category "${plan.categories}" returned nothing, asked the general engines instead`);
+    await sleep(400);
+    reply = await searxngRequest(query, "general", recency);
+    used = "general";
+    window = recency;
+  }
+  for (const [name, why] of reply.unresponsive) engineNotes.push(`searxng/${name}: ${why}`);
   const perEngine = new Map<string, number>();
-  for (const r of data.results ?? []) for (const e of r.engines ?? []) perEngine.set(e, (perEngine.get(e) ?? 0) + 1);
-  engineNotes.push(`searxng asked ${forced.length ? forced.join(", ") : "its default engines"}; results per engine: ${[...perEngine].map(([e, n]) => `${e} ${n}`).join(", ") || "none"}`);
-  return (data.results ?? [])
+  for (const r of reply.results) for (const e of r.engines ?? []) perEngine.set(e, (perEngine.get(e) ?? 0) + 1);
+  engineNotes.push(`searxng [${used}${window ? `, ${window}` : ""}] results per engine: ${[...perEngine].map(([e, n]) => `${e} ${n}`).join(", ") || "none"}`);
+  return reply.results
     .filter((r) => r.url && r.title)
     .map((r) => ({
       title: clean(r.title ?? ""),
@@ -400,6 +469,71 @@ async function searchSearxng(query: string, recency?: Recency): Promise<RawResul
       snippet: clean(r.content ?? ""),
       weight: Math.max(0, (r.engines?.length ?? 1) - 1) * 4,
     }));
+}
+
+export interface SearxngCheck {
+  label: string;
+  query: string;
+  /** Categories (and time window) the tool chose for this query. */
+  plan: string;
+  ok: boolean;
+  ms: number;
+  results: number;
+  engines: string[];
+  unresponsive: string[];
+  first?: string;
+  fallback?: boolean;
+  problem?: string;
+}
+
+const VERIFY_CASES: Array<{ label: string; query: string }> = [
+  { label: "code / docs", query: "playwright page.setViewportSize mobile emulation" },
+  { label: "error text", query: "TypeError: Cannot read properties of undefined (reading 'map') react" },
+  { label: "general fact", query: "capital of Bosnia and Herzegovina population" },
+  { label: "news", query: "latest technology news today" },
+  { label: "weather", query: "weather Sarajevo today" },
+];
+
+/**
+ * Asks the local SearXNG one question of each kind, the same way the tool does (same categories, same fallback), and checks that
+ * it answers with clean JSON: HTTP ok, a results list, at least 3 results, every result with a title and an http(s) URL.
+ * Used by `npm run search:verify`. Requests are spaced out so the check itself does not trigger upstream rate limits.
+ */
+export async function verifySearxng(): Promise<SearxngCheck[]> {
+  const checks: SearxngCheck[] = [];
+  for (const c of VERIFY_CASES) {
+    const plan = chooseSearch(c.query);
+    const planText = `${plan.categories}${plan.recency ? `, ${plan.recency}` : ""}`;
+    const started = Date.now();
+    try {
+      let reply = await searxngRequest(c.query, plan.categories, plan.recency);
+      let fallback = false;
+      if (!reply.results.length && plan.categories !== "general") {
+        await sleep(400);
+        reply = await searxngRequest(c.query, "general", undefined);
+        fallback = true;
+      }
+      const malformed = reply.results.filter((r) => !r.title || !r.url || !/^https?:\/\//i.test(r.url)).length;
+      const problem = reply.results.length < 3 ? `only ${reply.results.length} result(s)` : malformed ? `${malformed} result(s) without title or http(s) URL` : undefined;
+      checks.push({
+        label: c.label,
+        query: c.query,
+        plan: planText,
+        ok: !problem,
+        ms: Date.now() - started,
+        results: reply.results.length,
+        engines: [...new Set(reply.results.flatMap((r) => r.engines ?? []))],
+        unresponsive: reply.unresponsive.map(([n, why]) => `${n}: ${why}`),
+        first: reply.results[0]?.title ? clip(clean(reply.results[0].title ?? ""), 80) : undefined,
+        fallback: fallback || undefined,
+        problem,
+      });
+    } catch (err: any) {
+      checks.push({ label: c.label, query: c.query, plan: planText, ok: false, ms: Date.now() - started, results: 0, engines: [], unresponsive: [], problem: String(err?.message ?? err) });
+    }
+    await sleep(700);
+  }
+  return checks;
 }
 
 async function searchDuckDuckGo(query: string, recency?: Recency): Promise<RawResult[]> {
@@ -528,39 +662,12 @@ async function searchMojeek(query: string): Promise<RawResult[]> {
   return out;
 }
 
-let geminiClient: GeminiTriageClient | undefined;
-
-/** Google Search via Gemini grounding. The sources come back as Google redirect links; resolve them to the real pages. */
-async function searchGemini(query: string): Promise<RawResult[]> {
-  if (!GeminiTriageClient.resolveApiKey()) throw new Error("GEMINI_API_KEY is not set");
-  geminiClient ??= new GeminiTriageClient();
-  const { sources } = await geminiClient.groundedSearch(query);
-  const resolved = await Promise.all(
-    sources.slice(0, 10).map(async (s) => ({ title: s.title, url: await resolveGroundingUrl(s.url), snippet: s.snippet })),
-  );
-  return resolved;
-}
-
-async function resolveGroundingUrl(url: string): Promise<string> {
-  if (!/vertexaisearch\.cloud\.google\.com\/grounding-api-redirect/i.test(url)) return url;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6_000);
-  try {
-    const res = await fetch(url, { redirect: "manual", signal: controller.signal, headers: { "User-Agent": UA } });
-    return res.headers.get("location") ?? url;
-  } catch {
-    return url;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function runEngine(engine: string, query: string, recency?: Recency): Promise<RawResult[]> {
+async function runEngine(engine: string, query: string, recency?: Recency, category?: Category): Promise<RawResult[]> {
   switch (engine) {
     case "google":
       return searchGoogleBrowser(query, recency);
     case "searxng":
-      return searchSearxng(query, recency);
+      return searchSearxng(query, recency, category);
     case "brave":
       return searchBraveApi(query, recency);
     case "tavily":
@@ -571,8 +678,6 @@ async function runEngine(engine: string, query: string, recency?: Recency): Prom
       return searchDuckDuckGoLite(query, recency);
     case "mojeek":
       return searchMojeek(query);
-    case "gemini":
-      return searchGemini(query);
     case "bing":
       return searchBing(query);
     default:
@@ -582,7 +687,7 @@ async function runEngine(engine: string, query: string, recency?: Recency): Prom
 
 // Scraped engines answer bots that are too fast with a block page, so each one gets a minimum gap between requests,
 // and a block puts it on a cooldown (see searchWeb).
-const MIN_GAP_MS: Record<string, number> = { google: 5000, ddg: 1500, "ddg-lite": 1500, mojeek: 1000, bing: 1000 };
+const MIN_GAP_MS: Record<string, number> = { searxng: 600, google: 5000, ddg: 1500, "ddg-lite": 1500, mojeek: 1000, bing: 1000 };
 const nextSlot = new Map<string, number>();
 const cooldownUntil = new Map<string, { until: number; reason: string }>();
 
@@ -639,20 +744,9 @@ function scoreResult(r: RawResult, domain: string, rank: number, qTerms: string[
   return s;
 }
 
+/** Local-first: the only search engine is your own SearXNG. Nothing is sent to a cloud search API. */
 function engineList(): string[] {
-  // Default order: your own SearXNG first, Gemini grounding last (its free Google Search quota is small).
-  const configured = (process.env.WEB_SEARCH_ENGINES ?? (process.env.SEARXNG_URL?.trim() ? "searxng,gemini" : "gemini"))
-    .split(",")
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean);
-  // Engines that need a key or URL are skipped when it is not configured.
-  const available: Record<string, boolean> = {
-    searxng: Boolean(process.env.SEARXNG_URL?.trim()),
-    brave: Boolean(process.env.BRAVE_API_KEY?.trim()),
-    tavily: Boolean(process.env.TAVILY_API_KEY?.trim()),
-    gemini: Boolean(GeminiTriageClient.resolveApiKey()),
-  };
-  return configured.filter((e) => available[e] ?? true);
+  return ["searxng"];
 }
 
 export interface SearchOutcome {
@@ -668,7 +762,7 @@ export interface SearchOutcome {
 export async function searchWeb(
   query: string,
   maxResults = 8,
-  opts: { site?: string; recency?: Recency } = {},
+  opts: { site?: string; recency?: Recency; category?: Category } = {},
 ): Promise<SearchOutcome> {
   const masked = redactSecrets(query.trim()).text.slice(0, 300);
   // A site: operator typed inside the query counts like the `site` argument (and is enforced on the results below).
@@ -679,7 +773,7 @@ export async function searchWeb(
   engineNotes.length = 0;
   const limit = num(maxResults, 8, 1, 15);
 
-  const cacheKey = `search|${finalQuery}|${opts.recency ?? ""}|${limit}`;
+  const cacheKey = `search|${finalQuery}|${opts.recency ?? ""}|${opts.category ?? ""}|${limit}`;
   const cached = cacheGet<SearchOutcome>(cacheKey);
   if (cached) return cached;
 
@@ -699,7 +793,7 @@ export async function searchWeb(
     for (let attempt = 0; attempt < 2 && raw === undefined; attempt++) {
       try {
         await throttle(engine);
-        raw = await runEngine(engine, finalQuery, opts.recency);
+        raw = await runEngine(engine, finalQuery, opts.recency, opts.category);
       } catch (err: any) {
         const msg = String(err?.message ?? err);
         if (/rate limit|access challenge|consent choice|Google browser search is disabled|authorized to automate|HTTP (202|403|429)|captcha|challenge|quota|RESOURCE_EXHAUSTED/i.test(msg)) {
@@ -728,7 +822,7 @@ export async function searchWeb(
   if (!collected.length) {
     throw new Error(
       `no search engine returned results${notes.length ? ` (${notes.join("; ")})` : ""}. ` +
-        "Check WEB_SEARCH_ENGINES and the configured engine requirements. For Google results use WEB_SEARCH_ENGINES=gemini with GEMINI_API_KEY set (no scraping). The browser engine \"google\" requires GOOGLE_SEARCH_AUTOMATION_ALLOWED=true, must only be enabled where you have permission, and stops at access challenges (they are not bypassed).",
+        "Search runs only through the local SearXNG (SEARXNG_URL, default http://localhost:8080). Check that it is running (cd ../searxng && docker compose up -d) and that its json format is enabled.",
     );
   }
 
@@ -1266,7 +1360,7 @@ function formatResults(query: string, outcome: SearchOutcome): string {
   outcome.results.forEach((r, i) => {
     lines.push(`\n[${i + 1}] ${r.title}\n    ${r.url}${r.snippet ? `\n    ${clip(r.snippet, 300)}` : ""}`);
   });
-  lines.push("\nNext: read a promising result with web_fetch (add 'query' to get just the relevant passages), or use web_research for a multi-source answer.");
+  lines.push("\nNext: read a promising result with web_fetch (add 'query' to get just the relevant passages), or use web_research for a multi-source answer. Snippets can be outdated: for weather, prices, scores and news open the page before you quote a number.");
   return lines.join("\n");
 }
 
@@ -1276,7 +1370,7 @@ export async function runWebSearch(args: Record<string, any>): Promise<string> {
   console.error(pc.cyan(`\n🌐 Searching the web: "${clip(query, 120)}"${args.site ? ` (site: ${args.site})` : ""}`));
   try {
     const started = Date.now();
-    const outcome = await searchWeb(query, num(args.maxResults, 8, 1, 15), { site: args.site, recency: asRecency(args.recency) });
+    const outcome = await searchWeb(query, num(args.maxResults, 8, 1, 15), { site: args.site, recency: asRecency(args.recency), category: asCategory(args.category) });
     console.error(pc.green(`✅ ${outcome.results.length} results via ${outcome.engines.join(" + ")} in ${Date.now() - started}ms`));
     if (!outcome.results.length) return `No web results for "${query}". Try different keywords, fewer words, or remove the site/recency filter.`;
     return formatResults(query, outcome);
@@ -1342,6 +1436,7 @@ export async function runWebResearch(args: Record<string, any>): Promise<string>
   const maxPages = num(args.maxPages, 4, 1, 6);
   const site = args.site ? String(args.site) : undefined;
   const recency = asRecency(args.recency);
+  const category = asCategory(args.category);
   const TOTAL_CHARS = 14_000;
 
   console.error(pc.cyan(`\n🌐 Researching: "${clip(question, 140)}"`));
@@ -1353,7 +1448,7 @@ export async function runWebResearch(args: Record<string, any>): Promise<string>
     const outcomes: Array<SearchOutcome | { error: string }> = [];
     for (const q of queries) {
       try {
-        outcomes.push(await searchWeb(q, 8, { site, recency }));
+        outcomes.push(await searchWeb(q, 8, { site, recency, category }));
       } catch (err: any) {
         outcomes.push({ error: String(err?.message ?? err) });
       }
