@@ -55,7 +55,15 @@ export function repeatNote(count: number): string {
   return (
     `The same failure has now happened ${count} times. Stop trying small variations of the same fix. ` +
     "Write down what the error says, what you already tried and your best theory, then either try ONE clearly different " +
-    "approach (a different cause, not a different spelling) or give your final answer explaining where you are stuck."
+    "approach (a different cause, not a different spelling) or give your final answer explaining where you are stuck. " +
+    "If the output lists several different errors, check whether they share one cause before fixing one line. " +
+    "If you give up, use exactly this format so the user can unblock you:\n" +
+    "STUCK REPORT\n" +
+    "Command: <the failing command>\n" +
+    "First error: <the first error line, copied exactly>\n" +
+    "Tried: <each different thing you tried, one line each>\n" +
+    "Missing: <the specific information you lack, for example a file's content, a version, a decision, a permission>\n" +
+    "Next step for the user: <one concrete action>"
   );
 }
 

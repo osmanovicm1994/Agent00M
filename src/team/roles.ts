@@ -43,6 +43,9 @@ const taskSchema = z.object({
   title: z.string().min(1),
   instructions: z.string().nullish().transform((v) => v ?? ""),
   acceptance: z.array(z.string()).nullish().transform((v) => v ?? []),
+  // Only filled in parallel mode (see PM_PARALLEL_ADDENDUM): folders this task may write, and the numbers of tasks it waits for.
+  scope: z.array(z.string()).nullish().transform((v) => v ?? []),
+  dependsOn: z.array(z.union([z.number(), z.string()])).nullish().transform((v) => v ?? []),
 });
 
 export const pmPlanSchema = z.object({
@@ -85,6 +88,14 @@ Reply with ONE JSON object and nothing else, in this shape:
     { "role": "dev", "title": "short title", "instructions": "what to do, where, how", "acceptance": ["checkable criterion"] }
   ]
 }`;
+
+// Added to PM_SYSTEM only when the team runs engineers in parallel (--parallel).
+export const PM_PARALLEL_ADDENDUM = `
+
+PARALLEL MODE: engineers may work at the same time, so every task that is not "ux" also needs:
+- "scope": the folders or files that task may WRITE, relative to the project root, ending in "/" for a folder (for example ["apps/api/"], ["prisma/", "apps/api/src/prisma/"]). Two tasks that can run at the same time must NOT share a folder. Never put the project root, "apps/" or a root package.json in a scope.
+- "dependsOn": the numbers of the tasks (1-based, as in your list) that must finish first, for example [1]. Use it whenever one task needs the result of another: the database schema before the API that uses it, the API before the web page that calls it, everything before qa. Tasks with no dependency between them and separate scopes run side by side.
+Add both fields to every task in the JSON, for example: { "role": "api", "title": "...", "instructions": "...", "acceptance": ["..."], "scope": ["apps/api/"], "dependsOn": [1] }.`;
 
 export const UX_SYSTEM = `You are a senior UX designer on a software team. You do not write code. You write the build spec that the engineers will follow, so that the interface is clear, consistent and accessible.
 

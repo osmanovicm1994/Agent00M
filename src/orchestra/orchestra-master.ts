@@ -23,6 +23,8 @@ export interface OrchTask {
   dependsOn: string[];
   /** Contract names this task must read before starting (published by its dependencies). */
   readsContracts?: string[];
+  /** Name of the contract this task publishes when it is done (its final message carries the text). */
+  publishes?: string;
 }
 
 export type TaskStatus = "done" | "incomplete" | "failed" | "interrupted" | "skipped";

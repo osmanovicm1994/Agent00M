@@ -51,8 +51,9 @@ export class Semaphore {
 /** Wraps `provider.chat` so calls go through the semaphore. Every other member is passed through unchanged. */
 export function gateProvider<T extends { chat: (...args: never[]) => Promise<unknown> }>(provider: T, sem: Semaphore): T {
   return new Proxy(provider, {
-    get(target, prop, receiver) {
-      const value = Reflect.get(target, prop, receiver);
+    get(target, prop) {
+      // No receiver: getters and #private fields of the provider must see the real object, not the proxy.
+      const value = Reflect.get(target, prop);
       if (prop === "chat" && typeof value === "function") {
         return (...args: unknown[]) => sem.run(() => (value as (...a: unknown[]) => Promise<unknown>).apply(target, args));
       }

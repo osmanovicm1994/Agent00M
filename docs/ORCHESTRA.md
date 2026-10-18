@@ -1,6 +1,6 @@
 # Orchestra: parallel agents and automatic debugging
 
-Status: modules and unit tests written; **not yet run** (run `npm run typecheck && npm test`). The executor hooks and the team-mode wiring are described in "Wiring" below and are not applied yet unless the checklist says so.
+Status: modules, executor hooks, CLI flags and team-mode wiring are written, with unit tests. **Nothing has been run yet** (run `npm run typecheck && npm test`). Both features are opt-in: without `AGENT_AUTO_DEBUG=1` / `--auto-debug` and `--parallel` / `/parallel` the agent behaves as before.
 
 ## The two problems
 
@@ -63,12 +63,38 @@ Safety: the nested run uses the same approval rules (`escapesWorkspace`, `isDang
 - At runtime `WorkspaceLocks` enforces it: a write outside the scope, in another agent's scope, or on a shared file (root `package.json`, lockfiles) is refused with a message telling the agent to put the request in its summary.
 - Agents learn about each other through the blackboard digest (short lines, only new events) and through contracts (full text, versioned), not by reading each other's prompts.
 
-## Wiring (what is still to apply)
+## Wiring (done)
 
-1. `executor.ts`: add optional hooks to the executor options: `writeGuard?(agentId, path) => {allowed, reason?}`, `commandInterceptor?(ctx) => Promise<string|null>` (append the returned text to the `run_command` result), `teamUpdates?(agentId) => string` (inject as a system note before each step). All default to no-ops, so existing behaviour is unchanged.
-2. A small `src/orchestra/wire.ts` building the `TaskRunner` (Executor + gated provider + hooks) and the `debug` function (`executor.run(debugAgent, ...)` with `filesWritten` as `filesChanged`).
-3. `team/roles.ts`: extend the PM schema with optional `scope: string[]` and `dependsOn: string[]` per task; `team/orchestrator.ts`: use `OrchestraMaster` when `--parallel` is given and the plan validates, else run sequentially as today.
-4. Bench: `--auto-debug` flag that sets `AGENT_AUTO_DEBUG=1`, so the two benchmark runs can be compared with `--compare`.
+| Piece | Where |
+| --- | --- |
+| Optional hooks `writeGuard`, `onFileWritten`, `commandInterceptor`, `teamUpdates`, `unattended`, plus `maxSteps` | `src/core/executor-hooks.ts`, used in `src/core/executor.ts` (all default to nothing) |
+| `createExecutor()` (adds the debug interceptor when `AGENT_AUTO_DEBUG=1`), `makeTaskRunner()`, `makeParallelOptions()` | `src/orchestra/wire.ts` |
+| PM plan fields `scope` and `dependsOn`, `PM_PARALLEL_ADDENDUM` | `src/team/roles.ts` |
+| Plan to task graph, with the default order (db before api, all before qa) and every reason a plan cannot run in parallel | `src/team/parallel.ts` |
+| Parallel branch of team mode, falling back to one-after-another | `src/team/orchestrator.ts` |
+| `--auto-debug`, `--parallel` (with `--team`, needs `-y`), chat `/parallel` | `src/cli.ts` |
+
+### How to use it
+
+```
+# reactive debugging only (works with a single agent)
+npm run chat            # put AGENT_AUTO_DEBUG=1 in .env.local, or:
+npx ts-node src/cli.ts run "<task>" -p <project> -y --auto-debug
+
+# parallel team
+npx ts-node src/cli.ts run "<task>" -p <project> -y --team --parallel
+# in chat: /team then /parallel (auto-write and auto-run must be ON)
+```
+
+Auto-debug needs auto-write and auto-run, because a debug run that stops to ask for approval defeats the purpose. Parallel runs decline any command that would need approval (nobody can answer two prompts at once).
+
+### Known limits
+
+- The debug run is a nested, sequential `Executor.run` of the Debug Agent with at most `AGENT_AUTO_DEBUG_STEPS` (25) steps. It uses the same model and the same knowledge as everything else, so it fixes what the agent could fix with a clear error message in front of it, not gaps in what the model knows (see the Prisma 7 example in `04-prisma-drizzle.md`).
+- Parallel tasks are limited to `AGENT_TASK_MAX_STEPS` (60) steps each and are reported as incomplete when they hit it.
+- The root `package.json` and lockfiles are shared files: parallel tasks cannot edit them. Refused writes are listed after the run and in the delivery report.
+- The blackboard digest is injected as a user message before a model step. It is only used in parallel runs.
+- The PM must produce `scope` and `dependsOn` for every task; if it does not, the plan runs one task at a time and the reasons are printed.
 
 ## Verify
 

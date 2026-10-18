@@ -58,6 +58,11 @@ export const DOMAIN_KEYWORDS: Record<string, RegExp[]> = {
     /\bis (it|this|that) (still )?(deprecated|supported|compatible)/i,
     /compatible with (the )?(latest|newest)/i,
     /which version (of|to use|should)/i,
+    // General real-time information (not only documentation): news, weather, prices, scores. Kept specific on purpose.
+    /\b(latest|breaking|today'?s|recent) news\b|\bnews (about|on)\b|\bheadlines?\b/i,
+    /\bweather (in|for|forecast|today|tomorrow)\b|\bforecast for\b|\bwhat'?s the weather\b|\bwhat is the weather\b/i,
+    /\b(exchange rate|stock price|share price|crypto price|price of (bitcoin|gold|oil))\b/i,
+    /\bwho (won|is the current)\b|\bfinal score\b|\blive score\b|\bleague standings\b/i,
   ],
   // Failing commands and errors. Several patterns so a real failure report outscores the single keyword
   // it often shares with another agent ("npm run dev:api failing" also matches api).

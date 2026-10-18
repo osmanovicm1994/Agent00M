@@ -71,6 +71,9 @@ export function interceptorConfigFromEnv(env: NodeJS.ProcessEnv = process.env): 
   };
 }
 
+/** Appears in the note only when the failed command was re-run and now succeeds. The executor hook uses it to set `verified`. */
+export const VERIFIED_MARKER = "FIXED and verified";
+
 const MAX_OUTPUT = 4000;
 
 function tail(text: string, max = MAX_OUTPUT): string {
@@ -154,7 +157,7 @@ export class DebugInterceptor {
     const again = await this.deps.rerun(e.command, e.cwd);
     if (again.exitCode === 0) {
       this.deps.log?.(`auto-debug: fixed (${failure.kind}); resuming ${e.agentId}`);
-      return `AUTO-DEBUG RESULT (${failure.kind}): FIXED and verified. \`${e.command}\` now succeeds. ${result.summary}${files}\nContinue with your task; do not redo this step.`;
+      return `AUTO-DEBUG RESULT (${failure.kind}): ${VERIFIED_MARKER}. \`${e.command}\` now succeeds. ${result.summary}${files}\nContinue with your task; do not redo this step.`;
     }
     return `AUTO-DEBUG RESULT (${failure.kind}): patched, but \`${e.command}\` still fails.${files}\nNew output:\n${tail(again.output, 1500)}\n${result.summary}`;
   }
