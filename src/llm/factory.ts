@@ -2,6 +2,7 @@
 import type { LLMProvider } from "./types";
 import { LMStudioProvider, type LMStudioConfig } from "./providers/lmstudio";
 import { CachedLLMProvider } from "./cached-provider";
+import { UsageReportingProvider } from "./usage-provider";
 
 export type ProviderId = "lmstudio" | "anthropic";
 
@@ -19,6 +20,6 @@ export function createProvider(id: ProviderId = "lmstudio", config?: LMStudioCon
       throw new Error(`Unknown LLM provider: ${id}`);
   }
 
-  // Wrap the base provider in the caching layer before returning
-  return new CachedLLMProvider(baseProvider);
+  // Usage reporting sits INSIDE the cache: a cache hit does no model work, so it must not count as usage.
+  return new CachedLLMProvider(new UsageReportingProvider(baseProvider));
 }

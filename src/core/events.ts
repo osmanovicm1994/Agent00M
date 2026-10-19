@@ -20,7 +20,7 @@ interface RunScope {
 }
 
 // Late-joining dashboards replay this buffer. Keep it small: events carry text previews.
-const HISTORY_LIMIT = Number(process.env.AGENT_UI_HISTORY) || 400;
+const HISTORY_LIMIT = Number(process.env.AGENT_UI_HISTORY) || 1500;
 
 export function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}… (+${text.length - max} chars)` : text;

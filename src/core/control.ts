@@ -6,6 +6,7 @@
 
 import { randomUUID } from "crypto";
 import { bus } from "./events";
+import type { PlannerMode, SettingKey, SettingsState } from "./event-types";
 
 export const MAX_TASK_CHARS = 8000;
 export const MAX_ANSWER_CHARS = 1000;
@@ -28,14 +29,33 @@ export interface QuestionAnswer {
 }
 
 type TaskHandler = (task: string, agentId?: string) => Promise<void>;
+// Stops the running shell command(s); returns how many were stopped (same as Ctrl+C in the terminal).
+type InterruptHandler = () => number;
 type BusyListener = (busy: boolean) => void;
+type TeamListener = (team: boolean) => void;
+type SettingsListener = (settings: SettingsState) => void;
 type SessionListener = (acceptsTasks: boolean) => void;
 
 class ControlHub {
   private busy = false;
   private handler: TaskHandler | undefined;
+  private workspace: string | undefined;
+  private interruptHandler: InterruptHandler | undefined;
   private pending: ((approved: boolean) => void) | undefined;
   private question: { id: string; kind: QuestionSpec["kind"]; answer: (value: string) => void } | undefined;
+  private settings: SettingsState = {
+    team: false,
+    parallel: false,
+    autoWrite: false,
+    autoRun: false,
+    autoDebug: /^(1|true|yes|on)$/i.test(process.env.AGENT_AUTO_DEBUG ?? ""),
+    research: false,
+    planner: "auto",
+    autoRunLocked: process.env.AGENT_AUTO_RUN === "0",
+    researchAvailable: false,
+  };
+  private readonly settingsListeners = new Set<SettingsListener>();
+  private readonly teamListeners = new Set<TeamListener>();
   private readonly busyListeners = new Set<BusyListener>();
   private readonly sessionListeners = new Set<SessionListener>();
 
@@ -74,6 +94,107 @@ class ControlHub {
         // a broken listener must not break the agent
       }
     }
+  }
+
+  // --- team mode (shared by the terminal's /team and the dashboard switch) ---
+
+  isTeam(): boolean {
+    return this.settings.team;
+  }
+
+  setTeam(on: boolean): void {
+    this.setSetting("team", on);
+  }
+
+  onTeamChange(listener: TeamListener): () => void {
+    this.teamListeners.add(listener);
+    return () => {
+      this.teamListeners.delete(listener);
+    };
+  }
+
+  // --- all switches (terminal commands and dashboard share this state) ---
+
+  getSettings(): SettingsState {
+    return { ...this.settings };
+  }
+
+  // What this session can do at all (set once by the CLI): the AGENT_AUTO_RUN=0 lock and the Gemini key.
+  setCapabilities(caps: { researchAvailable?: boolean; autoRunLocked?: boolean }): void {
+    const next = { ...this.settings, ...caps };
+    if (next.autoRunLocked) next.autoRun = false;
+    if (!next.researchAvailable) next.research = false;
+    this.commit(next);
+  }
+
+  // Validates and applies one switch. Returns ok:false (with the reason) when the switch is not allowed.
+  setSetting(key: SettingKey, value: unknown): SubmitResult {
+    const next = { ...this.settings };
+    if (key === "planner") {
+      if (value !== "auto" && value !== "always" && value !== "off") return { ok: false, reason: "Planner mode must be auto, always or off." };
+      next.planner = value as PlannerMode;
+    } else if (key === "team" || key === "parallel" || key === "autoWrite" || key === "autoRun" || key === "autoDebug" || key === "research") {
+      if (typeof value !== "boolean") return { ok: false, reason: `${key} must be on or off.` };
+      if (key === "autoRun" && value && next.autoRunLocked) return { ok: false, reason: "Auto-run is disabled by AGENT_AUTO_RUN=0 in the env file." };
+      if (key === "research" && value && !next.researchAvailable) return { ok: false, reason: "GEMINI_API_KEY is not set (put it in .env and restart)." };
+      next[key] = value;
+      // Same rule as the terminal's /auto-write: auto mode switches files and commands together.
+      if (key === "autoWrite") next.autoRun = value && !next.autoRunLocked;
+    } else {
+      return { ok: false, reason: `Unknown setting '${String(key)}'.` };
+    }
+    this.commit(next);
+    return { ok: true };
+  }
+
+  private commit(next: SettingsState): void {
+    const prev = this.settings;
+    if ((Object.keys(next) as (keyof SettingsState)[]).every((k) => prev[k] === next[k])) return;
+    this.settings = next;
+    const teamChanged = prev.team !== next.team;
+    for (const l of this.settingsListeners) {
+      try {
+        l({ ...next });
+      } catch {
+        // a broken listener must not break the agent
+      }
+    }
+    if (teamChanged) {
+      for (const l of this.teamListeners) {
+        try {
+          l(next.team);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  onSettingsChange(listener: SettingsListener): () => void {
+    this.settingsListeners.add(listener);
+    return () => {
+      this.settingsListeners.delete(listener);
+    };
+  }
+
+  // --- project folder and interrupt (read by the dashboard server) ---
+
+  // The CLI tells us which folder the agent works in, so the dashboard can show the project tree.
+  setWorkspace(root: string | undefined): void {
+    this.workspace = root;
+  }
+
+  getWorkspace(): string | undefined {
+    return this.workspace;
+  }
+
+  setInterruptHandler(handler: InterruptHandler | undefined): void {
+    this.interruptHandler = handler;
+  }
+
+  // Stops running shell commands. Returns how many were stopped (0 when nothing was running).
+  interrupt(): number {
+    return this.interruptHandler ? this.interruptHandler() : 0;
   }
 
   // --- tasks from the dashboard ---

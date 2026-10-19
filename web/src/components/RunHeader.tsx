@@ -14,7 +14,7 @@ function useNow(active: boolean): number {
 }
 
 const STATUS_STYLES: Record<RunStatus, string> = {
-  running: "bg-sky-500/15 text-sky-300",
+  running: "bg-teal-300/15 text-teal-300",
   done: "bg-emerald-500/15 text-emerald-300",
   failed: "bg-rose-500/15 text-rose-300",
 };
@@ -27,6 +27,7 @@ const STATUS_TEXT: Record<RunStatus, string> = {
 
 export function RunHeader({ state }: { state: DashboardState }) {
   const run = state.run;
+  const [expanded, setExpanded] = useState(false);
   const now = useNow(run?.status === "running");
 
   if (!run) {
@@ -47,9 +48,21 @@ export function RunHeader({ state }: { state: DashboardState }) {
   ].filter(Boolean);
 
   return (
-    <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-5">
+    <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
       <div className="flex items-start justify-between gap-4">
-        <p className="text-base leading-snug">{run.task}</p>
+        <div className="min-w-0 flex-1">
+          <p
+            className="whitespace-pre-wrap break-words text-sm leading-snug"
+            style={expanded ? undefined : { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}
+          >
+            {run.task}
+          </p>
+          {run.task.length > 140 && (
+            <button type="button" onClick={() => setExpanded(!expanded)} className="mt-1 text-xs text-teal-300 hover:underline">
+              {expanded ? "Show less" : "Show full task"}
+            </button>
+          )}
+        </div>
         <div className="flex shrink-0 items-center gap-3 text-xs">
           <span className="font-mono text-slate-400">{elapsed(run.startedAt, run.endedAt ?? now)}</span>
           <span className={`rounded-full px-2.5 py-1 ${STATUS_STYLES[run.status]}`}>{STATUS_TEXT[run.status]}</span>

@@ -14,8 +14,10 @@ import * as os from "os";
 import { AGENTS } from "./agents/definitions";
 import { bus } from "./core/events";
 import { control, MAX_ANSWER_CHARS } from "./core/control";
-import type { AgentInfo, ClientCommand, ServerMessage } from "./core/event-types";
+import { listWorkspace } from "./core/file-tree";
+import type { AgentInfo, ClientCommand, ServerMessage, SettingKey } from "./core/event-types";
 import { REMOTE_MODE, detectTailscale, resolveRemoteHost } from "./remote";
+import { startNotifier } from "./notify";
 
 export interface DashboardServer {
   port: number;
@@ -91,6 +93,12 @@ function parseCommand(raw: unknown): ClientCommand | undefined {
   if (value?.kind === "answer_question" && typeof value.id === "string" && typeof value.answer === "string") {
     return { kind: "answer_question", id: value.id, answer: value.answer.slice(0, MAX_ANSWER_CHARS) };
   }
+  if (value?.kind === "list_files") return { kind: "list_files" };
+  if (value?.kind === "stop_command") return { kind: "stop_command" };
+  if (value?.kind === "set_team" && typeof value.on === "boolean") return { kind: "set_team", on: value.on };
+  if (value?.kind === "set_setting" && typeof value.key === "string" && (typeof value.value === "boolean" || typeof value.value === "string")) {
+    return { kind: "set_setting", key: value.key as SettingKey, value: value.value };
+  }
   return undefined;
 }
 
@@ -143,6 +151,8 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
       acceptsTasks: control.acceptsTasks(),
       busy: control.isBusy(),
     });
+    send({ kind: "settings", ...control.getSettings() });
+    const unsubscribeTeam = control.onSettingsChange((settings) => send({ kind: "settings", ...settings }));
     const unsubscribeEvents = bus.subscribe((event) => send({ kind: "event", event }));
     const unsubscribeBusy = control.onBusyChange((busy) => send({ kind: "busy", busy }));
     const unsubscribeSession = control.onSessionChange((acceptsTasks) => send({ kind: "session", acceptsTasks }));
@@ -172,6 +182,30 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
         if (!control.answerQuestion(command.id, command.answer)) {
           send({ kind: "notice", level: "info", text: "That question was already answered." });
         }
+      } else if (command.kind === "list_files") {
+        const root = control.getWorkspace();
+        if (!root) {
+          send({ kind: "notice", level: "error", text: "No project folder yet: finish the chat startup questions first." });
+          return;
+        }
+        try {
+          send({ kind: "files", ...listWorkspace(root) });
+        } catch (err) {
+          send({ kind: "notice", level: "error", text: `Could not read the project folder: ${(err as Error).message}` });
+        }
+      } else if (command.kind === "set_team") {
+        control.setTeam(command.on);
+        console.log(pc.dim(`\n🏢 Team mode ${command.on ? "ON" : "OFF"} (switched in the dashboard).`));
+      } else if (command.kind === "set_setting") {
+        const result = control.setSetting(command.key, command.value);
+        if (!result.ok) {
+          send({ kind: "notice", level: "error", text: result.reason ?? "That switch was not accepted." });
+        } else {
+          console.log(pc.dim(`\n⚙  ${command.key} = ${String(command.value)} (switched in the dashboard).`));
+        }
+      } else if (command.kind === "stop_command") {
+        const n = control.interrupt();
+        send({ kind: "notice", level: "info", text: n > 0 ? `Stopped ${n} running command(s).` : "No command is running." });
       }
     });
 
@@ -180,6 +214,7 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
       if (closed) return;
       closed = true;
       unsubscribeEvents();
+      unsubscribeTeam();
       unsubscribeBusy();
       unsubscribeSession();
       if (canControl) {
@@ -230,5 +265,17 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
     console.log(pc.yellow("   Anyone on your tailnet with the token URL can run commands on this machine. Never use Tailscale Funnel for this."));
   }
 
-  return { port, token, url, close: () => app.close() };
+  // Optional phone push (AGENT_NOTIFY_URL): approvals and failures. Text only, never the command.
+  const stopNotifier = startNotifier();
+  if (stopNotifier) console.log(pc.dim("🔔 Phone notifications on (AGENT_NOTIFY_URL): approval requests and failed runs."));
+
+  return {
+    port,
+    token,
+    url,
+    close: () => {
+      stopNotifier?.();
+      return app.close();
+    },
+  };
 }

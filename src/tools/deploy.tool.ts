@@ -226,7 +226,7 @@ function subDirs(dir: string): string[] {
 }
 
 /** The root, its direct sub-folders, and the apps inside apps/, packages/ and services/; without dependency and build folders. */
-function appDirs(root: string): string[] {
+export function appDirs(root: string): string[] {
   const dirs = [root];
   for (const d of subDirs(root)) {
     dirs.push(d);

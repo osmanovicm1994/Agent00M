@@ -43,6 +43,11 @@ export interface LLMStats {
   tokPerSec: number;
   // true when the server sent no usage and the token count is a chars/3.5 estimate.
   estimated: boolean;
+  // Prompt tokens processed by the server (summed over continuation requests). Optional: a provider
+  // that cannot tell leaves it out.
+  promptTokens?: number;
+  // true when promptTokens is a chars/3.5 estimate because the server sent no usage.
+  promptEstimated?: boolean;
 }
 
 export interface LLMResponse {

@@ -41,6 +41,24 @@ The terminal prints a line like `🌍 Remote (Tailscale): https://my-mac.tail123
 
 The computer must stay awake and online. If it sleeps, the dashboard is unreachable (macOS: System Settings > Battery/Energy, or run `caffeinate -s` in a terminal).
 
+## iPhone home-screen app
+
+The dashboard is also a phone-friendly web app (bottom tabs: Agents, Live, Prompt, Project, History). Open the token URL in Safari, choose Share > Add to Home Screen, then open it once from the icon and press "Remember on this device" (iOS keeps home-screen storage separate from Safari tabs). The Tailscale app must be connected.
+
+There is also a native SwiftUI iPhone app in `ios/` (see `ios/README.md`).
+
+## What the dashboard shows
+
+- **Team mode switch** (Prompt panel): same as `/team` in the terminal. In team mode a pinned "Only me" agent is not used, because the Project Manager assigns the roles. Dashboard-started team runs start the plan without asking.
+- **Live screen:** the full terminal-style feed (stack, model, standards, command and reason, exit code, output, model timings, team plan and steps) with filters.
+
+- **Agents:** pick "Only me" on an agent and every prompt goes to it (sent as `agentId`; the choice is remembered on the device). "Back to auto" restores orchestrator routing.
+- **Live:** what the agent wants to do (newest tool call), why (newest reasoning text), recent steps, the live feed and a Stop button for a running command (same as Ctrl+C).
+- **Prompt:** send tasks with optional file context chips.
+- **Project:** folder tree of the workspace (secret `.env*` files, `node_modules`, `.git` are never listed).
+- **History:** last 40 runs, kept in the browser.
+- **Token usage:** model calls of the agent (`llm_usage` events). Numbers come from the model server when it reports them (LM Studio with `stream_options.include_usage`); otherwise they are character estimates marked `est.`. Set `AI_STREAM_USAGE=0` if a model server rejects that option. This is not a Claude subscription meter.
+
 ## Commands
 
 | Command | What it does |
@@ -60,13 +78,16 @@ The computer must stay awake and online. If it sleeps, the dashboard is unreacha
 | `AGENT_UI_REMOTE_HOST` | Tailnet host name. Auto-detected from `tailscale status --json` when unset. Set it if detection fails. |
 | `AGENT_UI_TOKEN` | Fixed control token. Use at least 24 characters; a warning is printed otherwise. |
 | `AGENT_UI_WEB_PORT` | Vite port used by `remote.sh` (default 5173). |
+| `AGENT_NOTIFY_URL` | Optional phone push (ntfy): the agent POSTs "needs approval" / "run failed" (agent name only, never the command) to this URL, e.g. `https://ntfy.sh/<long-random-topic>`. `AGENT_NOTIFY_DONE=0` skips the failure message. See `src/notify.ts`. |
+| `AGENT_UI_HISTORY` | Events replayed to a newly opened dashboard (default 1500). |
 
 ## Security notes
 
 - The agent can write files and run commands. Anyone on your tailnet who has the token URL can drive it. Keep the URL private and keep the tailnet to your own devices.
 - **Never use Tailscale Funnel** for this. Funnel publishes to the whole internet. `remote.sh` never uses it.
 - Optional hardening: in the Tailscale admin console, restrict access to this machine with an ACL so only your own devices can reach it.
-- Approvals from the dashboard show the message only; the file diff is printed in the terminal. Check the command or file in the live feed before approving from a phone.
+- Approvals from the dashboard show the message AND the real command or diff (`detail`, up to 6000 characters). Read it before you approve from a phone.
+- "Remember on this device" (header button) stores the control token in the browser's localStorage so the home-screen app stays signed in. Use it only on your own phone and press "Forget token" when you lose it. Rotate `AGENT_UI_TOKEN` if a token URL was ever pasted somewhere shared.
 - Vite stays on `127.0.0.1` and `allowedHosts` lists the tailnet host explicitly (never `true`, which would allow DNS rebinding).
 
 ## Troubleshooting

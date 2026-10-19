@@ -88,6 +88,8 @@ interface StreamResult {
   outChars: number;
   // completion_tokens as reported by the server, if it sent usage.
   usageTokens?: number;
+  // prompt_tokens as reported by the server, if it sent usage.
+  usagePromptTokens?: number;
 }
 
 // LM Studio exposes an OpenAI-compatible /v1 server, so we reuse the official
@@ -256,6 +258,9 @@ export class LMStudioProvider implements LLMProvider {
           // Models without a tool template sometimes keep writing and invent the tool's answer.
           stop: this.nativeTools ? undefined : [`\n${TOOL_RESULT_PREFIX}`],
           stream: true,
+          // Ask for a final usage chunk (prompt + completion tokens) so the dashboard can show real numbers.
+          // AI_STREAM_USAGE=0 turns it off for a server that rejects the option.
+          ...(process.env.AI_STREAM_USAGE === "0" ? {} : { stream_options: { include_usage: true } }),
         } as any,
         { timeout: this.timeoutMs },
       )) as unknown as AsyncIterable<any>;
@@ -268,6 +273,7 @@ export class LMStudioProvider implements LLMProvider {
     let firstTokenAt: number | null = null;
     let outChars = 0;
     let usageTokens: number | undefined;
+    let usagePromptTokens: number | undefined;
     const toolAcc = new Map<number, { id: string; name: string; args: string }>();
     let lastTick = 0;
 
@@ -279,6 +285,7 @@ export class LMStudioProvider implements LLMProvider {
     try {
       for await (const chunk of stream) {
         if (typeof chunk.usage?.completion_tokens === "number") usageTokens = chunk.usage.completion_tokens;
+        if (typeof chunk.usage?.prompt_tokens === "number") usagePromptTokens = chunk.usage.prompt_tokens;
 
         const choice = chunk.choices?.[0];
         if (!choice) continue;
@@ -333,7 +340,7 @@ export class LMStudioProvider implements LLMProvider {
           }))
       : undefined;
 
-    return { content, toolCalls, finishReason, firstTokenAt, outChars, usageTokens };
+    return { content, toolCalls, finishReason, firstTokenAt, outChars, usageTokens, usagePromptTokens };
   }
 
   private friendlyError(err: any): Error {
@@ -381,6 +388,8 @@ export class LMStudioProvider implements LLMProvider {
     let outChars = 0;
     let usageTotal = 0;
     let usageSeen = false;
+    let promptTotal = 0;
+    let promptSeen = false;
 
     let raw = "";
     let toolCalls: ToolCall[] | undefined;
@@ -404,6 +413,10 @@ export class LMStudioProvider implements LLMProvider {
       if (result.usageTokens !== undefined) {
         usageSeen = true;
         usageTotal += result.usageTokens;
+      }
+      if (result.usagePromptTokens !== undefined) {
+        promptSeen = true;
+        promptTotal += result.usagePromptTokens;
       }
 
       raw = attempt === 0 ? result.content : stitch(raw, result.content);
@@ -435,6 +448,8 @@ export class LMStudioProvider implements LLMProvider {
       outTokens,
       tokPerSec: outTokens >= 8 ? outTokens / (genMs / 1000) : 0,
       estimated: !usageSeen,
+      promptTokens: promptSeen ? promptTotal : Math.round(JSON.stringify(base).length / CHARS_PER_TOKEN),
+      promptEstimated: !promptSeen,
     };
     this.logStats(stats);
 

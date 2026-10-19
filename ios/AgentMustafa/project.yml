@@ -1,0 +1,28 @@
+# XcodeGen spec: `brew install xcodegen && cd ios/AgentMustafa && xcodegen`, then open AgentMustafa.xcodeproj.
+# (No XcodeGen? Create an iOS App project in Xcode named AgentMustafa (SwiftUI, iOS 17), delete the
+# generated Swift files and drag the files from Sources/ into it.)
+name: AgentMustafa
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    GENERATE_INFOPLIST_FILE: YES
+    INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    INFOPLIST_KEY_CFBundleDisplayName: Agent
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  AgentMustafa:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.agentmustafa
+        # Set DEVELOPMENT_TEAM to your Apple ID team in Xcode (Signing & Capabilities); a free account works for your own phone.
