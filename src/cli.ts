@@ -214,6 +214,8 @@ program
       if (opts.autoDebug) process.env.AGENT_AUTO_DEBUG = "1";
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
+  control.setWorkspace(workspaceRoot);
+  control.setInterruptHandler(() => interruptRunningCommands());
 
       const llm = makeProvider(opts.model);
       const mcp = await setupMcp(!opts.mcp);
@@ -583,6 +585,8 @@ program
     }
 
     console.log(pc.dim(`\n✅ Workspace locked to: ${workspaceRoot}`));
+  control.setWorkspace(workspaceRoot);
+  control.setInterruptHandler(() => interruptRunningCommands());
 
     const llm = makeProvider(opts.model);
     console.log(pc.dim(`Model: ${describeModel(llm)}   (type /model to list or switch)`));
@@ -634,7 +638,9 @@ program
     }
 
     const mcp = await setupMcp(!opts.mcp);
-    const executor = createExecutor(llm, workspaceRoot, mcp, { autoWrite, autoRun });
+    // liveAutoDebug: the Debug Agent hook is always installed and re-reads AGENT_AUTO_DEBUG on every failure, so the
+    // dashboard (or /auto-debug) can switch it on and off during the session.
+    const executor = createExecutor(llm, workspaceRoot, mcp, { autoWrite, autoRun }, { liveAutoDebug: true });
     if (/^(1|true|yes|on)$/i.test(process.env.AGENT_AUTO_DEBUG ?? "")) {
       console.log(pc.yellow("\u{1F6E0}  Auto-debug ON (AGENT_AUTO_DEBUG=1): a failed command starts the Debug Agent right away; it needs auto-write and auto-run."));
     }
@@ -668,13 +674,32 @@ program
     let parallelOn = false;
     let brief: DesignBrief | undefined;
 
+    // One shared state for every switch: the terminal commands below and the dashboard (web + iOS) both go
+    // through control.setSetting(), and this listener applies the result to the executor, the research pipeline
+    // and the auto-debug flag. Startup answers are pushed in first.
+    control.setCapabilities({ researchAvailable: pipeline.hasApiKey(), autoRunLocked: process.env.AGENT_AUTO_RUN === "0" });
+    control.setSetting("autoWrite", autoWrite);
+    control.setSetting("autoRun", autoRun);
+    control.setSetting("research", researchOn);
+    control.setSetting("planner", pipeline.plannerMode);
+    const applySettings = (s: ReturnType<typeof control.getSettings>) => {
+      if (s.autoWrite !== executor.isAutoWrite()) executor.setAutoWrite(s.autoWrite);
+      if (s.autoRun !== executor.isAutoRun()) executor.setAutoRun(s.autoRun);
+      parallelOn = s.parallel;
+      researchOn = s.research;
+      pipeline.plannerMode = s.planner;
+      process.env.AGENT_AUTO_DEBUG = s.autoDebug ? "1" : "0";
+    };
+    applySettings(control.getSettings());
+    control.onSettingsChange(applySettings);
+
     // Routes and runs one task as one observable run. Used by the terminal and the dashboard.
     // `origin` decides where approvals are asked; `forcedAgentId` (dashboard picker) beats the
     // session lock and the router.
     const executeTask = async (rawTask: string, origin: "terminal" | "dashboard", forcedAgentId?: string): Promise<void> => {
       // `/team <task>` runs just this task with the team; `/team` alone toggles it for every task.
       const teamRequest = /^\/team\s+\S/i.test(rawTask);
-      const useTeam = teamOn || teamRequest;
+      const useTeam = teamRequest || control.isTeam();
       const task = teamRequest ? rawTask.replace(/^\/team\s+/i, "").trim() : rawTask;
       const briefText = brief ? renderBriefForAgents(brief) : "";
       try {
@@ -796,6 +821,8 @@ program
   ${pc.cyan("/team <task>")}                 - Run one task with the team: Project Manager plans, engineers build, Safety Reviewer checks
   ${pc.cyan("/team")}                        - Toggle team mode for every task
   ${pc.cyan("/parallel")}                    - Toggle parallel team: independent engineer tasks run at the same time (needs auto-write + auto-run)
+  ${pc.cyan("/auto-debug")}                  - Toggle auto-debug: a failed command starts the Debug Agent right away (needs auto-write + auto-run)
+  (all switches can also be changed in the dashboard; both stay in sync)
   ${pc.cyan("/image <path> [note]")}         - Show a picture of what you want; it is read into a design brief the agents build from
   ${pc.cyan("/image show")} | ${pc.cyan("/image clear")} - Print or drop the current design brief
   ${pc.cyan("Ctrl+C")}                       - Stops a running command (a second Ctrl+C when idle exits)
@@ -858,7 +885,7 @@ program
         }
 
         if (["auto-write", "/auto-write", "autowrite", "/autowrite"].includes(normalizedInput)) {
-          executor.setAutoWrite(!executor.isAutoWrite());
+          control.setSetting("autoWrite", !executor.isAutoWrite());
           console.log(
             executor.isAutoWrite()
               ? pc.yellow("\n✎ Auto mode ON: files are written and commands are run without asking (risky commands still ask).\n")
@@ -872,7 +899,7 @@ program
           if (process.env.AGENT_AUTO_RUN === "0") {
             console.log(pc.yellow("\n⚠ Auto-run is disabled by AGENT_AUTO_RUN=0 in your env file.\n"));
           } else {
-            executor.setAutoRun(!executor.isAutoRun());
+            control.setSetting("autoRun", !executor.isAutoRun());
             console.log(
               executor.isAutoRun()
                 ? pc.yellow("\n⚡ Auto-run ON: commands run without asking (risky ones still ask).\n")
@@ -890,7 +917,7 @@ program
           } else if (!pipeline.hasApiKey()) {
             console.log(pc.yellow("\n⚠ GEMINI_API_KEY is not set. Put it in .env (git-ignored) and restart.\n"));
           } else {
-            researchOn = !researchOn;
+            control.setSetting("research", !researchOn);
             console.log(
               researchOn
                 ? pc.yellow(`\n🔎 Research stage ON: the question and a file-name overview are sent to Google/Gemini for each task. Planner mode: ${pipeline.plannerMode}.\n`)
@@ -904,7 +931,7 @@ program
         if (normalizedInput === "/plan" || normalizedInput.startsWith("/plan ")) {
           const arg = normalizedInput.replace(/^\/plan\s*/, "").trim();
           if (arg === "auto" || arg === "always" || arg === "off") {
-            pipeline.plannerMode = arg;
+            control.setSetting("planner", arg);
             console.log(pc.green(`\n✔ Planner mode: ${arg}${arg === "auto" ? " (only when the research says a plan is needed)" : ""}.\n`));
           } else {
             console.log(pc.dim(`\nPlanner mode: ${pipeline.plannerMode}. Change with: /plan auto | /plan always | /plan off\n`));
@@ -913,8 +940,20 @@ program
           return;
         }
 
+        if (normalizedInput === "/auto-debug" || normalizedInput === "/autodebug") {
+          const on = !control.getSettings().autoDebug;
+          control.setSetting("autoDebug", on);
+          console.log(
+            on
+              ? pc.yellow("\n\u{1F6E0}  Auto-debug ON: a failed command starts the Debug Agent right away (needs auto-write and auto-run).\n")
+              : pc.green("\n✔ Auto-debug OFF.\n"),
+          );
+          askQuestion();
+          return;
+        }
+
         if (normalizedInput === "/parallel") {
-          parallelOn = !parallelOn;
+          control.setSetting("parallel", !parallelOn);
           console.log(
             parallelOn
               ? pc.yellow("\n\u{1F3BC} Parallel team ON: in team mode, tasks that do not depend on each other run at the same time (needs auto-write and auto-run; model calls are limited by AGENT_LLM_CONCURRENCY, default 2).\n")
@@ -925,7 +964,8 @@ program
         }
 
         if (normalizedInput === "/team") {
-          teamOn = !teamOn;
+          teamOn = !control.isTeam();
+          control.setSetting("team", teamOn);
           console.log(
             teamOn
               ? pc.yellow("\n🏢 Team mode ON: every task is planned by the Project Manager, built by engineers and checked by the Safety Reviewer.\n")

@@ -20,6 +20,7 @@ import * as fs from "fs";
 import pc from "picocolors";
 import prompts from "prompts";
 import type { LLMProvider } from "../llm/types";
+import { bus } from "../core/events";
 import type { Executor, ExecutorResult } from "../core/executor";
 import { getAgent } from "../agents/definitions";
 import { OrchestraMaster, type TaskRunner } from "../orchestra/orchestra-master";
@@ -172,6 +173,17 @@ function printPlan(plan: PmPlan, parallel: boolean): void {
   if (plan.risks.length) console.log(pc.yellow(`  Risks: ${plan.risks.join("; ")}`));
   if (plan.questions.length) console.log(pc.yellow(`  Open questions: ${plan.questions.join("; ")}`));
   console.log(pc.dim("  🛡  A Safety Reviewer checks the result at the end.\n"));
+
+  // The same plan as plain text for the dashboard.
+  const lines = [`Project Manager: ${plan.goal}`];
+  plan.tasks.forEach((t, i) => {
+    lines.push(`${i + 1}. [${ROLE_TITLES[t.role] ?? t.role}] ${t.title}`);
+    t.acceptance.forEach((a) => lines.push(`     ✓ ${a}`));
+  });
+  if (plan.assumptions.length) lines.push(`Assumptions: ${plan.assumptions.join("; ")}`);
+  if (plan.risks.length) lines.push(`Risks: ${plan.risks.join("; ")}`);
+  if (plan.questions.length) lines.push(`Open questions: ${plan.questions.join("; ")}`);
+  bus.emit("log", { text: lines.join("\n"), level: "plan" });
 }
 
 function assignment(plan: PmPlan, index: number, notes: string[], uxSpec: string, extra?: string): string {
@@ -200,6 +212,7 @@ function parseVerdict(text: string): SafetyVerdict {
 
 async function review(opts: TeamOptions, plan: PmPlan, files: string[], label: string): Promise<{ verdict: SafetyVerdict; notes: string; interrupted: boolean }> {
   console.log(pc.bold(`\n🛡  ${label}`));
+  bus.emit("log", { text: label, level: "step" });
   const res = await opts.executor.run(
     safetyAgent,
     `Review the work done for this goal: ${plan.goal}`,
@@ -227,6 +240,7 @@ function fallbackReport(r: Omit<TeamResult, "report">): string {
  */
 export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
   console.log(pc.bold(`\n🏢 Team mode: Project Manager is planning${opts.think ? " (Gemini)" : ""} …`));
+  bus.emit("log", { text: "Team mode: the Project Manager is planning…", level: "step" });
 
   let plan: PmPlan;
   try {
@@ -265,6 +279,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     const t = plan.tasks[i];
     const title = ROLE_TITLES[t.role] ?? t.role;
     console.log(pc.bold(`\n━━ [${i + 1}/${plan.tasks.length}] ${title}: ${t.title}`));
+    bus.emit("log", { text: `[${i + 1}/${plan.tasks.length}] ${title}: ${t.title}`, level: "step" });
 
     if (t.role === "ux") {
       try {
@@ -362,6 +377,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
 
     if (safety === "FAIL" && !interrupted) {
       console.log(pc.yellow("\n🛡  Blockers found. One fix round follows."));
+      bus.emit("log", { text: "Safety Reviewer found blockers. One fix round follows.", level: "warn" });
       const fixAgent = getAgent(lastEngineer) ?? getAgent("dev");
       if (fixAgent) {
         const fixRes = await opts.executor.run(

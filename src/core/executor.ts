@@ -20,13 +20,14 @@ import { escapesWorkspace, isDangerousCommand, isSafeDiagnostic } from "./comman
 import { analyzeTask } from "../agents/orchestration";
 import { ProcessManager, processToolSchemas } from "../tools/process.tool";
 import { deployToolSchemas, runDeployTemplate, runPredeployCheck } from "../tools/deploy.tool";
+import { styleToolSchemas, runStyleCheck } from "../tools/styles.tool";
 import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 import type { ExecutorHooks } from "./executor-hooks";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas];
 
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
@@ -73,6 +74,7 @@ const READ_ONLY_TOOLS = new Set([
   "design_search",
   "deploy_template",
   "predeploy_check",
+  "check_styles",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -256,11 +258,30 @@ function clip(s: string): string {
     : s;
 }
 
-async function confirm(message: string): Promise<boolean> {
+// Terminal colour codes are useless in the dashboard, so the detail sent with an approval is plain text.
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+const APPROVAL_DETAIL_LIMIT = 6000;
+
+// A line the terminal prints that the dashboard should show as well.
+function logLine(text: string, level: "info" | "warn" = "info"): void {
+  bus.emit("log", { text, level });
+}
+
+// The same successful command, over and over, with nothing written in between: tracked per run so the
+// agent can be told to stop (a failing command has its own tracker, RepeatTracker).
+const successRuns = new WeakMap<object, Map<string, number>>();
+const SUCCESS_REPEAT_LIMIT = 3;
+
+async function confirm(message: string, detail?: string): Promise<boolean> {
   // Runs started from the dashboard are approved there; terminal runs keep the terminal prompt
   // (the dashboard then only shows that an answer is pending).
   const via = bus.origin();
-  bus.emit("approval_requested", { message, via });
+  const shownDetail = detail ? truncate(stripAnsi(detail), APPROVAL_DETAIL_LIMIT) : undefined;
+  bus.emit("approval_requested", { message, via, detail: shownDetail });
   let approved: boolean;
   if (via === "dashboard") {
     console.log(pc.yellow(`⏸ Waiting for approval in the dashboard: ${message}`));
@@ -624,7 +645,9 @@ When you are done and have no more actions to take, reply normally with a final 
     const stackPaths = detectStackKnowledge(this.workspaceRoot, agent.id);
     if (stackPaths.length) {
       console.log(pc.dim(`Detected stack standards: ${stackPaths.map((p) => basename(p)).join(", ")}`));
+      logLine(`Detected stack standards: ${stackPaths.map((p) => basename(p)).join(", ")}`);
     }
+    logLine(`Model: ${this.llm.model ?? "unknown"} · tool protocol: ${this.llm.nativeTools === false ? "fenced blocks (no native tools)" : "native tool calls"}`);
     console.log(
       pc.dim(
         `Model: ${this.llm.model ?? "unknown"} · tool protocol: ${this.llm.nativeTools === false ? "fenced blocks (no native tools)" : "native tool calls"}`,
@@ -643,8 +666,14 @@ When you are done and have no more actions to take, reply normally with a final 
     const taskPaths = analysis.knowledge
       .map((k) => k.path)
       .filter((p) => !stackPaths.includes(p) && !agent.systemPrompt.includes(`### STANDARD: ${p}`));
-    if (taskPaths.length) console.log(pc.dim(`Task standards: ${taskPaths.map(basename).join(", ")}`));
-    if (analysis.teamHint) console.log(pc.yellow(`💡 ${analysis.teamHint}`));
+    if (taskPaths.length) {
+      console.log(pc.dim(`Task standards: ${taskPaths.map(basename).join(", ")}`));
+      logLine(`Task standards: ${taskPaths.map(basename).join(", ")}`);
+    }
+    if (analysis.teamHint) {
+      console.log(pc.yellow(`💡 ${analysis.teamHint}`));
+      logLine(analysis.teamHint, "warn");
+    }
     if ((this.autoWrite || this.autoRun) && !this.warnedNoGit && !insideGitRepo(this.workspaceRoot)) {
       this.warnedNoGit = true;
       console.log(pc.yellow("⚠ Auto mode is on but this folder is not in a git repository: there is no sandbox, and changes cannot be reviewed or reverted. Use git first."));
@@ -655,7 +684,10 @@ When you are done and have no more actions to take, reply normally with a final 
     const designContext = agent.id === "design" || agent.id === "dev" ? loadDesignSystem(this.workspaceRoot) : "";
     if (designContext) console.log(pc.dim("Design system loaded from design-system/MASTER.md"));
     const projectContext = loadProjectContext(this.workspaceRoot) + designContext;
-    if (projectContext && !designContext) console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
+    if (projectContext && !designContext) {
+      console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
+      logLine("Project rules loaded from AGENTS.md / CLAUDE.md");
+    }
     const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext);
 
     // Ground the agent in reality before it can guess: show the real tree as the
@@ -848,9 +880,9 @@ When you are done and have no more actions to take, reply normally with a final 
       messages.push(assistantMsg);
 
       for (let i = 0; i < calls.length; i++) {
-        bus.emit("tool_running", { callId: calls[i].id, tool: calls[i].name, args: truncate(calls[i].arguments, 300) });
+        bus.emit("tool_running", { callId: calls[i].id, tool: calls[i].name, args: truncate(calls[i].arguments, 1500) });
         const rawResult = await this.handleToolCall(calls[i], state, response.finishReason === "length");
-        bus.emit("tool_result", { callId: calls[i].id, ok: toolSucceeded(rawResult), preview: truncate(rawResult, 600) });
+        bus.emit("tool_result", { callId: calls[i].id, ok: toolSucceeded(rawResult), preview: truncate(rawResult, 1500) });
         const result = clip(rawResult);
 
         // Once a write has succeeded the content lives on disk. Drop it from the
@@ -1055,6 +1087,9 @@ When you are done and have no more actions to take, reply normally with a final 
       case "predeploy_check":
         return runPredeployCheck(this.workspaceRoot);
 
+      case "check_styles":
+        return runStyleCheck(this.workspaceRoot);
+
       case "update_plan": {
         if (state.readOnly) return READ_ONLY_REFUSAL;
         const store = new PlanStore(this.workspaceRoot);
@@ -1085,7 +1120,7 @@ When you are done and have no more actions to take, reply normally with a final 
           console.log(pc.green(`▶ Auto-starting: ${command}`));
         } else {
           if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
-          if (!(await confirm("Start this background process?"))) {
+          if (!(await confirm("Start this background process?", command))) {
             return "User rejected starting this process. Do not repeat it; ask what to do differently or stop.";
           }
         }
@@ -1121,7 +1156,10 @@ When you are done and have no more actions to take, reply normally with a final 
         if (autoRun) {
           console.log(pc.green(`▶ Auto-running: ${command}`));
         } else if (!diagnostic) {
-          if (this.autoRunEnabled()) console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
+          if (this.autoRunEnabled()) {
+            console.log(pc.yellow("⚠ Risky command or path outside the project: asking even though auto mode is on."));
+            logLine("Risky command or path outside the project: asking even though auto mode is on.", "warn");
+          }
           if (this.hooks.unattended) {
             return (
               "This command was NOT run: it needs approval and this agent runs alongside others with nobody to ask. " +
@@ -1129,7 +1167,7 @@ When you are done and have no more actions to take, reply normally with a final 
               "no rm, no global installs; use `npm --prefix <dir>` and `mkdir -p <dir>` from the project root."
             );
           }
-          const approved = await confirm("Run this command?");
+          const approved = await confirm("Run this command?", command);
           if (!approved) {
             if (!process.stdin.isTTY) {
               return (
@@ -1173,7 +1211,26 @@ When you are done and have no more actions to take, reply normally with a final 
         state.lastRunFailed = failed;
         const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
         const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
-        if (repeatCount >= REPEAT_LIMIT) console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
+        if (repeatCount >= REPEAT_LIMIT) {
+          console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
+          logLine(`Same failure ${repeatCount} times: telling the agent to stop and report.`, "warn");
+        }
+
+        // The same command succeeding again and again (nothing written in between) is a loop, not progress.
+        let successNote = "";
+        if (state.runsSinceWrite === 1) successRuns.delete(state);
+        if (!failed && !result.timedOut && !result.interrupted && result.exitCode === 0) {
+          const counts = successRuns.get(state) ?? new Map<string, number>();
+          const key = command.trim();
+          const n = (counts.get(key) ?? 0) + 1;
+          counts.set(key, n);
+          successRuns.set(state, counts);
+          if (n >= SUCCESS_REPEAT_LIMIT) {
+            successNote = `This exact command has now succeeded (exit 0) ${n} times with nothing changed in between. Running it again will not change the result. Use the output you already have and move on to the next step, or report what is blocking you.`;
+            console.log(pc.yellow(`\n(Same successful command ${n} times, telling the agent to move on.)`));
+            logLine(`Same successful command ${n} times: telling the agent to move on.`, "warn");
+          }
+        }
 
         // Reactive debugging: the agent is paused here until the interceptor (Debug Agent) is done.
         let autoDebug: { note: string; verified: boolean } | null = null;
@@ -1188,6 +1245,7 @@ When you are done and have no more actions to take, reply normally with a final 
           ...(failureSummary ? { failureSummary } : {}),
           ...(repeatCount >= REPEAT_LIMIT && !autoDebug?.verified ? { note: repeatNote(repeatCount) } : {}),
           ...(autoDebug ? { autoDebug: autoDebug.note } : {}),
+          ...(successNote ? { note: successNote } : {}),
           ...(result.interrupted
             ? {
                 interrupted: true,
@@ -1346,7 +1404,7 @@ When you are done and have no more actions to take, reply normally with a final 
       console.log(`\n${pc.bold(exists ? "Proposed edit:" : "Proposed new file:")} ${p} (${newLines - 1} lines)\n`);
       console.log(diff || pc.dim("(no textual diff — identical content)"));
 
-      if (!(await confirm(`Apply this change to ${p}?`))) {
+      if (!(await confirm(`Apply this change to ${p}?`, diff || "(no textual diff, identical content)"))) {
         return "User rejected this file write. Do not repeat the same change; ask what to do differently or stop.";
       }
     }
@@ -1376,7 +1434,7 @@ When you are done and have no more actions to take, reply normally with a final 
       console.log(preview.join("\n"));
       if (lines.length > 40) console.log(pc.dim(`… (+${lines.length - 40} more lines)`));
 
-      if (!(await confirm(`Append these ${lines.length} lines to ${p}?`))) {
+      if (!(await confirm(`Append these ${lines.length} lines to ${p}?`, lines.slice(0, 80).map((l) => `+${l}`).join("\n")))) {
         return "User rejected this append. Do not repeat the same change; ask what to do differently or stop.";
       }
     }

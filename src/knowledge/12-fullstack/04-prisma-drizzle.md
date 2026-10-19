@@ -13,6 +13,8 @@ Use the ORM the project already has. Check its installed major first: Prisma 7 a
 - `npx prisma init --datasource-provider postgresql`; edit the schema; `npx prisma migrate dev --name <change>` locally (creates and applies the migration, regenerates the client); `npx prisma migrate deploy` in CI and production; `npx prisma generate` after dependency installs.
 - With a pooled connection (Neon, PgBouncer) migrations need the DIRECT connection (see `05-neon-postgres.md`).
 - "Client not generated" or type errors after a schema change: run `generate`.
+- Prisma does NOT need Docker. It needs a reachable PostgreSQL database in `DATABASE_URL`. `prisma validate`, `prisma format` and `prisma generate` need no database at all, so run those first and do not wait on a database for them. `migrate dev`, `migrate deploy` and `db push` do need one. Use what the project already has: a hosted database (Neon, Supabase) in `.env`, a local Postgres, or Docker only when the project already has a compose file for it or the user asks. Never install or start Docker on your own to get a database.
+- If `DATABASE_URL` is empty, a placeholder or unreachable, do not loop on migrate commands. Write the schema, run `validate` and `generate`, and report "migration not applied: no database reachable; need DATABASE_URL".
 
 ## Prisma version decides everything (check FIRST, before editing any import)
 - Read the installed major: `npm --prefix <app> ls prisma @prisma/client` and look for `prisma.config.ts` / `prisma7.config.ts` and for `output = ...` in the generator block. If `@prisma/client` is missing from the app's package.json, `npx prisma` downloads the LATEST major (7) on the fly, which does not match an older schema: install `prisma` and `@prisma/client` into the app first.

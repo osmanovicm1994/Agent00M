@@ -1,7 +1,8 @@
-import type { AgentEvent, AgentInfo } from "./protocol";
+import type { AgentEvent, AgentInfo, FileEntry, SettingsState } from "./protocol";
 
-const FEED_LIMIT = 400;
+const FEED_LIMIT = 800;
 const OUTPUT_LIMIT = 20_000;
+const USAGE_LIMIT = 600;
 
 export type ToolStatus = "running" | "ok" | "error";
 
@@ -14,6 +15,10 @@ interface FeedBase {
 
 export type FeedItem =
   | (FeedBase & { kind: "note"; text: string })
+  // A terminal line: info/warn notes, "step" = a team task heading, "plan" = the Project Manager's plan.
+  | (FeedBase & { kind: "log"; level: "info" | "warn" | "step" | "plan"; text: string })
+  // Timing of one model call, like the terminal's "first token 3.1s · 107 tokens in 5.6s · 42.8 tok/s".
+  | (FeedBase & { kind: "stats"; text: string })
   | (FeedBase & { kind: "thinking"; label: string; text: string })
   | (FeedBase & {
       kind: "tool";
@@ -47,6 +52,35 @@ export interface RunInfo {
   commandsRun: string[];
 }
 
+// One model call of the agent (from the llm_usage event). Tokens are what the agent's model used,
+// not what a Claude subscription used.
+export interface UsageEntry {
+  // Stable key (timestamp + sequence) so a replayed history never counts twice.
+  key: string;
+  ts: number;
+  runId: string;
+  agent: string;
+  model: string;
+  prompt: number;
+  completion: number;
+  // True when the model server did not report the number and it is a character-based estimate.
+  estimated: boolean;
+  tokPerSec: number;
+}
+
+export interface FileTree {
+  root: string;
+  entries: FileEntry[];
+  truncated: boolean;
+}
+
+export interface PendingApproval {
+  message: string;
+  via: "terminal" | "dashboard";
+  // The command or the diff that is about to run.
+  detail?: string;
+}
+
 export interface DashboardState {
   connected: boolean;
   roster: AgentInfo[];
@@ -57,7 +91,7 @@ export interface DashboardState {
   run: RunInfo | null;
   feed: FeedItem[];
   // A y/n answer is needed: via "dashboard" the buttons answer it, via "terminal" it is display-only.
-  pendingApproval: { message: string; via: "terminal" | "dashboard" } | null;
+  pendingApproval: PendingApproval | null;
   // An LLM request is in flight.
   llmWaiting: boolean;
   // True when this page presented the control token (it may answer questions and approvals).
@@ -69,6 +103,14 @@ export interface DashboardState {
   // An agent run is in progress (started from the terminal or the dashboard).
   busy: boolean;
   notice: { level: "info" | "error"; text: string } | null;
+  // Team mode (PM plans, engineers build, Safety Reviewer checks) for tasks sent from the dashboard.
+  team: boolean;
+  // All terminal switches (parallel, auto-write, auto-run, auto-debug, research, planner). Null until the server sent them.
+  settings: SettingsState | null;
+  // Model calls seen in this server session (replayed history included).
+  usage: UsageEntry[];
+  // Project folder listing, filled after a list_files request.
+  files: FileTree | null;
 }
 
 export const initialState: DashboardState = {
@@ -85,6 +127,10 @@ export const initialState: DashboardState = {
   pendingQuestion: null,
   busy: false,
   notice: null,
+  team: false,
+  settings: null,
+  usage: [],
+  files: null,
 };
 
 export type Action =
@@ -93,6 +139,8 @@ export type Action =
   | { type: "session"; acceptsTasks: boolean }
   | { type: "event"; event: AgentEvent }
   | { type: "busy"; busy: boolean }
+  | { type: "files"; tree: FileTree }
+  | { type: "settings"; settings: SettingsState }
   | { type: "notice"; level: "info" | "error"; text: string }
   | { type: "dismiss_notice" };
 
@@ -101,6 +149,16 @@ function patchRun(state: DashboardState, patch: Partial<RunInfo>): RunInfo | nul
 }
 
 export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState {
+  // Team mode runs several executors inside one run, and each one ends with run_completed. When the same run
+  // keeps working afterwards it is running again, not done.
+  if (
+    state.run &&
+    state.run.status === "done" &&
+    e.runId === state.run.runId &&
+    (e.type === "executor_ready" || e.type === "llm_request" || e.type === "tool_running" || e.type === "log")
+  ) {
+    state = { ...state, run: { ...state.run, status: "running", endedAt: undefined } };
+  }
   const base = { id: e.seq, ts: e.ts, agent: e.agent };
   const push = (item: FeedItem): FeedItem[] => [...state.feed, item].slice(-FEED_LIMIT);
 
@@ -169,6 +227,32 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
     case "llm_request":
       return { ...state, llmWaiting: true };
 
+    case "log":
+      return { ...state, feed: push({ ...base, kind: "log", level: e.payload.level, text: e.payload.text }) };
+
+    case "llm_usage": {
+      const entry: UsageEntry = {
+        key: `${e.ts}:${e.seq}`,
+        ts: e.ts,
+        runId: e.runId,
+        agent: e.agent,
+        model: e.payload.model,
+        prompt: e.payload.promptTokens,
+        completion: e.payload.completionTokens,
+        estimated: e.payload.promptEstimated || e.payload.completionEstimated,
+        tokPerSec: e.payload.tokPerSec,
+      };
+      const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+      const stats =
+        `first token ${secs(e.payload.ttftMs)} · ${e.payload.completionTokens}${e.payload.completionEstimated ? "~" : ""} tokens in ${secs(e.payload.totalMs)}` +
+        ` · ${e.payload.tokPerSec.toFixed(1)} tok/s · prompt ${e.payload.promptTokens}${e.payload.promptEstimated ? "~" : ""}`;
+      return {
+        ...state,
+        usage: [...state.usage, entry].slice(-USAGE_LIMIT),
+        feed: push({ ...base, kind: "stats", text: stats }),
+      };
+    }
+
     case "agent_thinking": {
       const speed = e.payload.tokPerSec ? ` · ${e.payload.tokPerSec.toFixed(1)} tok/s` : "";
       const label =
@@ -231,7 +315,7 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
       };
 
     case "approval_requested":
-      return { ...state, pendingApproval: { message: e.payload.message, via: e.payload.via } };
+      return { ...state, pendingApproval: { message: e.payload.message, via: e.payload.via, detail: e.payload.detail } };
 
     case "approval_resolved":
       return {
@@ -240,7 +324,7 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
         feed: push({
           ...base,
           kind: "note",
-          text: e.payload.approved ? "You approved the action in the terminal." : "You rejected the action in the terminal.",
+          text: e.payload.approved ? "The action was approved." : "The action was rejected.",
         }),
       };
 
@@ -283,9 +367,13 @@ export function reducer(state: DashboardState, action: Action): DashboardState {
     case "connection":
       return { ...state, connected: action.connected };
     case "hello":
-      // A (re)connect replays the server's history from scratch, so start from a clean slate.
+      // A (re)connect replays the server's history from scratch, so start from a clean slate
+      // (the project tree is kept: it does not depend on the event history).
       return action.history.reduce(applyEvent, {
         ...initialState,
+        files: state.files,
+        team: state.team,
+        settings: state.settings,
         connected: true,
         roster: action.roster,
         canControl: action.canControl,
@@ -298,6 +386,10 @@ export function reducer(state: DashboardState, action: Action): DashboardState {
       return applyEvent(state, action.event);
     case "busy":
       return { ...state, busy: action.busy };
+    case "files":
+      return { ...state, files: action.tree };
+    case "settings":
+      return { ...state, team: action.settings.team, settings: action.settings };
     case "notice":
       return { ...state, notice: { level: action.level, text: action.text } };
     case "dismiss_notice":

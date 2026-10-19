@@ -7,6 +7,10 @@ export interface AgentSocket {
   // Sends a command. Returns false if the socket is not open.
   send: (command: ClientCommand) => boolean;
   dismissNotice: () => void;
+  // Asks the agent for the project folder listing (answer arrives in state.files).
+  requestFiles: () => void;
+  // Stops the running shell command, like Ctrl+C in the terminal.
+  stop: () => void;
 }
 
 // Connects to the agent's WebSocket, reconnects automatically, and folds every event into
@@ -56,6 +60,15 @@ export function useAgentSocket(url: string): AgentSocket {
           case "notice":
             dispatch({ type: "notice", level: parsed.level, text: parsed.text });
             break;
+          case "settings":
+            {
+              const { kind: _kind, ...settings } = parsed;
+              dispatch({ type: "settings", settings });
+            }
+            break;
+          case "files":
+            dispatch({ type: "files", tree: { root: parsed.root, entries: parsed.entries, truncated: parsed.truncated } });
+            break;
         }
       };
 
@@ -85,5 +98,12 @@ export function useAgentSocket(url: string): AgentSocket {
 
   const dismissNotice = useCallback(() => dispatch({ type: "dismiss_notice" }), []);
 
-  return { state, send, dismissNotice };
+  const requestFiles = useCallback(() => {
+    send({ kind: "list_files" });
+  }, [send]);
+  const stop = useCallback(() => {
+    send({ kind: "stop_command" });
+  }, [send]);
+
+  return { state, send, dismissNotice, requestFiles, stop };
 }

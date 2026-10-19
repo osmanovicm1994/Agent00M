@@ -79,11 +79,14 @@ export interface AutoDebugDeps {
   mayRun: () => boolean;
   config?: InterceptorConfig;
   log?: (line: string) => void;
+  /** Re-reads AGENT_AUTO_DEBUG before every failure, so the dashboard/terminal can switch auto-debug on and off mid-session. */
+  live?: boolean;
 }
 
 /** Builds the interceptor and returns the hook the Executor calls after a failed command. */
 export function makeCommandInterceptor(deps: AutoDebugDeps): ExecutorHooks["commandInterceptor"] {
-  const config = deps.config ?? interceptorConfigFromEnv();
+  const base = deps.config ?? interceptorConfigFromEnv();
+  const config = deps.live ? { ...base, enabled: true } : base;
   if (!config.enabled) return undefined;
   const log = deps.log ?? ((l: string) => console.log(`\n\u{1F6E0}  ${l}`));
   const shell = new ShellTool(path.resolve(deps.workspaceRoot));
@@ -117,6 +120,7 @@ export function makeCommandInterceptor(deps: AutoDebugDeps): ExecutorHooks["comm
   );
 
   return async (failure: CommandFailure): Promise<InterceptResult | null> => {
+    if (deps.live && !interceptorConfigFromEnv().enabled) return null;
     if (!deps.mayRun()) return null;
     // The Debug Agent already is the debugger: starting a second one for its own failed commands only duplicates work.
     if (failure.agentId === "debug") return null;
@@ -126,7 +130,13 @@ export function makeCommandInterceptor(deps: AutoDebugDeps): ExecutorHooks["comm
 }
 
 /** `new Executor(...)`, plus the automatic debug interceptor when AGENT_AUTO_DEBUG is on. */
-export function createExecutor(llm: LLMProvider, workspaceRoot: string, mcp?: McpManager, options: ExecutorOptions = {}): Executor {
+export function createExecutor(
+  llm: LLMProvider,
+  workspaceRoot: string,
+  mcp?: McpManager,
+  options: ExecutorOptions = {},
+  extra: { liveAutoDebug?: boolean } = {},
+): Executor {
   const hooks: ExecutorHooks = { ...(options.hooks ?? {}) };
   const executor = new Executor(llm, workspaceRoot, mcp, { ...options, hooks });
   if (!hooks.commandInterceptor) {
@@ -136,6 +146,7 @@ export function createExecutor(llm: LLMProvider, workspaceRoot: string, mcp?: Mc
       workspaceRoot,
       mcp,
       mayRun: () => executor.isAutoWrite() && executor.isAutoRun(),
+      live: extra.liveAutoDebug,
     });
   }
   return executor;
