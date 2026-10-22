@@ -56,6 +56,24 @@ struct AgentsView: View {
 
                     SettingsCard()
 
+                    NotificationsCard()
+
+                    NavigationLink {
+                        GuideView()
+                    } label: {
+                        Card {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("How to prompt the agent").font(.headline)
+                                    Text("The tutorial: what to write so it builds what you want.").font(.footnote).foregroundStyle(Theme.muted)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").foregroundStyle(Theme.muted)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+
                     HStack {
                         Text("Who is active").font(.title3.bold())
                         Spacer()
@@ -100,6 +118,102 @@ struct AgentsView: View {
             }
             .background(Theme.bg)
             .navigationTitle("Agents")
+        }
+    }
+}
+
+// MARK: Guide
+
+// One block of the tutorial. The tutorial is Markdown; only what it uses is drawn: headings, paragraphs, bullets,
+// numbered lines, code blocks and table rows (as one line of cells).
+struct GuideBlock: Identifiable {
+    enum Kind { case h1, h2, h3, paragraph, bullet, numbered, code, row }
+    let id: Int
+    let kind: Kind
+    let text: String
+}
+
+func parseGuide(_ markdown: String) -> [GuideBlock] {
+    var out: [GuideBlock] = []
+    var code: [String]?
+    var para: [String] = []
+    func add(_ kind: GuideBlock.Kind, _ text: String) { out.append(GuideBlock(id: out.count, kind: kind, text: text)) }
+    func flush() {
+        if !para.isEmpty { add(.paragraph, para.joined(separator: " ")); para = [] }
+    }
+    for raw in markdown.components(separatedBy: "\n") {
+        if raw.hasPrefix("```") {
+            if let c = code { add(.code, c.joined(separator: "\n")); code = nil } else { flush(); code = [] }
+            continue
+        }
+        if code != nil { code?.append(raw); continue }
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty { flush(); continue }
+        if line.hasPrefix("### ") { flush(); add(.h3, String(line.dropFirst(4))) }
+        else if line.hasPrefix("## ") { flush(); add(.h2, String(line.dropFirst(3))) }
+        else if line.hasPrefix("# ") { flush(); add(.h1, String(line.dropFirst(2))) }
+        else if line.hasPrefix("- ") || line.hasPrefix("* ") { flush(); add(.bullet, String(line.dropFirst(2))) }
+        else if line.range(of: #"^\d+\.\s"#, options: .regularExpression) != nil { flush(); add(.numbered, line) }
+        else if line.hasPrefix("|") {
+            flush()
+            if !line.contains("---") {
+                add(.row, line.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: "  ·  "))
+            }
+        }
+        else { para.append(line) }
+    }
+    if let c = code { add(.code, c.joined(separator: "\n")) }
+    flush()
+    return out
+}
+
+private func inlineMarkdown(_ s: String) -> AttributedString {
+    (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
+}
+
+struct GuideView: View {
+    @Environment(AgentClient.self) private var client
+    @State private var blocks: [GuideBlock] = []
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                if blocks.isEmpty {
+                    Text(client.connected ? "Loading the guide from your Mac…" : "Not connected. The guide is read from the agent when you are connected.")
+                        .foregroundStyle(Theme.muted)
+                    if let n = client.notice { Text(n).font(.footnote).foregroundStyle(Theme.amber) }
+                }
+                ForEach(blocks) { b in blockView(b) }
+            }
+            .padding(16)
+        }
+        .background(Theme.bg)
+        .navigationTitle("Prompting guide")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            if let g = client.guide { blocks = parseGuide(g) } else { client.requestGuide() }
+        }
+        .onChange(of: client.guide) { _, new in blocks = new.map(parseGuide) ?? [] }
+    }
+
+    @ViewBuilder private func blockView(_ b: GuideBlock) -> some View {
+        switch b.kind {
+        case .h1: Text(inlineMarkdown(b.text)).font(.title.bold()).padding(.top, 6)
+        case .h2: Text(inlineMarkdown(b.text)).font(.title2.bold()).foregroundStyle(Theme.teal).padding(.top, 12)
+        case .h3: Text(inlineMarkdown(b.text)).font(.headline).padding(.top, 6)
+        case .paragraph: Text(inlineMarkdown(b.text)).font(.callout)
+        case .bullet:
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("•").foregroundStyle(Theme.teal)
+                Text(inlineMarkdown(b.text)).font(.callout)
+            }
+        case .numbered: Text(inlineMarkdown(b.text)).font(.callout)
+        case .code:
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(b.text).font(.caption.monospaced()).textSelection(.enabled).padding(12)
+            }
+            .background(Color.black.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        case .row: Text(inlineMarkdown(b.text)).font(.footnote).foregroundStyle(Theme.muted)
         }
     }
 }

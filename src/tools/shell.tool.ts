@@ -23,8 +23,10 @@ const MAX_TIMEOUT_MS = 2 * 60 * 60_000; // 2 hours: hard ceiling for any single 
 // Builds, tests and installs (gradlew assembleDebug, xcodebuild, npm run build ...) legitimately run for many
 // minutes. They get this long by default; the user can still stop them with Ctrl+C at any time.
 const LONG_TIMEOUT_MS = Math.min((Number(process.env.AGENT_CMD_TIMEOUT_MIN) || 30) * 60_000, MAX_TIMEOUT_MS);
-const LONG_RUNNING_RE =
-  /\b(gradlew?|xcodebuild|mvnw?|fastlane|pod install|swift build|flutter build|cargo build|dotnet (build|publish|test)|docker (compose )?build|(npm|pnpm|yarn|bun) (run )?(build|test|ci|install)|npx playwright test|appium)\b/i;
+// Platform toolchains (iOS, Android, Flutter, Rust, Go, .NET, Prisma) as well as the web ones: none of them may be cut
+// short by a small timeout_seconds hint from the model. Servers that never exit (compose up, flutter run) are not listed.
+export const LONG_RUNNING_RE =
+  /\b(gradlew?|xcodebuild|xcodegen|mvnw?|fastlane|pod (install|update|repo update)|swift (build|test)|flutter (build|test|pub get|pub upgrade|analyze)|cargo (build|test|check|clippy|install|fetch)|go (build|test|vet|install|mod download)|dotnet (build|publish|test|restore)|docker (compose )?build|prisma (migrate|generate|db push)|(npm|pnpm|yarn|bun) (run )?(build|test|ci|install)|npx playwright test|appium)\b/i;
 
 // Commands currently running; Ctrl+C stops them (see interruptRunningCommands).
 const running = new Set<() => void>();

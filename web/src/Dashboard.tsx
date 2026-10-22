@@ -11,7 +11,10 @@ import { StackPanel } from "./components/StackPanel";
 import { TaskComposer } from "./components/TaskComposer";
 import { ThinkingPanel } from "./components/ThinkingPanel";
 import { TokenPanel } from "./components/TokenPanel";
-import { AgentsIcon, HistoryIcon, LiveIcon, ProjectIcon, PromptIcon } from "./components/icons";
+import { GuidePanel } from "./components/GuidePanel";
+import { SettingsScreen } from "./components/SettingsScreen";
+import { useNotifications } from "./notifications";
+import { AgentsIcon, HistoryIcon, LiveIcon, MoreIcon, ProjectIcon, PromptIcon } from "./components/icons";
 import {
   clearRuns,
   forgetToken,
@@ -69,7 +72,8 @@ const WS_URL = TOKEN ? `${WS_BASE}?token=${encodeURIComponent(TOKEN)}` : WS_BASE
 
 // agents / prompt / project make up the Monitor (all three side by side on a wide screen, one at a time on a phone).
 // live, history and stack are screens of their own.
-type View = "agents" | "live" | "prompt" | "project" | "history" | "stack";
+// settings (notifications) and guide (the prompting tutorial) are screens of their own too.
+type View = "agents" | "live" | "prompt" | "project" | "history" | "stack" | "settings" | "guide";
 const MONITOR_VIEWS: View[] = ["agents", "prompt", "project"];
 
 const MOBILE_TABS: { id: View; label: string; icon: () => ReactElement }[] = [
@@ -78,6 +82,7 @@ const MOBILE_TABS: { id: View; label: string; icon: () => ReactElement }[] = [
   { id: "prompt", label: "Prompt", icon: PromptIcon },
   { id: "project", label: "Project", icon: ProjectIcon },
   { id: "history", label: "History", icon: HistoryIcon },
+  { id: "settings", label: "More", icon: MoreIcon },
 ];
 
 const DESKTOP_TABS: { id: View; label: string }[] = [
@@ -85,10 +90,13 @@ const DESKTOP_TABS: { id: View; label: string }[] = [
   { id: "live", label: "Live" },
   { id: "history", label: "History" },
   { id: "stack", label: "Stack" },
+  { id: "guide", label: "Guide" },
+  { id: "settings", label: "Settings" },
 ];
 
 export default function Dashboard() {
   const { state, send, dismissNotice, requestFiles, stop } = useAgentSocket(WS_URL);
+  useNotifications(state);
   const [view, setView] = useState<View>("agents");
   const [pinned, setPinned] = useState<string | null>(() => loadPinned());
   const [context, setContext] = useState<string[]>([]);
@@ -344,6 +352,14 @@ export default function Dashboard() {
         <div className={view === "stack" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
           <StackPanel state={state} wsUrl={WS_URL} />
         </div>
+
+        <div className={view === "settings" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
+          <SettingsScreen onOpenGuide={() => setView("guide")} />
+        </div>
+
+        <div className={view === "guide" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
+          <GuidePanel onBack={() => setView("settings")} />
+        </div>
       </main>
 
       <nav
@@ -351,7 +367,7 @@ export default function Dashboard() {
         className="flex shrink-0 border-t border-slate-800 bg-slate-900 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-1.5 lg:hidden"
       >
         {MOBILE_TABS.map(({ id, label, icon: Icon }) => {
-          const on = view === id || (id === "project" && view === "stack");
+          const on = view === id || (id === "project" && view === "stack") || (id === "settings" && view === "guide");
           return (
             <button
               key={id}

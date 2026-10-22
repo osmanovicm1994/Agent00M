@@ -22,6 +22,12 @@ describe("isDangerousCommand (asks even in auto mode)", () => {
     "echo x >> notes.md",
     "mv src/a.ts src/b.ts",
     "truncate -s 0 file.log",
+    "cargo publish",
+    "flutter pub publish",
+    "pod trunk push MyPod.podspec",
+    "docker push registry.example.com/app:1",
+    "./gradlew publishToMavenRepository",
+    "xcrun altool --upload-app -f app.ipa",
   ])("flags %s", (cmd) => {
     expect(isDangerousCommand(cmd)).toBe(true);
   });
@@ -37,6 +43,15 @@ describe("isDangerousCommand (asks even in auto mode)", () => {
     "ls -la src",
     "cat package.json | head -20",
     "node -v",
+    "xcodegen generate",
+    "pod install",
+    "xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone 15' build",
+    "./gradlew assembleDebug",
+    "flutter pub get",
+    "cargo test",
+    "go build ./...",
+    "npx prisma migrate dev --name init",
+    "docker compose up -d",
   ])("lets %s run in auto mode", (cmd) => {
     expect(isDangerousCommand(cmd)).toBe(false);
   });

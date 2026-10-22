@@ -15,6 +15,8 @@ import { bus } from "../core/events";
 import type { LLMProvider } from "../llm/types";
 import type { McpManager } from "../mcp/client";
 import { ShellTool } from "../tools/shell.tool";
+import { escapesWorkspace, isDangerousCommand } from "../core/command-safety";
+import { describeProject } from "./triage";
 import { getAgent } from "../agents/definitions";
 import {
   DebugInterceptor,
@@ -26,15 +28,16 @@ import {
   type RerunResult,
 } from "./debug-interceptor";
 import { Semaphore, gateProvider, llmConcurrencyFromEnv } from "./llm-gate";
+import { boundedInt } from "./env-int";
 import type { OrchTask, TaskContext, TaskOutcome, TaskRunner } from "./orchestra-master";
 import { Blackboard } from "./blackboard";
 import { WorkspaceLocks } from "./workspace-locks";
 import type { ParallelOptions } from "../team/orchestrator";
 
 /** Steps the Debug Agent may use for one automatic debug run. Small on purpose: it fixes one failure, nothing else. */
-const DEBUG_MAX_STEPS = Number(process.env.AGENT_AUTO_DEBUG_STEPS) || 25;
+const DEBUG_MAX_STEPS = boundedInt(process.env.AGENT_AUTO_DEBUG_STEPS, 25, 3, 200);
 /** Steps one parallel task may use before it is reported as incomplete. */
-const TASK_MAX_STEPS = Number(process.env.AGENT_TASK_MAX_STEPS) || 60;
+const TASK_MAX_STEPS = boundedInt(process.env.AGENT_TASK_MAX_STEPS, 60, 3, 500);
 
 export function buildDebugTask(req: DebugRequest): string {
   return [
@@ -111,6 +114,10 @@ export function makeCommandInterceptor(deps: AutoDebugDeps): ExecutorHooks["comm
           bus.setAgent(req.agentId);
         }
       },
+      // Same gate the executor applies before auto-running a command: risky ones were approved by a person once,
+      // that approval does not extend to running them again unattended.
+      canRerun: (command: string) => !isDangerousCommand(command) && !escapesWorkspace(command, deps.workspaceRoot),
+      describeProject: () => describeProject(deps.workspaceRoot),
       async rerun(command: string): Promise<RerunResult> {
         const r = await shell.runAsync(command, 10 * 60 * 1000, () => {}, () => {});
         return { output: r.output, exitCode: r.timedOut ? null : r.exitCode };
@@ -124,8 +131,16 @@ export function makeCommandInterceptor(deps: AutoDebugDeps): ExecutorHooks["comm
     if (!deps.mayRun()) return null;
     // The Debug Agent already is the debugger: starting a second one for its own failed commands only duplicates work.
     if (failure.agentId === "debug") return null;
+    // Another agent already used up the attempts on this exact command: stop this one too, with the same report.
+    const earlier = interceptor.haltFor(failure.command);
+    if (earlier) {
+      return { note: `AUTO-DEBUG STOP: the debug attempts for \`${failure.command}\` are used up. The run ends here with a triage report.`, verified: false, halt: earlier };
+    }
     const note = await interceptor.handle({ ...failure });
-    return note ? { note, verified: note.includes(VERIFIED_MARKER) } : null;
+    if (!note) return null;
+    // takeHalt: this call used up the attempts. haltFor: another agent's call sharing the same debug run did.
+    const halt = interceptor.takeHalt() ?? interceptor.haltFor(failure.command);
+    return { note, verified: note.includes(VERIFIED_MARKER), ...(halt ? { halt } : {}) };
   };
 }
 
@@ -208,6 +223,8 @@ export function makeTaskRunner(deps: TaskRunnerDeps): TaskRunner {
       maxSteps: TASK_MAX_STEPS,
       hooks: {
         unattended: true,
+        // Ctrl+C on the team run: the master aborts ctx.signal and this task stops before its next model call.
+        cancelled: () => ctx.signal.aborted,
         // The task id is the lock owner; the agent id inside the executor is the role, so use the task id here.
         writeGuard: (_a, rel) => deps.locks.canWrite(task.id, rel),
         onFileWritten: (_a, rel) => ctx.board.post(task.id, "file-written", `wrote ${rel}`, rel),
@@ -222,9 +239,11 @@ export function makeTaskRunner(deps: TaskRunnerDeps): TaskRunner {
       const res = await executor.run(agent, buildTaskPrompt(task, ctx));
       const hitLimit = res.stepsTaken >= TASK_MAX_STEPS;
       const contract = task.publishes ? extractContract(res.finalMessage, task.publishes) : undefined;
+      const status = taskStatus({ interrupted: res.interrupted, hitLimit, unresolvedFailure: res.unresolvedFailure });
       return {
-        status: res.interrupted ? "interrupted" : hitLimit ? "incomplete" : "done",
-        summary: res.finalMessage.slice(0, 1500),
+        status,
+        // A task that ends on a failed command says so, so the report and the dependents' prompts are not misleading.
+        summary: (status === "failed" ? "UNRESOLVED FAILURE (the last command still fails). " : "") + res.finalMessage.slice(0, 1500),
         filesWritten: res.filesWritten,
         commandsRun: res.commandsRun,
         ...(contract ? { contract } : {}),
@@ -235,16 +254,41 @@ export function makeTaskRunner(deps: TaskRunnerDeps): TaskRunner {
   };
 }
 
+/**
+ * How a finished task counts. Only a clean finish is "done": a task whose last command still fails is "failed", so the
+ * orchestra skips whatever depends on it instead of building on a red build or test.
+ */
+export function taskStatus(r: { interrupted?: boolean; hitLimit: boolean; unresolvedFailure?: boolean }): "done" | "incomplete" | "failed" | "interrupted" {
+  if (r.interrupted) return "interrupted";
+  if (r.unresolvedFailure) return "failed";
+  if (r.hitLimit) return "incomplete";
+  return "done";
+}
+
 /** Everything team mode needs to run engineer tasks side by side: runner, fresh locks and blackboard, concurrency. */
 export function makeParallelOptions(deps: { llm: LLMProvider; workspaceRoot: string; mcp?: McpManager }): ParallelOptions {
   const locks = new WorkspaceLocks(deps.workspaceRoot);
   const board = new Blackboard();
   const concurrency = llmConcurrencyFromEnv();
+  // One controller per team run: beginRun() before the orchestra starts, cancel() from the Ctrl+C handler.
+  let controller: AbortController | undefined;
   return {
     runner: makeTaskRunner({ ...deps, locks, gate: new Semaphore(concurrency) }),
     locks,
     board,
     concurrency,
+    beginRun: () => {
+      controller = new AbortController();
+      return controller.signal;
+    },
+    endRun: () => {
+      controller = undefined;
+    },
+    cancel: () => {
+      if (!controller || controller.signal.aborted) return false;
+      controller.abort();
+      return true;
+    },
   };
 }
 

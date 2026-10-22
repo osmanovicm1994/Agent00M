@@ -17,6 +17,7 @@ Reference for every agent the local worker model can become, the knowledge each 
 | `qa` | QA Automation Agent | Appium (C#/NUnit), Playwright, page objects, flaky tests | - | tool-execution, **reasoning-core**, mcp-protocols, appium-standards, appium-csharp, playwright-standards |
 | `debug` | Debugging & Problem-Solving Agent | A command/build/server/test fails: reproduce, rank hypotheses, root-cause fix, re-run | `thinkingBudget: 14`, `autoDiagnostics`, `verifyFixes`; knowledge capped at 10000 chars | debugging-playbook, tool-execution, root-cause-debugging |
 | `research` | Research & Web Discovery Agent | Answers from live web sources (docs, versions, errors), cites URLs | `thinkingBudget: 3` | tool-execution |
+| `infra` | Infrastructure & Build Agent | Project skeleton and platform commands: npm/pnpm, prisma migrate/generate, docker compose, xcodegen, pod install, xcodebuild, gradlew, flutter, cargo, go. Looks at what exists, runs the real command in the folder that owns the manifest, proves each step by exit code, writes no feature code. No routing keywords yet: reached through team mode, `-a infra` or `/use infra` | `thinkingBudget: 8`, `autoDiagnostics`, `verifyFixes`; knowledge capped at 14000 chars | tool-execution, 12-fullstack/00-build-protocol, 09-scaffolding, 04-prisma-drizzle, 07-docker-deploy, 03-mobile/ios-build-debug, android-build-debug |
 | `safety` | Safety Reviewer | Read-only review at the end of team mode. NOT in `AGENTS`: not routable, not lockable. Defined in `src/team/roles.ts` | `readOnly`, `autoDiagnostics`, `thinkingBudget: 2` | edge-case-analysis (appended to its prompt) |
 
 `reasoning-core` is `08-logic/00-reasoning-core.md`: a compact (1.4 KB) version of the logic standards (restate the goal, blast radius, edge-case checklist, failure rules, "say what you did not verify"). It sits second so it survives a small `AGENT_SKILL_CHARS` budget.
@@ -95,9 +96,9 @@ The id stays `design` because the router, the team roles, `MOBILE_ROLE` and the 
 
 | Role id | Title | How it runs |
 | --- | --- | --- |
-| `pm` | Project Manager | One plain model call (Gemini when the research stage is on), JSON plan with at most 6 tasks, with `PM_KNOWLEDGE` appended. Also writes the delivery report from recorded facts |
+| `pm` | Project Manager | One plain model call (Gemini when the research stage is on), JSON plan with at most 6 tasks, with `PM_KNOWLEDGE` appended. It plans from `<project_tree>` (three levels, names only, from `team/tree.ts`: existing paths are read and changed in place, other paths are new files) and names the exact platform command and folder for `infra` tasks. Also writes the delivery report from recorded facts |
 | `ux` | UX Designer | One plain model call, writes a build spec (screens, components, states, layout, copy, accessibility). No code |
-| `design`, `dev`, `api`, `db`, `debug`, `qa` | Engineers | Run through the Executor with the matching agent, each with a fresh small context; each task also gets task-specific standards from its own title and instructions |
+| `infra`, `design`, `dev`, `api`, `db`, `debug`, `qa` | Engineers | Run through the Executor with the matching agent, each with a fresh small context; each task also gets task-specific standards from its own title and instructions |
 | `safety` | Safety Reviewer | Executor with `safetyAgent` (`readOnly`), ends with `VERDICT: PASS|FAIL`; one fix round on FAIL |
 
 `ROLE_TITLES` labels `design` as "Frontend/UI Engineer". The PM prompt describes `design` as the engineer who "builds components, styling and layout in the existing design system"; the UX role comes before it for any UI work.

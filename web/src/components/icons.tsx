@@ -20,6 +20,14 @@ export const AgentsIcon = () => (
   </svg>
 );
 
+export const MoreIcon = () => (
+  <svg {...common}>
+    <circle cx="5" cy="12" r="1.5" />
+    <circle cx="12" cy="12" r="1.5" />
+    <circle cx="19" cy="12" r="1.5" />
+  </svg>
+);
+
 export const LiveIcon = () => (
   <svg {...common}>
     <polyline points="3,12 8,12 11,5 14,19 17,12 21,12" />

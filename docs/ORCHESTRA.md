@@ -18,7 +18,8 @@ Status: modules, executor hooks, CLI flags and team-mode wiring are written, wit
 | File | Role |
 | --- | --- |
 | `error-classifier.ts` | `classifyFailure(command, output, exitCode)` → `{kind, key, immediate, fixable, evidence, hint}` or `null`. Pure. Immediate: npm E404, ETARGET, ERESOLVE, Prisma schema/migration/client, module not found. Escalated (after 2 repeats): tests, build, TypeScript. Not fixable by a patch: network, permission, port in use, missing tool. |
-| `debug-interceptor.ts` | `DebugInterceptor.handle(event)` runs after each shell command. If the failure is fixable, it calls the injected `debug()` with the exact output, optionally `rerun()`s the command, and returns a note appended to the tool result. Single-flight per failure key, budget `AGENT_AUTO_DEBUG_MAX` (default 3), 1 run per distinct failure, never throws. |
+| `debug-interceptor.ts` | `DebugInterceptor.handle(event)` runs after each shell command. If the failure is fixable, it calls the injected `debug()` with the exact output, optionally `rerun()`s the command, and returns a note appended to the tool result. Single-flight per failure key, at most `AGENT_AUTO_DEBUG_ATTEMPTS` (default 5) attempts per command, then it stops and hands over a triage report; `AGENT_AUTO_DEBUG_MAX` (default 10) debug runs per session; never throws. |
+| `triage.ts` | `describeProject(root)` (stack and folders, names only) and `buildTriageReport(input)`: the "🚨 Project Failure & Triage Report" with the four sections (System Telemetry & Architecture, Execution Log & Blockers, Root Cause Analysis, Required User Intervention). Pure, no model calls. |
 | `workspace-locks.ts` | Path-scope write leases. `tryAcquire(owner, scopes)`, `canWrite(owner, path)`. Root manifests and lockfiles are shared and refused for parallel agents. |
 | `blackboard.ts` | Append-only event log plus versioned contracts. `digestFor(agent)` returns only what the others did since the last call. |
 | `llm-gate.ts` | `Semaphore` and `gateProvider(provider, sem)`: limits concurrent `chat()` calls. |
@@ -52,8 +53,9 @@ scheduler: ready tasks (deps done, scope lease free, < concurrency)
 2. The executor awaits `commandInterceptor`. The agent is paused because its tool call has not returned.
 3. `classifyFailure` says `npm-404`, immediate, fixable. The interceptor calls the Debug Agent (a nested `Executor.run("debug", ...)`) with the command, the tail of the exact output and the hint.
 4. The Debug Agent edits `package.json` (version/name), as any agent would, through the same write guard.
-5. The interceptor re-runs the command. Exit 0 → note "FIXED and verified". Otherwise the new output is returned.
+5. The interceptor re-runs the command. Exit 0 → note "FIXED and verified". Otherwise the new output is returned, and the attempt is counted for this command.
 6. The note is appended to the original tool result; the primary agent continues with it.
+7. **The 5-try gate.** When the count for the same command reaches `AGENT_AUTO_DEBUG_ATTEMPTS` (default 5) and it still fails, there is no sixth attempt: the interceptor builds the triage report (`triage.ts`), `wire.ts` passes it on as `InterceptResult.halt`, and the executor ends the run at once with it as the final message (`unresolvedFailure: true`, so a team run does not report "done"). The report names the failing command, the exact error, every attempt and at most two direct questions for the user.
 
 Safety: the nested run uses the same approval rules (`escapesWorkspace`, `isDangerousCommand`), so it cannot run risky commands unattended; the budget stops loops; Prisma notes tell it never to reset a database without the user.
 
@@ -90,6 +92,7 @@ Auto-debug needs auto-write and auto-run, because a debug run that stops to ask 
 
 ### Known limits
 
+- The attempt count is per command text (whitespace-normalised). A different command that fails for the same reason has its own count, and `AGENT_AUTO_DEBUG_MAX` caps the session as a whole.
 - The debug run is a nested, sequential `Executor.run` of the Debug Agent with at most `AGENT_AUTO_DEBUG_STEPS` (25) steps. It uses the same model and the same knowledge as everything else, so it fixes what the agent could fix with a clear error message in front of it, not gaps in what the model knows (see the Prisma 7 example in `04-prisma-drizzle.md`).
 - Parallel tasks are limited to `AGENT_TASK_MAX_STEPS` (60) steps each and are reported as incomplete when they hit it.
 - The root `package.json` and lockfiles are shared files: parallel tasks cannot edit them. Refused writes are listed after the run and in the delivery report.

@@ -12,12 +12,13 @@ struct AgentMustafaApp: App {
                 .preferredColorScheme(.dark)
                 .tint(Theme.teal)
                 .onAppear {
-                    client.askNotificationPermission()
+                    client.setupNotifications()
                     // Reconnect with the saved address (Keychain), so the app opens straight into the dashboard.
                     if let saved = Keychain.load() { client.connect(pasted: saved) }
                 }
                 .onChange(of: scenePhase) { _, phase in
                     client.appActive = (phase == .active)
+                    if phase == .active { client.refreshNotificationStatus() }
                     if phase == .active, let saved = Keychain.load(), !client.connected { client.connect(pasted: saved) }
                 }
         }

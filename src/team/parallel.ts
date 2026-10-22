@@ -74,9 +74,12 @@ export function planToOrchTasks(plan: PmPlan, uxSpec = ""): ParallelPlan {
     deps.set(e.id, set);
   }
 
-  // Default order the PM prompt already asks for: db before api, everything before qa.
+  // Default order the PM prompt already asks for: infra (skeleton, installs) first, db before api, everything before qa.
   for (const e of engineers) {
     const set = deps.get(e.id)!;
+    if (e.t.role !== "infra") {
+      for (const o of engineers) if (o.t.role === "infra" && o.i < e.i) set.add(o.id);
+    }
     if (e.t.role === "api") {
       for (const o of engineers) if (o.t.role === "db" && o.i < e.i) set.add(o.id);
     }

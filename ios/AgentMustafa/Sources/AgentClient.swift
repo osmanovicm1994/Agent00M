@@ -28,10 +28,25 @@ final class AgentClient {
     var files: FileTree?
     var notice: String?
     var history: [RunRecord] = []
+    // The prompting tutorial (docs/PROMPTING.md), fetched from the agent on demand.
+    var guide: String?
 
     // "Only me": every prompt goes to this agent. Kept on the phone.
     var pinned: String? = UserDefaults.standard.string(forKey: "pinnedAgent") {
         didSet { UserDefaults.standard.set(pinned, forKey: "pinnedAgent") }
+    }
+
+    // Notifications (kept on the phone). The agent never sends content for them: the texts below are fixed.
+    var notifyApprovals: Bool = UserDefaults.standard.object(forKey: "notifyApprovals") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(notifyApprovals, forKey: "notifyApprovals") }
+    }
+    var notifyResults: Bool = UserDefaults.standard.object(forKey: "notifyResults") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(notifyResults, forKey: "notifyResults") }
+    }
+    // What iOS currently allows for this app (the user can change it in iOS Settings at any time).
+    var notificationStatus: UNAuthorizationStatus = .notDetermined
+    var notificationsAllowed: Bool {
+        notificationStatus == .authorized || notificationStatus == .provisional || notificationStatus == .ephemeral
     }
 
     private var socket: URLSessionWebSocketTask?
@@ -120,6 +135,7 @@ final class AgentClient {
 
     func answerApproval(_ approved: Bool) { send(["kind": "answer_approval", "approved": approved]) }
     func requestFiles() { send(["kind": "list_files"]) }
+    func requestGuide() { send(["kind": "get_guide"]) }
     func stopCommand() { send(["kind": "stop_command"]) }
     func setTeam(_ on: Bool) { send(["kind": "set_team", "on": on]) }
     // key: team, parallel, autoWrite, autoRun, autoDebug, research (Bool) or planner (auto | always | off).
@@ -148,6 +164,7 @@ final class AgentClient {
                 FileEntry(path: $0.str("path"), isDir: $0.str("type") == "dir", size: $0["size"] as? Int)
             }
             files = FileTree(root: msg.str("root"), entries: entries, truncated: msg.bool("truncated"))
+        case "guide": guide = msg.str("markdown")
         case "notice": notice = msg.str("text")
         default: break
         }
@@ -229,7 +246,10 @@ final class AgentClient {
             }
         case "approval_requested":
             approval = Approval(message: p.str("message"), viaDashboard: p.str("via") == "dashboard", detail: p.optStr("detail"))
-            if !replay && !appActive && p.str("via") == "dashboard" { notifyApproval(p.str("message")) }
+            // Generic text on purpose: the approval message can contain a file path or a command.
+            if !replay && !appActive && notifyApprovals && p.str("via") == "dashboard" {
+                notify(id: "approval", title: "Agent needs approval", body: "The agent is waiting for you to approve an action. Open the app.", urgent: true)
+            }
         case "approval_resolved":
             approval = nil
         case "artifact_generated":
@@ -240,11 +260,17 @@ final class AgentClient {
             run?.filesWritten = p.strings("filesWritten"); run?.commandsRun = p.strings("commandsRun")
             push(FeedItem(id: seq, ts: ts, agent: agent, kind: .final, title: "Agent", body: p.str("finalMessage")))
             archive(summary: p.str("finalMessage"))
+            if !replay && !appActive && notifyResults {
+                notify(id: "result", title: "Agent finished", body: "The run is complete. Open the app to read the result.", urgent: false)
+            }
         case "run_failed":
             llmWaiting = false; approval = nil; activeAgent = nil
             run?.running = false; run?.failed = true; run?.endedAt = ts
             push(FeedItem(id: seq, ts: ts, agent: agent, kind: .error, title: "Error", body: p.str("error")))
             archive(summary: p.str("error"))
+            if !replay && !appActive && notifyResults {
+                notify(id: "result", title: "Agent run failed", body: "The run stopped with an error. Open the app.", urgent: false)
+            }
         default: break
         }
     }
@@ -266,17 +292,41 @@ final class AgentClient {
     // iOS suspends the socket shortly after the app leaves the screen, so this only fires in that short window.
     // For a notification that always arrives, set AGENT_NOTIFY_URL on the agent (ntfy), see docs/REMOTE.md.
 
-    func askNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    // Call at launch: reads what iOS allows and, when notifications are wanted but never asked about, asks once.
+    func setupNotifications() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor in
+                guard let self else { return }
+                self.notificationStatus = status
+                if status == .notDetermined && (self.notifyApprovals || self.notifyResults) { self.requestNotifications() }
+            }
+        }
     }
 
-    private func notifyApproval(_ message: String) {
+    func refreshNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor in self?.notificationStatus = status }
+        }
+    }
+
+    // Shows the iOS permission prompt (only appears while the status is "not determined").
+    func requestNotifications() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+            Task { @MainActor in self?.refreshNotificationStatus() }
+        }
+    }
+
+    // The same identifier replaces an earlier notification of that kind instead of stacking them.
+    private func notify(id: String, title: String, body: String, urgent: Bool) {
+        guard notificationsAllowed else { return }
         let content = UNMutableNotificationContent()
-        content.title = "Agent needs approval"
-        content.body = message
+        content.title = title
+        content.body = body
         content.sound = .default
-        content.interruptionLevel = .timeSensitive
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "approval", content: content, trigger: nil))
+        if urgent { content.interruptionLevel = .timeSensitive }
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
     }
 }
 

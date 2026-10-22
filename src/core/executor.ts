@@ -3,7 +3,7 @@ import * as path from "path";
 import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from "../llm/types";
 import type { AgentDefinition } from "../agents/definitions";
 import { detectStackKnowledge, loadKnowledge, loadProjectContext } from "../agents/helpers";
-import { FsTools, fsToolSchemas } from "../tools/fs.tool";
+import { FsTools, fsToolSchemas, isSecretPath as isSecretFile } from "../tools/fs.tool";
 import { ShellTool, shellToolSchema, clampTimeoutMs, condenseOutput } from "../tools/shell.tool";
 import { SearchTool, searchToolSchemas } from "../tools/search.tool";
 import type { McpManager } from "../mcp/client";
@@ -236,10 +236,9 @@ const DUPLICATE_NAME_EXEMPT = /^(index\.\w+|readme\.md|claude\.md|skill\.md|pack
 // Secret-bearing env files. The agent may read .env.example but never real
 // secrets: file contents are sent to the model (possibly a cloud endpoint) and
 // stored in the response cache.
+// The rule itself lives in tools/fs.tool.ts so FsTools can also apply it to the REAL target of a symlink.
 function isSecretPath(p: string): boolean {
-  const name = basename(p).toLowerCase();
-  if (!name.startsWith(".env")) return false;
-  return !/\.(example|sample|template)$/.test(name);
+  return isSecretFile(p);
 }
 
 function ensureTrailingNewline(s: string): string {
@@ -328,6 +327,9 @@ export interface ExecutorResult {
   commandsRun: string[];
   // The user pressed Ctrl+C during a command; the team orchestrator stops instead of moving on.
   interrupted?: boolean;
+  // The last command that ran failed and nothing fixed it before the run ended. A parallel task with this flag is
+  // not "done": its dependents must not start on top of a red build or test.
+  unresolvedFailure?: boolean;
 }
 
 // Per-run bookkeeping used to catch a model's bad behavior (guessing paths,
@@ -357,6 +359,12 @@ interface SessionState {
   runsSinceWrite: number;
   // The latest command exited non-zero and nothing was written since.
   lastRunFailed: boolean;
+  // Set when auto-debug used up its attempts: the run ends with this report (see InterceptResult.halt).
+  haltMessage?: string;
+  // What the terminal prints when it ends the run (default: the auto-debug wording).
+  haltLabel?: string;
+  // How many times a review role tried a command it may not run.
+  readOnlyRefusals: number;
   failNudged: boolean;
   // Identical failures seen in this run (see run-feedback.ts).
   repeats: RepeatTracker;
@@ -394,6 +402,7 @@ function newSessionState(): SessionState {
     planUsed: false,
     planNudged: false,
     readOnly: false,
+    readOnlyRefusals: 0,
     interrupted: false,
     agentId: "agent",
   };
@@ -707,6 +716,16 @@ When you are done and have no more actions to take, reply normally with a final 
 
     while (steps < this.maxSteps) {
       steps++;
+      // Cancelled from outside (Ctrl+C on a parallel team run): stop before spending another model call.
+      if (this.hooks.cancelled?.()) {
+        return {
+          finalMessage: "Stopped by the user (Ctrl+C).",
+          stepsTaken: steps - 1,
+          filesWritten: state.filesWritten,
+          commandsRun: state.commandsRun,
+          interrupted: true,
+        };
+      }
       this.compactHistory(messages);
       // Updates from the other agents (parallel runs only): what they wrote or published since the last step.
       const teamUpdate = this.hooks.teamUpdates?.(state.agentId);
@@ -872,6 +891,7 @@ When you are done and have no more actions to take, reply normally with a final 
           filesWritten: state.filesWritten,
           commandsRun: state.commandsRun,
           interrupted: state.interrupted,
+          unresolvedFailure: state.lastRunFailed && !state.readOnly,
         };
       }
 
@@ -906,6 +926,19 @@ When you are done and have no more actions to take, reply normally with a final 
             : "";
         messages.push({ role: "tool", content: result + notice, toolCallId: calls[i].id });
 
+        // The automatic debug attempts are used up: stop here with the triage report. No further attempt, no 6th run.
+        if (state.haltMessage) {
+          console.log(pc.red(`\n${state.haltLabel ?? "🚨 Automatic debugging gave up; stopping with a triage report."}`));
+          console.log(pc.bold("\nAgent:"), state.haltMessage);
+          return {
+            finalMessage: state.haltMessage,
+            stepsTaken: steps,
+            filesWritten: state.filesWritten,
+            commandsRun: state.commandsRun,
+            unresolvedFailure: true,
+          };
+        }
+
         if (state.interrupted) {
           console.log(pc.yellow("\n⏹ Stopped: you interrupted the running command. Tell the agent how to continue."));
           return {
@@ -925,6 +958,7 @@ When you are done and have no more actions to take, reply normally with a final 
       filesWritten: state.filesWritten,
       commandsRun: state.commandsRun,
       interrupted: state.interrupted,
+      unresolvedFailure: state.lastRunFailed && !state.readOnly,
     };
   }
 
@@ -1150,7 +1184,19 @@ When you are done and have no more actions to take, reply normally with a final 
 
         const diagnostic = state.autoDiagnostics && isSafeDiagnostic(command);
         if (state.readOnly && !diagnostic) {
-          return "TOOL ERROR: this is a review role: only read-only commands (git status, git diff, git log, ls, ...) are allowed. Do not try to change anything; report what you find.";
+          state.readOnlyRefusals++;
+          const base = "TOOL ERROR: this is a review role: only read-only commands (git status, git diff, git log, ls, ...) are allowed. echo, cat, builds, installs and servers are refused. Do not try to change or run anything; report what you find.";
+          if (state.readOnlyRefusals >= 4) {
+            // The reviewer is looping on refused commands: end it now instead of burning every step it has.
+            state.haltLabel = "\u{1F6D1} The reviewer kept trying commands a review role may not run; ending its review.";
+            state.haltMessage =
+              "VERDICT: UNKNOWN\nBLOCKERS:\n- none established\nWARNINGS:\n- The reviewer kept trying commands a read-only role may not run and never finished its review. Treat these changes as UNREVIEWED.\nCHECKED: incomplete";
+            return base;
+          }
+          if (state.readOnlyRefusals >= 2) {
+            return `${base} You have now been refused ${state.readOnlyRefusals} times. STOP running commands. Write your final answer NOW from what you have already read, ending with VERDICT: PASS or VERDICT: FAIL in the required format.`;
+          }
+          return base;
         }
         const autoRun = !diagnostic && this.autoRunEnabled() && !isDangerousCommand(command) && !escapesWorkspace(command, this.workspaceRoot);
         if (autoRun) {
@@ -1233,10 +1279,11 @@ When you are done and have no more actions to take, reply normally with a final 
         }
 
         // Reactive debugging: the agent is paused here until the interceptor (Debug Agent) is done.
-        let autoDebug: { note: string; verified: boolean } | null = null;
+        let autoDebug: { note: string; verified: boolean; halt?: string } | null = null;
         if (failed && this.hooks.commandInterceptor) {
           autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, command, output: result.output, exitCode: result.exitCode });
           if (autoDebug?.verified) state.lastRunFailed = false;
+          if (autoDebug?.halt) state.haltMessage = autoDebug.halt;
         }
 
         return JSON.stringify({

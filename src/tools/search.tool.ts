@@ -57,6 +57,8 @@ export class SearchTool {
       for (const entry of entries) {
         if (results.length >= maxResults) return;
         if (DEFAULT_IGNORE.has(entry.name)) continue;
+        // Never follow symlinks: they can point outside the project.
+        if (entry.isSymbolicLink()) continue;
 
         const fullPath = path.join(dir, entry.name);
 
@@ -101,6 +103,8 @@ export class SearchTool {
       for (const entry of entries) {
         if (results.length >= maxResults) return;
         if (DEFAULT_IGNORE.has(entry.name)) continue;
+        // Never follow symlinks: they can point outside the project (or at a real .env).
+        if (entry.isSymbolicLink()) continue;
 
         const fullPath = path.join(dir, entry.name);
 

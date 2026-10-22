@@ -13,6 +13,55 @@ struct AgentSettings {
     var researchAvailable = false
 }
 
+// Notifications of this phone. They are the phone's own setting (not an agent switch), so they work even in read-only mode.
+// iOS stops the app's connection a short time after you leave it, so alerts arrive in that window; for alerts that
+// always arrive, set AGENT_NOTIFY_URL on the agent (ntfy). The texts are fixed and never contain commands or paths.
+struct NotificationsCard: View {
+    @Environment(AgentClient.self) private var client
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Notifications").font(.headline)
+
+            if client.notificationStatus == .denied {
+                Text("Notifications are blocked for this app in iOS. Allow them in Settings, then come back.")
+                    .font(.footnote).foregroundStyle(Theme.amber)
+                Button("Open iOS Settings") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                }
+                .buttonStyle(.bordered).frame(minHeight: 44)
+            } else if !client.notificationsAllowed {
+                Text("Allow notifications to be told when the agent needs you.").font(.footnote).foregroundStyle(Theme.muted)
+                Button("Allow notifications") { client.requestNotifications() }
+                    .buttonStyle(.borderedProminent).foregroundStyle(.black).frame(minHeight: 44)
+            }
+
+            Toggle(isOn: Binding(get: { client.notifyApprovals }, set: { client.notifyApprovals = $0 })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Needs my approval").font(.subheadline.weight(.medium))
+                    Text("When the agent waits for a yes or no.").font(.footnote).foregroundStyle(Theme.muted)
+                }
+            }
+            .disabled(!client.notificationsAllowed)
+            Divider().overlay(Theme.line)
+            Toggle(isOn: Binding(get: { client.notifyResults }, set: { client.notifyResults = $0 })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Finished or failed").font(.subheadline.weight(.medium))
+                    Text("When a run ends.").font(.footnote).foregroundStyle(Theme.muted)
+                }
+            }
+            .disabled(!client.notificationsAllowed)
+
+            Text("iOS pauses the app soon after you leave it, so alerts arrive in that short window. For alerts that always arrive, set AGENT_NOTIFY_URL on the agent (ntfy).")
+                .font(.caption).foregroundStyle(Theme.muted)
+        }
+        .padding(14)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.line))
+    }
+}
+
 // Every switch the terminal has. Changes go to the agent; the screen updates when the agent confirms,
 // so the phone, the web dashboard and the terminal always agree.
 struct SettingsCard: View {

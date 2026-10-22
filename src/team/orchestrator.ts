@@ -16,7 +16,6 @@
 // its scope. A plan that cannot be run safely in parallel (no scope, overlapping scopes, a cycle) runs one after
 // another exactly as before.
 
-import * as fs from "fs";
 import pc from "picocolors";
 import prompts from "prompts";
 import type { LLMProvider } from "../llm/types";
@@ -27,6 +26,8 @@ import { OrchestraMaster, type TaskRunner } from "../orchestra/orchestra-master"
 import type { WorkspaceLocks } from "../orchestra/workspace-locks";
 import type { Blackboard } from "../orchestra/blackboard";
 import { planToOrchTasks } from "./parallel";
+import { projectTree } from "./tree";
+import { NO_FILES_NUDGE, applyEvidence, isComplete, lacksEvidence } from "./evidence";
 import {
   ASSIGNABLE_ROLES,
   PM_KNOWLEDGE,
@@ -58,6 +59,8 @@ export interface TeamResult {
   safety: SafetyVerdict;
   safetyNotes: string;
   interrupted: boolean;
+  /** Every task done (builders wrote files), not stopped, and the safety review passed or had nothing to review. */
+  complete: boolean;
   report: string;
 }
 
@@ -68,6 +71,12 @@ export interface ParallelOptions {
   /** How many tasks may run at once. Default 2. */
   concurrency?: number;
   board?: Blackboard;
+  /** Called when the orchestra starts; the returned signal aborts the whole parallel run (Ctrl+C). */
+  beginRun?(): AbortSignal;
+  /** Called when the orchestra has finished, whatever the outcome. */
+  endRun?(): void;
+  /** Aborts the parallel run in progress. Returns false when none is running. Used by the Ctrl+C handler. */
+  cancel?(): boolean;
 }
 
 export interface TeamOptions {
@@ -114,19 +123,8 @@ async function lead(opts: TeamOptions, system: string, user: string, maxTokens: 
   return ask(opts.llm, system, user, maxTokens);
 }
 
-function projectListing(root: string): string {
-  try {
-    const names = fs
-      .readdirSync(root, { withFileTypes: true })
-      .filter((d) => !["node_modules", ".git", "dist", "build", ".agent_cache", "Pods", "DerivedData"].includes(d.name))
-      .filter((d) => !d.name.startsWith(".env"))
-      .slice(0, 60)
-      .map((d) => (d.isDirectory() ? `${d.name}/` : d.name));
-    return names.join("\n") || "(empty)";
-  } catch {
-    return "(unreadable)";
-  }
-}
+// The PM and the UX designer plan from the real tree of the project (three levels), so they know what exists.
+const projectListing = (root: string): string => projectTree(root);
 
 function parsePlan(raw: string): PmPlan {
   const start = raw.indexOf("{");
@@ -137,7 +135,7 @@ function parsePlan(raw: string): PmPlan {
 
 async function planWithPm(opts: TeamOptions): Promise<PmPlan> {
   const user =
-    `<request>\n${opts.task}\n</request>\n\n<project_files_top_level>\n${projectListing(opts.workspaceRoot)}\n</project_files_top_level>` +
+    `<request>\n${opts.task}\n</request>\n\n<project_tree>\n${projectListing(opts.workspaceRoot)}\n</project_tree>` +
     (opts.context ? `\n\n<extra_context>\n${clip(opts.context, 5000)}\n</extra_context>` : "");
   const system = PM_SYSTEM + (opts.parallel ? PM_PARALLEL_ADDENDUM : "") + PM_KNOWLEDGE;
 
@@ -186,6 +184,10 @@ function printPlan(plan: PmPlan, parallel: boolean): void {
   bus.emit("log", { text: lines.join("\n"), level: "plan" });
 }
 
+// The same discipline the Executor enforces with its write gates, stated up front so the model does not hit them blindly.
+const FILE_RULE =
+  "File rule: before you write a file, check whether it exists (list_dir, find_files). If it exists, read it completely and change it in place; do not create a second copy or a new file with the same purpose. If it does not exist, make sure its folder exists and was looked at first.";
+
 function assignment(plan: PmPlan, index: number, notes: string[], uxSpec: string, extra?: string): string {
   const t = plan.tasks[index];
   const parts = [
@@ -196,6 +198,7 @@ function assignment(plan: PmPlan, index: number, notes: string[], uxSpec: string
     t.acceptance.length ? `Acceptance criteria (you are done only when these hold, and you have checked them):\n${t.acceptance.map((a) => `- ${a}`).join("\n")}` : "",
     plan.risks.length ? `Risks to avoid: ${plan.risks.join("; ")}` : "",
     plan.assumptions.length ? `Assumptions made by the planner (verify them against the real files): ${plan.assumptions.join("; ")}` : "",
+    FILE_RULE,
     notes.length ? `What the team has done so far:\n${notes.join("\n")}` : "",
     uxSpec ? `## UX SPEC (build to this)\n${clip(uxSpec, 4500)}` : "",
     extra ? clip(extra, 5000) : "",
@@ -225,7 +228,7 @@ async function review(opts: TeamOptions, plan: PmPlan, files: string[], label: s
 
 function fallbackReport(r: Omit<TeamResult, "report">): string {
   const lines = [
-    `**Result:** ${r.interrupted ? "Stopped by you before finishing." : r.tasks.every((t) => t.status === "done") ? "All planned tasks finished." : "Some tasks did not finish."}`,
+    `**Result:** ${r.interrupted ? "Stopped by you before finishing." : r.complete ? "All planned tasks finished and the safety review passed." : "NOT complete: some tasks did not finish or the safety review did not pass."}`,
     `**What changed:** ${r.filesWritten.length ? r.filesWritten.map((f) => `\n- ${f}`).join("") : "no files were written"}`,
     `**Checked:** ${r.commandsRun.length ? `${r.commandsRun.length} command(s) run. ` : "no commands were run. "}Safety review: ${r.safety}.`,
     `**Open items:** ${r.tasks.filter((t) => t.status !== "done").map((t) => t.title).join("; ") || "none"}`,
@@ -285,7 +288,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
       try {
         const user =
           `<goal>${plan.goal}</goal>\n<task>${t.title}\n${t.instructions}</task>\n` +
-          `<project_files_top_level>\n${projectListing(opts.workspaceRoot)}\n</project_files_top_level>` +
+          `<project_tree>\n${projectListing(opts.workspaceRoot)}\n</project_tree>` +
           (opts.context ? `\n\n<reference_and_context>\n${clip(opts.context, 6000)}\n</reference_and_context>` : "");
         uxSpec = await lead(opts, UX_SYSTEM, user, 3000);
         console.log(pc.dim(clip(uxSpec, 1200)));
@@ -306,11 +309,24 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
 
     if (t.role !== "qa") lastEngineer = t.role;
-    const res = await opts.executor.run(agent, `${t.title}${t.instructions ? `\n${t.instructions}` : ""}`, assignment(plan, i, notes, uxSpec, opts.context));
+    const taskText = `${t.title}${t.instructions ? `\n${t.instructions}` : ""}`;
+    let res = await opts.executor.run(agent, taskText, assignment(plan, i, notes, uxSpec, opts.context));
+    // A builder that ended without writing a file delivered nothing: one more attempt, stated plainly.
+    if (!res.interrupted && !isStopped(res) && lacksEvidence(t.role, res.filesWritten)) {
+      console.log(pc.yellow("⚠ This task wrote no files. One more attempt with a stricter instruction."));
+      const again = await opts.executor.run(agent, taskText, `${assignment(plan, i, notes, uxSpec, opts.context)}\n\n${NO_FILES_NUDGE}`);
+      res = {
+        ...again,
+        filesWritten: [...new Set([...res.filesWritten, ...again.filesWritten])],
+        commandsRun: [...res.commandsRun, ...again.commandsRun],
+      };
+    }
     res.filesWritten.forEach((f) => files.add(f));
     commands.push(...res.commandsRun);
 
-    const status: TaskStatus = res.interrupted ? "interrupted" : isStopped(res) ? "incomplete" : "done";
+    const rawStatus: TaskStatus = res.interrupted ? "interrupted" : isStopped(res) || res.unresolvedFailure ? "incomplete" : "done";
+    const status = applyEvidence(t.role, rawStatus, res.filesWritten);
+    if (status !== rawStatus) console.log(pc.yellow(`⚠ ${title}: no file was written, so this task is NOT counted as done.`));
     const summary = clip(res.finalMessage, MAX_SUMMARY);
     outcomes.push({ role: t.role, title: t.title, status, summary });
     notes.push(`- ${title} (${status}): ${t.title}. Files: ${res.filesWritten.join(", ") || "none"}. ${clip(res.finalMessage, 300)}`);
@@ -330,21 +346,34 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     } else {
       const concurrency = Math.max(1, opts.parallel.concurrency ?? 2);
       console.log(pc.bold(`\n🎼 Orchestra: ${graph.tasks.length} tasks, up to ${concurrency} at the same time`));
+      const signal = opts.parallel.beginRun?.();
       const master = new OrchestraMaster({
         runner: opts.parallel.runner,
         locks: opts.parallel.locks,
         board: opts.parallel.board,
         concurrency,
+        signal,
         log: (line) => console.log(pc.dim(line)),
       });
-      const res = await master.run(graph.tasks);
+      let res: Awaited<ReturnType<OrchestraMaster["run"]>>;
+      try {
+        res = await master.run(graph.tasks);
+      } finally {
+        opts.parallel.endRun?.();
+      }
+      // Ctrl+C stopped the run: no safety review or fix round after it, even if no task reported itself interrupted.
+      if (signal?.aborted) interrupted = true;
       for (const id of res.order) {
         const idx = graph.indexOf.get(id);
         if (idx === undefined) continue;
         handled.add(idx);
         const t = plan.tasks[idx];
         const o = res.outcomes[id];
-        const status: TaskStatus = o.status === "done" ? "done" : o.status === "interrupted" ? "interrupted" : o.status === "skipped" ? "skipped" : "incomplete";
+        const status = applyEvidence(
+          t.role,
+          o.status === "done" ? "done" : o.status === "interrupted" ? "interrupted" : o.status === "skipped" ? "skipped" : "incomplete",
+          o.filesWritten,
+        );
         o.filesWritten.forEach((f) => files.add(f));
         commands.push(...o.commandsRun);
         outcomes.push({ role: t.role, title: t.title, status, summary: clip(o.summary, MAX_SUMMARY) });
@@ -400,6 +429,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
   }
 
+  const complete = isComplete({ statuses: outcomes.map((o) => o.status), interrupted, safety });
   const base: Omit<TeamResult, "report"> = {
     plan,
     tasks: outcomes,
@@ -408,6 +438,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     safety,
     safetyNotes,
     interrupted,
+    complete,
   };
 
   // Delivery report from the PM, based only on the recorded facts.
@@ -422,6 +453,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         safetyVerdict: safety,
         safetyNotes: clip(safetyNotes, 1500),
         stoppedByUser: interrupted,
+        overallComplete: complete,
         plannerRisks: plan.risks,
         ...(blockedWrites.length ? { writesRefusedOutsideScope: blockedWrites.slice(0, 10) } : {}),
       },

@@ -39,6 +39,10 @@ export const DANGEROUS_COMMAND_RES: RegExp[] = [
   /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/,
   /\b(npm|pnpm|yarn)\s+(publish|unpublish|login|adduser)\b/,
   /\b(npm|pnpm)\s+(i|install|add)\b.*\s(-g|--global)\b|\byarn\s+global\b/,
+  // Publishing or uploading from the other toolchains (same reason as npm publish): crates.io, pub.dev, CocoaPods, PyPI,
+  // RubyGems, NuGet, container registries, Gradle publish tasks, App Store / notarization uploads, global Go cache wipe.
+  /\b(cargo\s+(publish|login|yank)|flutter\s+pub\s+publish|pod\s+trunk\s+push|twine\s+upload|gem\s+push|docker\s+push|dotnet\s+nuget\s+push|go\s+clean\s+-\w*modcache|xcrun\s+(altool|notarytool))\b/,
+  /\bgradlew?\b.*\bpublish\w*/i,
   /\bdocker\s+(system\s+prune|rm|rmi|volume\s+(rm|prune)|compose\s+down\b.*\s-v)/,
   /\b(drop|truncate)\s+(database|table|schema)\b/i,
   /\bprisma\s+(migrate\s+reset|db\s+push\s+--force-reset)\b|\bmigrate:fresh\b|\bdb:drop\b|\bschema:drop\b/,

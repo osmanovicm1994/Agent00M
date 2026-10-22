@@ -24,6 +24,8 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // The Guide screen imports ../docs/PROMPTING.md (one source for the tutorial); that folder is next to web/.
+    fs: { allow: [".."] },
     host: lan ? true : remote ? "127.0.0.1" : undefined,
     // Explicit host list only (never `true`: that would allow DNS rebinding against the dev server).
     // Without a known host name, remote mode accepts any *.ts.net name; the token still protects control.

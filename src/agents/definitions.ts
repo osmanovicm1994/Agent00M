@@ -8,6 +8,7 @@ import { kbHarvesterAgent } from "./list/kb-harvester";
 import { qaAgent } from "./list/qa";
 import { debugAgent } from "./list/debug";
 import { researchAgent } from "./list/research";
+import { infraAgent } from "./list/infra";
 
 export interface AgentDefinition {
   id: string;
@@ -36,6 +37,7 @@ export const AGENTS: AgentDefinition[] = [
   qaAgent,
   debugAgent,
   researchAgent,
+  infraAgent,
 ];
 
 // 2. Helper to fetch them

@@ -5,6 +5,8 @@
 // chat() calls are in flight at once (default 1 for a local model), so parallel agents overlap their SHELL time
 // (installs, builds, tests) with each other's MODEL time, which is the real win, without flooding the model.
 
+import { boundedInt } from "./env-int";
+
 export class Semaphore {
   private waiting: Array<() => void> = [];
   private active = 0;
@@ -66,6 +68,5 @@ export function gateProvider<T extends { chat: (...args: never[]) => Promise<unk
 export const DEFAULT_LLM_CONCURRENCY = 2;
 
 export function llmConcurrencyFromEnv(env: NodeJS.ProcessEnv = process.env): number {
-  const n = Number(env.AGENT_LLM_CONCURRENCY);
-  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_LLM_CONCURRENCY;
+  return boundedInt(env.AGENT_LLM_CONCURRENCY, DEFAULT_LLM_CONCURRENCY, 1, 16);
 }

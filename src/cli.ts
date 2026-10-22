@@ -25,10 +25,20 @@ import { launchDashboard, stopDashboard } from "./ui-launcher";
 import { GeminiTriageClient, resolveModels } from "./gateway";
 import { ResearchPipeline, confirmPlan, confirmRequired, researchEnv, isGeneralRealtime, prefetchRealtime } from "./research";
 import { searchWeb, verifySearxng } from "./tools/web-search.tool";
-import { runTeam } from "./team/orchestrator";
+import { runTeam, type ParallelOptions } from "./team/orchestrator";
 import { describeImage, renderBriefForAgents, type DesignBrief } from "./vision/describe";
 
 dotenv.config();
+
+// The parallel team run in progress (if any), so Ctrl+C can stop all its workers, not only the running shell command.
+let activeParallel: ParallelOptions | undefined;
+
+// What the dashboard's Stop button does (same as Ctrl+C in the terminal): stop the running shell commands and, in a
+// parallel team run, tell every worker to stop before its next step. Returns how many things were stopped.
+function stopRunningWork(): number {
+  const team = activeParallel?.cancel?.() ?? false;
+  return interruptRunningCommands() + (team ? 1 : 0);
+}
 
 // Starts the MCP servers from mcp.config.json (e.g. sequential-thinking).
 // Never fatal: if a server can't start the agent simply runs without it.
@@ -215,7 +225,7 @@ program
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
   control.setWorkspace(workspaceRoot);
-  control.setInterruptHandler(() => interruptRunningCommands());
+  control.setInterruptHandler(stopRunningWork);
 
       const llm = makeProvider(opts.model);
       const mcp = await setupMcp(!opts.mcp);
@@ -223,8 +233,9 @@ program
 
       // Ctrl+C stops a running command; with nothing running it exits.
       process.on("SIGINT", () => {
-        if (interruptRunningCommands() > 0) {
-          console.log(pc.yellow("\n⏹ Stopping the running command."));
+        const stoppedTeam = activeParallel?.cancel?.() ?? false;
+        if (interruptRunningCommands() > 0 || stoppedTeam) {
+          console.log(pc.yellow(stoppedTeam ? "\n⏹ Stopping the parallel team (running commands stop now, agents stop before their next step)." : "\n⏹ Stopping the running command."));
           return;
         }
         mcp?.close();
@@ -282,7 +293,7 @@ program
           if (opts.team) {
             let parallel;
             if (opts.parallel) {
-              if (executor.isAutoWrite() && executor.isAutoRun()) parallel = makeParallelOptions({ llm, workspaceRoot, mcp });
+              if (executor.isAutoWrite() && executor.isAutoRun()) parallel = activeParallel = makeParallelOptions({ llm, workspaceRoot, mcp });
               else console.log(pc.yellow("⚠ --parallel needs auto mode (-y): parallel agents cannot ask for approval. Running the team one task at a time."));
             }
             const team = await runTeam({
@@ -302,6 +313,8 @@ program
                 stepsTaken: team.tasks.length,
                 filesWritten: team.filesWritten,
                 commandsRun: team.commandsRun,
+                interrupted: team.interrupted,
+                unresolvedFailure: !team.complete,
               };
             }
             console.log(pc.dim("Continuing with a single agent.\n"));
@@ -586,7 +599,7 @@ program
 
     console.log(pc.dim(`\n✅ Workspace locked to: ${workspaceRoot}`));
   control.setWorkspace(workspaceRoot);
-  control.setInterruptHandler(() => interruptRunningCommands());
+  control.setInterruptHandler(stopRunningWork);
 
     const llm = makeProvider(opts.model);
     console.log(pc.dim(`Model: ${describeModel(llm)}   (type /model to list or switch)`));
@@ -658,8 +671,15 @@ program
     };
     // Ctrl+C while a command runs stops that command only; when nothing runs it ends the session.
     const onCtrlC = () => {
-      if (interruptRunningCommands() > 0) {
-        console.log(pc.yellow("\n⏹ Stopping the running command (Ctrl+C again when idle exits)."));
+      const stoppedTeam = activeParallel?.cancel?.() ?? false;
+      if (interruptRunningCommands() > 0 || stoppedTeam) {
+        console.log(
+          pc.yellow(
+            stoppedTeam
+              ? "\n⏹ Stopping the parallel team (running commands stop now, agents stop before their next step; Ctrl+C again when idle exits)."
+              : "\n⏹ Stopping the running command (Ctrl+C again when idle exits).",
+          ),
+        );
         return;
       }
       shutdown();
@@ -733,7 +753,7 @@ program
           if (useTeam) {
             let parallel;
             if (parallelOn) {
-              if (executor.isAutoWrite() && executor.isAutoRun()) parallel = makeParallelOptions({ llm, workspaceRoot, mcp });
+              if (executor.isAutoWrite() && executor.isAutoRun()) parallel = activeParallel = makeParallelOptions({ llm, workspaceRoot, mcp });
               else console.log(pc.yellow("⚠ Parallel team needs auto-write and auto-run ON (parallel agents cannot ask for approval). Running the team one task at a time."));
             }
             const team = await runTeam({
@@ -754,6 +774,8 @@ program
                 stepsTaken: team.tasks.length,
                 filesWritten: team.filesWritten,
                 commandsRun: team.commandsRun,
+                interrupted: team.interrupted,
+                unresolvedFailure: !team.complete,
               };
             }
             console.log(pc.dim("Continuing with a single agent.\n"));
@@ -778,7 +800,11 @@ program
           return executor.run(resolvedAgent, task, combinedContext);
         });
 
-        console.log(pc.green(`\n✔ Task completed successfully (${result.stepsTaken} step(s) taken)`));
+        // Never claim success for a run that ended on a failing command, was stopped, or (team mode) left tasks or the
+        // safety review open. The report above says what is missing.
+        if (result.interrupted) console.log(pc.yellow(`\n⏹ Stopped before finishing (${result.stepsTaken} step(s) taken)`));
+        else if (result.unresolvedFailure) console.log(pc.yellow(`\n⚠ Finished with open items (${result.stepsTaken} step(s) taken). It is NOT verified as complete: read the report above.`));
+        else console.log(pc.green(`\n✔ Task finished (${result.stepsTaken} step(s) taken)`));
 
         if (result.filesWritten.length > 0) {
           console.log(pc.cyan("Files written this session:"));
