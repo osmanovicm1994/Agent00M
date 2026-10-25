@@ -174,7 +174,7 @@ interface KnowledgeRule {
 const NO_CODE_AGENTS = ["kb-harvester", "research"];
 
 /** Agents that build or review application code and therefore get the full-stack building-block standards. */
-const FULLSTACK_AGENTS = ["dev", "api", "db", "design", "qa", "logic"];
+const FULLSTACK_AGENTS = ["dev", "api", "db", "design", "qa", "logic", "infra"];
 
 const BULLET_LIST_RE = /(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*(?:\n\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*){2,}/;
 
@@ -273,14 +273,15 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
   {
     id: "fullstack-build",
     test: /\bfull[- ]?stack\b|from scratch|\bscaffold|\bbootstrap|\bmonorepo\b|production[- ]ready|\bnew (web )?(app|application|project)\b/i,
-    files: ["12-fullstack/00-build-protocol.md"],
+    // The roadmap (phases with gates, git, versioning) rides along with the build protocol: one rule, so the protocol stays first.
+    files: ["12-fullstack/00-build-protocol.md", "13-delivery/00-roadmap.md"],
     weight: 6,
     onlyFor: FULLSTACK_AGENTS,
   },
   {
     id: "scaffolding",
-    test: /\bscaffold|create-next-app|\bnest new\b|@nestjs\/cli|\bmonorepo\b|\bnew (web )?(app|application|project)\b/i,
-    files: ["12-fullstack/09-scaffolding.md"],
+    test: /\bscaffold|create-next-app|\bnest new\b|@nestjs\/cli|\bmonorepo\b|\bnew (web |full[- ]?stack )?(app|application|project)\b/i,
+    files: ["12-fullstack/09-scaffolding.md", "13-delivery/02-versions-2026.md"],
     weight: 6,
     onlyFor: FULLSTACK_AGENTS,
   },
@@ -329,7 +330,7 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
   {
     id: "docker-deploy",
     test: /\bdocker(file)?\b|docker[- ]compose|\bvps\b|\bdeploy(ment|ing)?\b|\bnginx\b|\bcaddy\b|reverse proxy|\bci\/cd\b/i,
-    files: ["12-fullstack/07-docker-deploy.md"],
+    files: ["12-fullstack/07-docker-deploy.md", "13-delivery/04-local-infra-ci.md"],
     weight: 3,
     onlyFor: FULLSTACK_AGENTS,
   },
@@ -376,6 +377,52 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     files: ["10-design/design-system-workflow.md"],
     weight: 5,
     onlyFor: ["design", "dev"],
+  },
+  // --- Delivery knowledge (13-delivery): exact, checked recipes and the project lifecycle. -------------------
+  {
+    id: "delivery-recipe",
+    // Specific on purpose: "login" or "session" alone must not pull a Next.js recipe into a mobile task.
+    test: /\bprisma\b|\bnext\.?js\b|create-next-app|react-hook-form|\bzod\b|\bnext-auth\b|\bauth\.js\b/i,
+    files: ["13-delivery/03-recipe-nextjs-prisma-auth.md"],
+    weight: 5,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "rbac-auth",
+    // Accounts with roles and per-user data. "ADMIN ... USER" in capitals is how a spec writes the two roles.
+    test: (t) => /\bnext-?auth\b|\bauth\.js\b|\brbac\b|role[- ]based|credentials provider|\bownerFilter\b|\bidor\b|per-user|owner(ship)? (check|filter|column)/i.test(t) || /\bADMIN\b[\s\S]{0,80}\bUSER\b/.test(t),
+    files: ["13-delivery/06-recipe-auth-rbac-nextauth.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "ui-pages",
+    test: /\bwizard\b|multi-step|login (page|form|screen)|print (view|preview|stylesheet|layout)|pdf preview|admin (page|screen|panel|area)|starter page|\bdetail (view|page)\b/i,
+    files: ["13-delivery/07-recipe-ui-pages.md"],
+    weight: 6,
+    onlyFor: ["design", "dev", "qa"],
+  },
+  {
+    id: "monorepo-db-package",
+    // Only when the request names the layout. "monorepo" alone must not load it (the default is one app in apps/web).
+    test: /packages\/db\b|packages\/database\b|@app\/db\b|\b(db|database|prisma) package\b/i,
+    files: ["13-delivery/08-recipe-monorepo-db-package.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "legal-records",
+    test: /\b(agreements?|invoices?|ugovor\w*|legal (document|record)s?|purchase contract|sales? contract|commission contract)\b/i,
+    files: ["13-delivery/09-records-and-legal-documents.md"],
+    weight: 4,
+    onlyFor: ["db", "api", "dev", "design", "qa"],
+  },
+  {
+    id: "git-versioning",
+    test: /\bgit\b|\bbranch(es)?\b|\bcommits?\b|\bsemver\b|\bversioning\b|changelog|\brelease (notes|process|tag)\b|version control|git ?flow/i,
+    files: ["13-delivery/01-git-versioning.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
   },
 ];
 

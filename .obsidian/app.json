@@ -1,0 +1,7 @@
+{
+  "userIgnoreFilters": [
+    "node_modules/",
+    "_to_delete/",
+    "web/node_modules/"
+  ]
+}

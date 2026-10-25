@@ -26,6 +26,7 @@ import { GeminiTriageClient, resolveModels } from "./gateway";
 import { ResearchPipeline, confirmPlan, confirmRequired, researchEnv, isGeneralRealtime, prefetchRealtime } from "./research";
 import { searchWeb, verifySearxng } from "./tools/web-search.tool";
 import { runTeam, type ParallelOptions } from "./team/orchestrator";
+import { describeManifest, loadTaskManifest, tasksDirName } from "./team/task-store";
 import { describeImage, renderBriefForAgents, type DesignBrief } from "./vision/describe";
 
 dotenv.config();
@@ -190,7 +191,7 @@ program
 program
   .command("run")
   .description("Run a task. Auto-routes to a specialist agent unless --agent is given.")
-  .argument("<task>", "Natural-language description of what you want done")
+  .argument("[task]", "Natural-language description of what you want done (omit it with --resume)")
   .option("-a, --agent <id>", `Force a specific agent (${AGENTS.map((a) => a.id).join(", ")})`)
   .option("-p, --project <path>", "Path to the target project (workspace root)", process.cwd())
   .option("-m, --model <id>", "Model id to use (default: AI_MODEL_NAME)")
@@ -202,10 +203,12 @@ program
   .option("-i, --image <path>", "A picture of what you want (png/jpg/webp); it is read into a design brief the agents build from")
   .option("--serve", "Stream live agent state to the web dashboard (ws://127.0.0.1:3001/ws)")
   .option("--parallel", "With --team: engineer tasks that do not depend on each other run at the same time, each confined to its own folders (needs -y)")
+  .option("--resume", "Team mode: continue the saved tasks in tasks/ (only unfinished tasks run, no new planning)")
+  .option("--plan-only", "Team mode: the Project Manager writes the task files in tasks/ and stops, so you can edit them before running")
   .option("--auto-debug", "When a command fails (npm 404, version conflict, Prisma error...), run the Debug Agent on the exact output right away and resume (needs auto mode; same as AGENT_AUTO_DEBUG=1)")
   .action(
     async (
-      task: string,
+      taskArg: string | undefined,
       opts: {
         agent?: string;
         project: string;
@@ -219,9 +222,19 @@ program
         image?: string;
         autoDebug?: boolean;
         parallel?: boolean;
+        resume?: boolean;
+        planOnly?: boolean;
       },
     ) => {
       if (opts.autoDebug) process.env.AGENT_AUTO_DEBUG = "1";
+      if (!taskArg && !opts.resume) {
+        console.log(pc.red("Give a task, or use --resume to continue the saved tasks."));
+        process.exitCode = 1;
+        return;
+      }
+      const task: string = taskArg ?? "Resume the saved tasks";
+      // Saved tasks only exist in team mode.
+      if (opts.resume || opts.planOnly) opts.team = true;
       const workspaceRoot = path.resolve(opts.project);
       console.log(pc.dim(`Workspace: ${workspaceRoot}`));
   control.setWorkspace(workspaceRoot);
@@ -270,7 +283,7 @@ program
           let planContext: string | undefined;
           let suggested: string | undefined;
           const pipeline = new ResearchPipeline();
-          const useResearch = Boolean(opts.research) || Boolean(opts.triage) || researchEnv() === "on";
+          const useResearch = !opts.resume && (Boolean(opts.research) || Boolean(opts.triage) || researchEnv() === "on");
           if (useResearch) {
             if (!pipeline.hasApiKey()) {
               console.log(pc.yellow("⚠ Research requested but GEMINI_API_KEY is not set (put it in .env). Continuing without it."));
@@ -303,6 +316,8 @@ program
               workspaceRoot,
               context: combinedContext,
               parallel,
+              resume: opts.resume,
+              planOnly: opts.planOnly,
               approvePlan: !executor.isAutoWrite(),
               // Gemini leads (PM + UX) when you opted into Gemini; the local model is the worker.
               think: useResearch && pipeline.hasApiKey() ? (s, u, m, j) => pipeline.think(s, u, m, j) : undefined,
@@ -718,9 +733,18 @@ program
     // session lock and the router.
     const executeTask = async (rawTask: string, origin: "terminal" | "dashboard", forcedAgentId?: string): Promise<void> => {
       // `/team <task>` runs just this task with the team; `/team` alone toggles it for every task.
-      const teamRequest = /^\/team\s+\S/i.test(rawTask);
+      // `/tasks plan <task>`: the Project Manager writes the task files and stops. `/tasks resume`: carry on with the saved files.
+      const resumeRequest = /^\/tasks\s+resume\b/i.test(rawTask);
+      const planOnlyRequest = /^\/tasks\s+plan\s+\S/i.test(rawTask);
+      const teamRequest = /^\/team\s+\S/i.test(rawTask) || resumeRequest || planOnlyRequest;
       const useTeam = teamRequest || control.isTeam();
-      const task = teamRequest ? rawTask.replace(/^\/team\s+/i, "").trim() : rawTask;
+      const task = resumeRequest
+        ? "Resume the saved tasks"
+        : planOnlyRequest
+          ? rawTask.replace(/^\/tasks\s+plan\s+/i, "").trim()
+          : teamRequest
+            ? rawTask.replace(/^\/team\s+/i, "").trim()
+            : rawTask;
       const briefText = brief ? renderBriefForAgents(brief) : "";
       try {
         const result = await bus.withRun({ task, workspace: workspaceRoot, origin }, async () => {
@@ -729,7 +753,7 @@ program
           let suggested: string | undefined;
           const forcedId = forcedAgentId ?? lockedAgentId;
 
-          if (researchOn) {
+          if (researchOn && !resumeRequest) {
             if (origin === "dashboard" && confirmRequired()) {
               // The confirmation is a terminal prompt; do not block a browser-started run on it.
               console.log(pc.dim("Research skipped: AGENT_RESEARCH_CONFIRM=1 needs the terminal."));
@@ -765,6 +789,8 @@ program
               parallel,
               // You approve the plan in the terminal; auto-write mode and dashboard runs start without asking.
               approvePlan: origin === "terminal" && !executor.isAutoWrite(),
+              resume: resumeRequest,
+              planOnly: planOnlyRequest,
               // Gemini leads (PM + UX) while the research stage is ON; the local model is the worker.
               think: researchOn ? (s, u, m, j) => pipeline.think(s, u, m, j) : undefined,
             });
@@ -846,6 +872,9 @@ program
   ${pc.cyan("/plan [auto|always|off]")}      - Planner mode: auto = only when the research says a plan is needed (default), always, off
   ${pc.cyan("/team <task>")}                 - Run one task with the team: Project Manager plans, engineers build, Safety Reviewer checks
   ${pc.cyan("/team")}                        - Toggle team mode for every task
+  ${pc.cyan("/tasks")}                       - Show the saved task files (the team writes them to tasks/ before it starts)
+  ${pc.cyan("/tasks plan <task>")}           - Project Manager writes the task files and stops, so you can edit them first
+  ${pc.cyan("/tasks resume")}                - Run only the unfinished saved tasks (after a limit, a crash or Ctrl+C)
   ${pc.cyan("/parallel")}                    - Toggle parallel team: independent engineer tasks run at the same time (needs auto-write + auto-run)
   ${pc.cyan("/auto-debug")}                  - Toggle auto-debug: a failed command starts the Debug Agent right away (needs auto-write + auto-run)
   (all switches can also be changed in the dashboard; both stay in sync)
@@ -984,6 +1013,17 @@ program
             parallelOn
               ? pc.yellow("\n\u{1F3BC} Parallel team ON: in team mode, tasks that do not depend on each other run at the same time (needs auto-write and auto-run; model calls are limited by AGENT_LLM_CONCURRENCY, default 2).\n")
               : pc.green("\n✔ Parallel team OFF: team tasks run one after another.\n"),
+          );
+          askQuestion();
+          return;
+        }
+
+        if (normalizedInput === "/tasks" || normalizedInput === "/tasks status") {
+          const saved = loadTaskManifest(workspaceRoot);
+          console.log(
+            saved
+              ? `\n${describeManifest(saved)}\n${pc.dim("Continue unfinished work with /tasks resume.")}\n`
+              : pc.dim(`\nNo saved tasks in ${tasksDirName()}/. Plan some with: /tasks plan <task>  (or run /team <task>, which saves them too)\n`),
           );
           askQuestion();
           return;

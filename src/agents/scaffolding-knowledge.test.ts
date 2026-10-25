@@ -24,7 +24,10 @@ describe("scaffolding standard", () => {
     expect(text).toContain("mkdir -p apps");
     expect(text).toContain("not writable");
     expect(text).toMatch(/Never `npm install -g`/);
-    expect(text).toContain("create-next-app@latest apps/web");
+    expect(text).toContain("create-next-app@16 apps/web");
+    expect(text).toContain("--use-npm --disable-git");
+    expect(text).not.toContain("--package-manager npm --yes");
+    expect(text).toContain("lowercase");
     expect(text).toContain("@nestjs/cli@latest new api");
     expect(text).toContain("--skip-git");
     expect(text).toContain("--skip-install");

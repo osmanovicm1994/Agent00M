@@ -94,8 +94,11 @@ export class WorkspaceLocks {
       record(true);
       return { allowed: true };
     }
+    // An owner of the WHOLE workspace (scope "./") cannot run next to anybody else: any other scope overlaps it, so tryAcquire
+    // refuses a second lease while it is held. It is therefore the only writer, and the shared files are its to change.
+    const solo = mine.some((s) => normalizeScope(s) === "");
     // No exception for an exact-file scope: a plan that hands "package.json" to a worker does not make it writable.
-    if (this.shared.some((s) => inScope(rel, s))) {
+    if (!solo && this.shared.some((s) => inScope(rel, s))) {
       record(false);
       return {
         allowed: false,

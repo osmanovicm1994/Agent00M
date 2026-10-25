@@ -8,7 +8,7 @@
 //
 // Guard rails (a debug run is expensive on a local model):
 //  - disabled unless enabled (AGENT_AUTO_DEBUG=1),
-//  - the 5-try gate: at most `maxPerKey` debug attempts (default 5, AGENT_AUTO_DEBUG_ATTEMPTS) on the same command. When
+//  - the try gate: at most `maxPerKey` debug attempts (default 2, AGENT_AUTO_DEBUG_ATTEMPTS) on the same command. When
 //    the last attempt fails too, the interceptor stops trying (no further attempt) and hands the executor a
 //    "Project Failure & Triage Report" (see triage.ts) through takeHalt(); the executor ends the run with it,
 //  - `maxPerRun` debug runs in total,
@@ -80,8 +80,10 @@ export function interceptorConfigFromEnv(env: NodeJS.ProcessEnv = process.env): 
   const on = /^(1|true|yes|on)$/i.test(env.AGENT_AUTO_DEBUG ?? "");
   return {
     enabled: on,
-    maxPerRun: boundedInt(env.AGENT_AUTO_DEBUG_MAX, 10, 1, 30),
-    maxPerKey: boundedInt(env.AGENT_AUTO_DEBUG_ATTEMPTS, 5, 1, 10),
+    // Defaults were 10 runs and 5 attempts: a log showed ~245 of 254 model calls spent debugging. 2 attempts per command and
+    // 4 runs per session keep debugging a small part of the work; raise them with the environment variables when needed.
+    maxPerRun: boundedInt(env.AGENT_AUTO_DEBUG_MAX, 4, 1, 30),
+    maxPerKey: boundedInt(env.AGENT_AUTO_DEBUG_ATTEMPTS, 2, 1, 10),
     escalateAfter: 2,
   };
 }

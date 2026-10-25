@@ -3,6 +3,7 @@ import * as path from "path";
 import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from "../llm/types";
 import type { AgentDefinition } from "../agents/definitions";
 import { detectStackKnowledge, loadKnowledge, loadProjectContext } from "../agents/helpers";
+import { operatingGuidelines } from "../agents/operating-guidelines";
 import { FsTools, fsToolSchemas, isSecretPath as isSecretFile } from "../tools/fs.tool";
 import { ShellTool, shellToolSchema, clampTimeoutMs, condenseOutput } from "../tools/shell.tool";
 import { SearchTool, searchToolSchemas } from "../tools/search.tool";
@@ -26,6 +27,9 @@ import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToo
 import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
 import type { ExecutorHooks } from "./executor-hooks";
+import { LoopWatch, adviseBeforeRun, diagnoseFailure, formatDiagnosis, haltText, refuseRecursiveInstallScript } from "./toolchain-doctor";
+import { StallGuard, classifyCall, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
+import { KNOWN_FIX_SHOW_LIMIT, formatKnownFixes, knownFixStopText, matchKnownFixes } from "./known-fixes";
 
 const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas];
 
@@ -42,7 +46,8 @@ const MAX_NUDGES = 6;
 // Budget for the auto-detected stack standards in the system prompt (mobile adds role-specific detail files).
 const STACK_KNOWLEDGE_CHARS = Number(process.env.AGENT_STACK_CHARS) || 9000;
 // Budget for the task-specific standards (logic, cross-domain) chosen from the task text, see agents/orchestration.ts.
-const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 8000;
+// 16000 (was 8000): the delivery recipes (13-delivery) are exact and replace dozens of debugging calls; one prefill costs far less.
+const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 16000;
 
 // True when `dir` or one of its parents is a git working tree (changes can be reviewed and reverted).
 function insideGitRepo(dir: string): boolean {
@@ -275,6 +280,15 @@ function logLine(text: string, level: "info" | "warn" = "info"): void {
 const successRuns = new WeakMap<object, Map<string, number>>();
 const SUCCESS_REPEAT_LIMIT = 3;
 
+// Commands refused before running (a known install loop, an npm self-upgrade): how many per run. The model is told what to do
+// instead each time; when it proposes a blocked command again and again the run stops with the same explanation for the person.
+const blockedRuns = new WeakMap<object, number>();
+const BLOCKED_RUN_LIMIT = 3;
+
+// Known failures (see known-fixes.ts): how often each fix was shown in this run. A fix that was shown KNOWN_FIX_SHOW_LIMIT times and
+// did not help ends the run with a plain explanation instead of more tries.
+const knownFixShown = new WeakMap<object, Map<string, number>>();
+
 async function confirm(message: string, detail?: string): Promise<boolean> {
   // Runs started from the dashboard are approved there; terminal runs keep the terminal prompt
   // (the dashboard then only shows that an answer is pending).
@@ -377,6 +391,8 @@ interface SessionState {
   interrupted: boolean;
   // Id of the agent running in this session (used by the hooks).
   agentId: string;
+  // Catches an agent that goes in circles (see stall-guard.ts). null when switched off (AGENT_STALL_GUARD=0).
+  stall: StallGuard | null;
 }
 
 function newSessionState(): SessionState {
@@ -405,6 +421,7 @@ function newSessionState(): SessionState {
     readOnlyRefusals: 0,
     interrupted: false,
     agentId: "agent",
+    stall: null,
   };
 }
 
@@ -464,6 +481,15 @@ export class Executor {
   // Shell commands run without asking (risky ones still ask).
   private autoRunEnabled(): boolean {
     return this.autoRun;
+  }
+
+  // package.json of a folder (relative to the workspace), for the install-loop checks; undefined when there is none or it is outside.
+  private readPackageJson(dir: string): string | undefined {
+    try {
+      return this.fs.readFile(path.posix.join(dir === "" ? "." : dir, "package.json"));
+    } catch {
+      return undefined;
+    }
   }
 
   // Normalizes a model-supplied path: forward slashes, no leading "./",
@@ -531,7 +557,11 @@ export class Executor {
             : ""
         }`;
 
-    return `${agent.systemPrompt}${stack}${taskKnowledge}${projectContext}
+    // The operating guidelines come first: how to work, before what the role is and what it knows. The block is the same for
+    // every building role, so the model server can reuse its cached prompt prefix across agents.
+    const guidelines = operatingGuidelines(agent.id);
+
+    return `${guidelines ? `${guidelines}\n\n---\n\n` : ""}${agent.systemPrompt}${stack}${taskKnowledge}${projectContext}
 
 ${toolSection}
 
@@ -650,6 +680,7 @@ When you are done and have no more actions to take, reply normally with a final 
     state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
     state.readOnly = Boolean(agent.readOnly);
     state.agentId = agent.id;
+    state.stall = stallGuardEnabled() ? new StallGuard(stallOptionsFor(agent.id)) : null;
 
     const stackPaths = detectStackKnowledge(this.workspaceRoot, agent.id);
     if (stackPaths.length) {
@@ -903,7 +934,22 @@ When you are done and have no more actions to take, reply normally with a final 
         bus.emit("tool_running", { callId: calls[i].id, tool: calls[i].name, args: truncate(calls[i].arguments, 1500) });
         const rawResult = await this.handleToolCall(calls[i], state, response.finishReason === "length");
         bus.emit("tool_result", { callId: calls[i].id, ok: toolSucceeded(rawResult), preview: truncate(rawResult, 1500) });
-        const result = clip(rawResult);
+        let result = clip(rawResult);
+
+        // Going in circles: the same few steps over and over with nothing written in between. Warn the model, then stop the run.
+        const stallEvent = state.stall ? classifyCall(calls[i].name, calls[i].arguments, rawResult) : null;
+        if (state.stall && stallEvent) {
+          const verdict = state.stall.record(stallEvent);
+          if (verdict.level === "warn" && verdict.message) {
+            console.log(pc.yellow(`\n(Stall guard: ${verdict.message.slice(0, 110)}...)`));
+            logLine("Stall guard: the agent is repeating the same steps; told it to change approach.", "warn");
+            result += `\n\n${verdict.message}`;
+          } else if (verdict.level === "stop" && verdict.message && !state.haltMessage) {
+            logLine("Stall guard: the agent kept repeating the same steps; stopping the run.", "warn");
+            state.haltMessage = verdict.message;
+            state.haltLabel = "\u{1F501} Stopped: the agent was going in circles.";
+          }
+        }
 
         // Once a write has succeeded the content lives on disk. Drop it from the
         // history (it would otherwise be re-sent to the model on every later turn,
@@ -1182,6 +1228,20 @@ When you are done and have no more actions to take, reply normally with a final 
         const command = String(args.command ?? "");
         if (!command.trim()) return 'TOOL ERROR: run_command requires a non-empty "command".';
 
+        // Known loops and dead ends are refused BEFORE they run (an `npm install` that starts itself forever, `npm install -g npm@latest`).
+        const advice = adviseBeforeRun(command, (dir) => this.readPackageJson(dir));
+        if (advice) {
+          const blocked = (blockedRuns.get(state) ?? 0) + 1;
+          blockedRuns.set(state, blocked);
+          console.log(pc.yellow(`\n🩺 Not running this command: ${advice.diagnosis.summary}`));
+          logLine(`Command not run: ${advice.diagnosis.summary}`, "warn");
+          if (blocked >= BLOCKED_RUN_LIMIT) {
+            state.haltMessage = haltText(advice.diagnosis);
+            state.haltLabel = "🩺 Stopped: a blocked command was proposed again and again.";
+          }
+          return advice.refuse;
+        }
+
         const diagnostic = state.autoDiagnostics && isSafeDiagnostic(command);
         if (state.readOnly && !diagnostic) {
           state.readOnlyRefusals++;
@@ -1231,6 +1291,8 @@ When you are done and have no more actions to take, reply normally with a final 
         const timeoutMs = clampTimeoutMs(args.timeout_seconds, command);
         console.log(pc.dim(`(Ctrl+C stops this command; limit ${formatElapsed(Math.round(timeoutMs / 1000))})`));
         const stopWatching = watchForInterrupt();
+        // An install that starts itself again and again is stopped after the third repeat instead of running for minutes.
+        const loopWatch = new LoopWatch();
         let result: Awaited<ReturnType<ShellTool["runAsync"]>>;
         try {
           result = await this.shell.runAsync(
@@ -1241,6 +1303,11 @@ When you are done and have no more actions to take, reply normally with a final 
               bus.emit("tool_output", { callId, chunk: truncate(text, 2000) });
             },
             (sec) => console.log(pc.dim(`\n⏳ still running, ${formatElapsed(sec)} so far (Ctrl+C stops it)`)),
+            undefined,
+            (text) => {
+              const loop = loopWatch.feed(text);
+              return loop ? `the install step "${loop.pkg} ${loop.script}" (${loop.command}) started itself ${loop.count} times in a row` : null;
+            },
           );
         } finally {
           stopWatching();
@@ -1255,6 +1322,46 @@ When you are done and have no more actions to take, reply normally with a final 
         // the same failure keeps coming back.
         const failed = !result.timedOut && !result.interrupted && result.exitCode !== 0;
         state.lastRunFailed = failed;
+        if (result.aborted) {
+          console.log(pc.yellow(`\n⛔ Stopped this command: ${result.aborted}.`));
+          logLine(`Command stopped by the watchdog: ${result.aborted}.`, "warn");
+        }
+
+        // Known environment problems (an install loop, a Node/npm version mismatch) are explained from the real output and
+        // package.json, not left to the model's guess. When only the person can fix it, the run ends with plain instructions.
+        const diagnosis = failed
+          ? diagnoseFailure({
+              command,
+              output: result.output,
+              nodePath: process.execPath,
+              nodeVersion: process.version,
+              readPackageJson: (dir) => this.readPackageJson(dir),
+            })
+          : null;
+        if (diagnosis) {
+          console.log(pc.yellow(`\n🩺 ${diagnosis.summary}`));
+          logLine(`Diagnosis: ${diagnosis.summary}`, "warn");
+          if (diagnosis.userMustAct) {
+            state.haltMessage = haltText(diagnosis);
+            state.haltLabel = "🩺 Stopped: this needs a change on your computer, outside the project.";
+          }
+        }
+        // A failure the agent has met before comes with its exact fix: no debug run, no investigation.
+        const knownFixes = failed && !diagnosis ? matchKnownFixes(command, result.output) : [];
+        if (knownFixes.length) {
+          const shown = knownFixShown.get(state) ?? new Map<string, number>();
+          knownFixShown.set(state, shown);
+          for (const fix of knownFixes) {
+            const n = (shown.get(fix.id) ?? 0) + 1;
+            shown.set(fix.id, n);
+            console.log(pc.yellow(`\n\u{1F9E9} Known problem: ${fix.title}`));
+            logLine(`Known problem: ${fix.title}`, "warn");
+            if (n >= KNOWN_FIX_SHOW_LIMIT && !state.haltMessage) {
+              state.haltMessage = knownFixStopText(fix, command);
+              state.haltLabel = "\u{1F9E9} Stopped: a known problem keeps coming back.";
+            }
+          }
+        }
         const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
         const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
         if (repeatCount >= REPEAT_LIMIT) {
@@ -1280,7 +1387,8 @@ When you are done and have no more actions to take, reply normally with a final 
 
         // Reactive debugging: the agent is paused here until the interceptor (Debug Agent) is done.
         let autoDebug: { note: string; verified: boolean; halt?: string } | null = null;
-        if (failed && this.hooks.commandInterceptor) {
+        // A diagnosed failure is not a code bug the Debug Agent could patch: it would only burn its attempts on it.
+        if (failed && !diagnosis && knownFixes.length === 0 && this.hooks.commandInterceptor) {
           autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, command, output: result.output, exitCode: result.exitCode });
           if (autoDebug?.verified) state.lastRunFailed = false;
           if (autoDebug?.halt) state.haltMessage = autoDebug.halt;
@@ -1292,7 +1400,15 @@ When you are done and have no more actions to take, reply normally with a final 
           ...(failureSummary ? { failureSummary } : {}),
           ...(repeatCount >= REPEAT_LIMIT && !autoDebug?.verified ? { note: repeatNote(repeatCount) } : {}),
           ...(autoDebug ? { autoDebug: autoDebug.note } : {}),
+          ...(diagnosis ? { diagnosis: formatDiagnosis(diagnosis) } : {}),
+          ...(knownFixes.length ? { knownFix: formatKnownFixes(knownFixes) } : {}),
           ...(successNote ? { note: successNote } : {}),
+          ...(result.aborted
+            ? {
+                aborted: true,
+                note: `The agent stopped this command because ${result.aborted}. Do not run it again until the cause is fixed: read "diagnosis" and follow it.`,
+              }
+            : {}),
           ...(result.interrupted
             ? {
                 interrupted: true,
@@ -1366,6 +1482,12 @@ When you are done and have no more actions to take, reply normally with a final 
         "Placeholders replace real code with nothing. Write the complete real content instead; for long files use " +
         "write_file with the first ~150 lines and append_file for the remaining chunks."
       );
+    }
+
+    // A package.json whose install-time script starts another install would make `npm install` run itself forever.
+    if (path.posix.basename(p) === "package.json") {
+      const loop = refuseRecursiveInstallScript(content);
+      if (loop) return loop;
     }
 
     if (append) return this.handleAppend(p, content, exists, state);

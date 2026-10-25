@@ -34,8 +34,12 @@ import { Blackboard } from "./blackboard";
 import { WorkspaceLocks } from "./workspace-locks";
 import type { ParallelOptions } from "../team/orchestrator";
 
-/** Steps the Debug Agent may use for one automatic debug run. Small on purpose: it fixes one failure, nothing else. */
-const DEBUG_MAX_STEPS = boundedInt(process.env.AGENT_AUTO_DEBUG_STEPS, 25, 3, 200);
+/**
+ * Steps the Debug Agent may use for one automatic debug run. Small on purpose: it fixes one failure, nothing else.
+ * 10 (was 25): a failure that is not fixed in about 10 model calls is not fixed by 25 more; the run then ends with a report
+ * and the person decides. Known failures never get here (src/core/known-fixes.ts answers them without a model call).
+ */
+const DEBUG_MAX_STEPS = boundedInt(process.env.AGENT_AUTO_DEBUG_STEPS, 10, 3, 200);
 /** Steps one parallel task may use before it is reported as incomplete. */
 const TASK_MAX_STEPS = boundedInt(process.env.AGENT_TASK_MAX_STEPS, 60, 3, 500);
 
@@ -184,9 +188,13 @@ export function buildTaskPrompt(task: OrchTask, ctx: TaskContext): string {
     task.instructions,
     "",
     task.scope.length
-      ? `You may write ONLY in: ${task.scope.join(", ")}. Writes anywhere else are refused (other agents own those paths). If you need a change there, say so in your final message.`
+      ? task.scope.some((s) => s === "./" || s === "")
+        ? "You run alone at this stage and may write anywhere in the project, including the root files."
+        : `You may write ONLY in: ${task.scope.join(", ")}. Writes anywhere else are refused (other agents own those paths). If you need a change there, say so in your final message, and do not try another path to get around the refusal.`
       : "This task is read-only: do not write files.",
-    "Never edit the root package.json or lockfiles; use `npm --prefix <dir>` inside your own folder.",
+    task.scope.some((s) => s === "./" || s === "")
+      ? "Use `npm --prefix <dir>` inside the app's folder; do not create a root package.json unless the task asks for one."
+      : "Never edit the root package.json or lockfiles; use `npm --prefix <dir>` inside your own folder.",
     ctx.contractsText ? `\nINTERFACES YOU MUST FOLLOW (published by other agents):\n${ctx.contractsText}` : "",
     task.publishes
       ? `\nWhen you are done, end your final message with a section "CONTRACT:" listing exactly what the others need from you (endpoints with methods and bodies, DTO field names, env variable names, model names). Keep it under 60 lines.`

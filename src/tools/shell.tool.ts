@@ -16,6 +16,9 @@ export interface ShellRunResult {
   timedOut: boolean;
   // The user pressed Ctrl+C while it ran; the process group was stopped on purpose.
   interrupted: boolean;
+  // The watchdog passed to runAsync stopped the command (for example an install that restarts itself forever);
+  // this is the reason it returned. The exit code is then never 0.
+  aborted?: string;
 }
 
 const MIN_TIMEOUT_MS = 5_000;
@@ -123,6 +126,8 @@ export class ShellTool {
     // Called every `tickMs` with the elapsed seconds, so a quiet build does not look frozen.
     onTick?: (elapsedSec: number) => void,
     tickMs = 30_000,
+    // Sees every chunk of output; returning a reason stops the command (whole process group), like Ctrl+C.
+    watch?: (text: string) => string | null,
   ): Promise<ShellRunResult> {
     return new Promise((resolve) => {
       const isWindows = process.platform === "win32";
@@ -140,6 +145,7 @@ export class ShellTool {
       let total = 0;
       let timedOut = false;
       let interrupted = false;
+      let abortReason: string | undefined;
       let settled = false;
       const startedAt = Date.now();
 
@@ -150,6 +156,18 @@ export class ShellTool {
         tail += text;
         if (tail.length > TAIL_KEEP * 2) tail = tail.slice(-TAIL_KEEP);
         onChunk?.(text);
+        if (watch && !abortReason && !settled) {
+          let reason: string | null = null;
+          try {
+            reason = watch(text);
+          } catch {
+            // a faulty watchdog must never break the command
+          }
+          if (reason) {
+            abortReason = reason;
+            abort();
+          }
+        }
       };
       child.stdout?.on("data", add);
       child.stderr?.on("data", add);
@@ -177,7 +195,18 @@ export class ShellTool {
         clearTimeout(timer);
         if (ticker) clearInterval(ticker);
         running.delete(stop);
-        resolve({ output: collect(), exitCode: interrupted ? 130 : exitCode, timedOut, interrupted });
+        // A command the watchdog stopped has not succeeded, whatever code the dying process gave.
+        const code = interrupted ? 130 : abortReason && exitCode === 0 ? 1 : exitCode;
+        resolve({ output: collect(), exitCode: code, timedOut, interrupted, ...(abortReason ? { aborted: abortReason } : {}) });
+      };
+
+      // Same shutdown sequence as Ctrl+C, but it is not reported as the user's interruption.
+      const abort = () => {
+        if (interrupted || settled) return;
+        killGroup("SIGINT");
+        setTimeout(() => killGroup("SIGTERM"), 2_000);
+        setTimeout(() => killGroup("SIGKILL"), 5_000);
+        setTimeout(() => finish(1), 7_000);
       };
 
       const stop = () => {

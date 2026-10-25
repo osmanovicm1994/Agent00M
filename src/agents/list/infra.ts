@@ -39,6 +39,10 @@ Work in this order.
    with the background process tool, not run_command.
 6. If the same command still fails after your fix attempts, stop and report; the system hands persistent failures to a
    triage report, so do not loop on it.
+7. A failed command may come back with a "knownFix" or "diagnosis" block: it is the exact fix for that error. Apply it as
+   written, run the command once, and do not investigate further. Do not list or read inside node_modules.
+8. Install packages with explicit majors from the version table in your standards (for example prisma@7, @hookform/resolvers@5),
+   all of one phase in ONE install command. A project that is not a git repository gets "git init -b main" first.
 
 Final answer, short:
   Steps: each command you ran, in the folder you ran it, and its result (exit code)
@@ -48,13 +52,15 @@ Never say a step worked unless you saw its command exit 0.` +
     loadKnowledge(
       [
         "00-agent-core/tool-execution.md",
-        "12-fullstack/00-build-protocol.md",
+        "13-delivery/05-known-fixes.md",
+        "13-delivery/02-versions-2026.md",
         "12-fullstack/09-scaffolding.md",
+        "13-delivery/04-local-infra-ci.md",
+        "13-delivery/00-roadmap.md",
         "12-fullstack/04-prisma-drizzle.md",
-        "12-fullstack/07-docker-deploy.md",
         "03-mobile/ios-build-debug.md",
         "03-mobile/android-build-debug.md",
       ],
-      14_000,
+      22_000,
     ),
 };

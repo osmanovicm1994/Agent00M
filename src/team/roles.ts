@@ -17,8 +17,8 @@ import { loadKnowledge } from "../agents/helpers";
 // The Project Manager is a plain model call (no agent), so the logic standards are appended to its prompt here:
 // decomposition and ordering for the plan, edge cases for the risks list.
 export const PM_KNOWLEDGE = loadKnowledge(
-  ["08-logic/00-reasoning-core.md", "08-logic/01-problem-decomposition.md", "08-logic/02-edge-case-analysis.md"],
-  4500,
+  ["13-delivery/10-plan-template.md", "08-logic/00-reasoning-core.md", "08-logic/01-problem-decomposition.md", "08-logic/02-edge-case-analysis.md"],
+  7500,
   "PLANNING STANDARDS (use them to split, order and risk-check the work)",
 );
 
@@ -47,6 +47,8 @@ const taskSchema = z.object({
   // Only filled in parallel mode (see PM_PARALLEL_ADDENDUM): folders this task may write, and the numbers of tasks it waits for.
   scope: z.array(z.string()).nullish().transform((v) => v ?? []),
   dependsOn: z.array(z.union([z.number(), z.string()])).nullish().transform((v) => v ?? []),
+  // Optional: the interface other tasks build against (tables, endpoints, payloads, env names). Saved in the task file and handed to later tasks.
+  contract: z.string().nullish().transform((v) => v?.trim() || undefined),
 });
 
 export const pmPlanSchema = z.object({
@@ -72,8 +74,8 @@ Your team (use these role ids exactly):
 A Safety Reviewer checks the result automatically at the end. Do not plan that step yourself.
 
 Planning rules:
-1. Plan the SMALLEST set of tasks that does the job. A small request is 1 to 2 tasks. Never more than 6.
-2. Order matters: infra (skeleton, installs) first; ux before design; db before api; the code before qa. qa is last when something was built or fixed.
+1. Plan the SMALLEST set of tasks that does the job. A small request is 1 to 2 tasks. A whole application is 6 to 9 tasks, never more than 9. Size every task so that one engineer finishes it in about 40 model steps: at most about 10 files, one layer, one area. A task that needs more than that is two tasks.
+2. Order matters: infra (skeleton, installs) first; then the backend (db, then api, then dev); then the interface (ux, then design), because the UI is built against the real API; qa is last when something was built or fixed. Each task is saved as its own task file, so write every task so that someone who has not seen this conversation can do it.
 3. Every task has a concrete title, instructions an engineer can act on without asking you anything, and 1 to 4 acceptance criteria that can be checked (a command that must pass, a file that must exist, a behaviour that must work).
 4. Use real information only: if the project's file listing or the request does not tell you something (framework, paths), say so in "assumptions" or "questions" instead of inventing it.
 5. "risks": what could go wrong or be destroyed by this work (data loss, breaking changes, secrets, production impact). Empty list if none.
@@ -81,6 +83,12 @@ Planning rules:
 7. Never plan destructive actions (deleting data, force-pushing, dropping tables) unless the user asked for exactly that.
 8. Plan from the <project_tree> you are given. It lists the folders and files that really exist (three levels deep; dependencies, build output and secret files are left out). A path in the tree EXISTS: the task must say to read it and change it in place. A path not in the tree does not exist: say it is a new file and name the folder it goes in. Never invent a path, and never plan a second copy of something that is already in the tree. An empty tree means a new project.
 9. When a task needs a platform command (npm install, prisma migrate, xcodegen, pod install, xcodebuild, gradlew, flutter, cargo, go, docker compose), put the exact command and the folder to run it in under "instructions", and make "a command that exits 0" one of the acceptance criteria.
+10. For a db or api task that other tasks build on, fill "contract" with the interface they rely on, in a few lines: tables and columns, endpoints with request and response shapes, environment variable names. Leave it out for other tasks.
+11. LAYOUT. A layout the request names explicitly WINS (for example "Prisma in packages/db", "apps/api", "src/" at the root): plan exactly that, and write the chosen layout into the instructions of every task it touches. If the request and an attached example contradict each other (one says packages/db, the example tree shows a root prisma/ folder), follow the request text, add the conflict to "assumptions" with the choice you made, and put the question in "questions". Never plan both layouts. When the request names no layout, a new Next.js application is ONE full-stack app in apps/web/ (create-next-app puts it there): API route handlers in apps/web/src/app/api/, Prisma in apps/web/prisma/, shared code in apps/web/src/lib/, pages in apps/web/src/app/. Do not invent apps/api or a second package then. When the tree already has an app, use its real folders (rule 8). The scaffold command and the versions are in the engineers' standards: do not write them from memory, say "scaffold the app as in the standards".
+12. COVERAGE: every numbered requirement, role, screen and route in the request must be covered by the acceptance criteria of exactly one task. Before you answer, go through the request line by line against your tasks. A requirement without a task is a mistake in your plan.
+13. INTERFACE: when the request has screens, plan design tasks that BUILD them (login, lists, forms or wizards, detail and print views, admin screens), after the API they call. Split a large interface into 2 or 3 design tasks by area. The first design task replaces the generated starter page and the starter title.
+14. ACCEPTANCE CRITERIA are checks, not claims. Good: "npm --prefix apps/web run build exits 0", "file apps/web/src/app/login/page.tsx exists and renders a login form", "a USER asking GET /api/agreements/<id of another user's agreement> gets 403". Bad: "TypeScript compilation passes" written as if it were already true, "UI looks good".
+15. <mission> is the ORIGINAL request, when it is given. <request> may then be only a follow-up ("continue", "next step", a fix). Plan the work still needed to finish the mission, starting from <previous_plan_state> and <project_tree>. Never replace the mission with the text of the follow-up. If <request> is clearly a different job, ignore the mission.
 
 Reply with ONE JSON object and nothing else, in this shape:
 {
@@ -89,7 +97,7 @@ Reply with ONE JSON object and nothing else, in this shape:
   "risks": ["..."],
   "questions": ["..."],
   "tasks": [
-    { "role": "dev", "title": "short title", "instructions": "what to do, where, how", "acceptance": ["checkable criterion"] }
+    { "role": "dev", "title": "short title", "instructions": "what to do, where, how", "acceptance": ["checkable criterion"], "contract": "optional, see rule 10" }
   ]
 }`;
 
@@ -97,9 +105,9 @@ Reply with ONE JSON object and nothing else, in this shape:
 export const PM_PARALLEL_ADDENDUM = `
 
 PARALLEL MODE: engineers may work at the same time, so every task that is not "ux" also needs:
-- "scope": the folders or files that task may WRITE, relative to the project root, ending in "/" for a folder (for example ["apps/api/"], ["prisma/", "apps/api/src/prisma/"]). Two tasks that can run at the same time must NOT share a folder. Never put the project root, "apps/" or a root package.json in a scope.
+- "scope": the folders or files that task may WRITE, relative to the project root, ending in "/" for a folder (for example ["apps/web/prisma/"], ["apps/web/src/app/api/", "apps/web/src/lib/"], ["apps/web/src/app/login/"]). Two tasks that can run at the same time must NOT share a folder. Never put the project root, "apps/" or a root package.json in a scope. An "infra" task needs no scope: it runs first and alone, and may write anywhere in the project.
 - "dependsOn": the numbers of the tasks (1-based, as in your list) that must finish first, for example [1]. Use it whenever one task needs the result of another: the database schema before the API that uses it, the API before the web page that calls it, everything before qa. Tasks with no dependency between them and separate scopes run side by side.
-Add both fields to every task in the JSON, for example: { "role": "api", "title": "...", "instructions": "...", "acceptance": ["..."], "scope": ["apps/api/"], "dependsOn": [1] }.`;
+Add both fields to every task in the JSON, for example: { "role": "api", "title": "...", "instructions": "...", "acceptance": ["..."], "scope": ["apps/web/src/app/api/"], "dependsOn": [1] }.`;
 
 export const UX_SYSTEM = `You are a senior UX designer on a software team. You do not write code. You write the build spec that the engineers will follow, so that the interface is clear, consistent and accessible.
 
@@ -135,7 +143,12 @@ Rules:
 **What changed:** bullet per file or area (only files in the facts).
 **Checked:** what was actually run or reviewed, and the safety verdict.
 **Open items:** anything unfinished, risky, or needing a decision from the user. Write "none" if none.
-**Next step:** one concrete suggestion.`;
+**Next step:** one concrete suggestion.
+
+More rules:
+- If overallComplete is false and the facts contain "resumeWith", the Next step is exactly that command: the saved plan keeps the original request. Do not write a new task for the person to paste.
+- If "starterPageStillInPlace" is true, the Result must say that the app still shows the generated starter page.
+- Never list a task's acceptance criteria as achieved unless the facts show the command or file that proves it.`;
 
 export const safetyAgent: AgentDefinition = {
   id: "safety",

@@ -38,7 +38,8 @@ describe("planToOrchTasks", () => {
     expect(g.problems).toEqual([]);
     const by = Object.fromEntries(g.tasks.map((t) => [t.id, t]));
     expect(by.t2.dependsOn).toEqual(["t1"]);
-    expect(by.t3.dependsOn).toEqual(["t2"]);
+    // a design task also waits for the db task planned before it (the interface is built against the real data)
+    expect([...by.t3.dependsOn].sort()).toEqual(["t1", "t2"]);
     expect(by.t4.dependsOn.sort()).toEqual(["t1", "t2", "t3"]);
     expect(by.t2.scope).toEqual(["apps/api/"]);
   });
@@ -48,7 +49,7 @@ describe("planToOrchTasks", () => {
     expect(by.t1.publishes).toBe("t1");
     expect(by.t2.publishes).toBe("t2");
     expect(by.t3.publishes).toBeUndefined();
-    expect(by.t3.readsContracts).toEqual(["t2"]);
+    expect([...(by.t3.readsContracts ?? [])].sort()).toEqual(["t1", "t2"]);
   });
 
   it("adds acceptance criteria and the UX spec to the instructions, and leaves UX out of the graph", () => {
@@ -62,6 +63,42 @@ describe("planToOrchTasks", () => {
     expect(g.tasks.map((t) => t.id)).toEqual(["t2", "t3"]);
     expect(g.tasks[0].instructions).toContain("SCREEN LIST");
     expect(g.tasks[1].instructions).toContain("returns 200");
+  });
+
+  it("makes a design task wait for the api and db tasks planned before it, even when the planner forgot", () => {
+    const g = planToOrchTasks(
+      plan([
+        { role: "db", title: "Schema", scope: ["packages/db/"] },
+        { role: "api", title: "API", scope: ["apps/web/src/app/api/"] },
+        { role: "design", title: "Pages", scope: ["apps/web/src/app/(app)/"] },
+      ]),
+    );
+    expect(g.problems).toEqual([]);
+    const by = Object.fromEntries(g.tasks.map((t) => [t.id, t]));
+    expect([...by.t3.dependsOn].sort()).toEqual(["t1", "t2"]);
+  });
+
+  it("does not make a design task wait for an api task planned AFTER it", () => {
+    const g = planToOrchTasks(
+      plan([
+        { role: "design", title: "Pages", scope: ["apps/web/src/app/"] },
+        { role: "api", title: "API", scope: ["apps/web/src/app/api/"] },
+      ]),
+    );
+    const by = Object.fromEntries(g.tasks.map((t) => [t.id, t]));
+    expect(by.t1.dependsOn).toEqual([]);
+  });
+
+  it("adds the extra context (original request, referenced files) to every engineer task", () => {
+    const g = planToOrchTasks(
+      plan([
+        { role: "api", title: "A", instructions: "build a", scope: ["a/"] },
+        { role: "db", title: "B", instructions: "build b", scope: ["b/"] },
+      ]),
+      "",
+      "## REFERENCED FILES\nSPEC TEXT",
+    );
+    for (const t of g.tasks) expect(t.instructions).toContain("SPEC TEXT");
   });
 
   it("reports a missing scope", () => {

@@ -15,9 +15,9 @@ Reference for every agent the local worker model can become, the knowledge each 
 | `logic` | Logical Architecture Agent | Planning, decomposition, edge cases, trade-offs. Answers in text, does not write files unless asked | - | tool-execution, architecture-patterns, 08-logic/01..05 |
 | `kb-harvester` | Knowledge Base Harvester | Reads a project and writes Markdown documentation | - | tool-execution, mcp-protocols, kb-standards |
 | `qa` | QA Automation Agent | Appium (C#/NUnit), Playwright, page objects, flaky tests | - | tool-execution, **reasoning-core**, mcp-protocols, appium-standards, appium-csharp, playwright-standards |
-| `debug` | Debugging & Problem-Solving Agent | A command/build/server/test fails: reproduce, rank hypotheses, root-cause fix, re-run | `thinkingBudget: 14`, `autoDiagnostics`, `verifyFixes`; knowledge capped at 10000 chars | debugging-playbook, tool-execution, root-cause-debugging |
+| `debug` | Debugging & Problem-Solving Agent ("debug-lite") | A command/build/server/test fails: read the error, look at the one place it names (max 3 looks), smallest fix, re-run once, 4-line report. Cheap on purpose: known failures are answered by `core/known-fixes.ts` without a model call, repetition is cut by `core/stall-guard.ts` | `thinkingBudget: 2`, `autoDiagnostics`, `verifyFixes`; knowledge capped at 7000 chars; automatic runs: 10 steps, 2 attempts per command, 4 runs per session | 13-delivery/05-known-fixes, tool-execution |
 | `research` | Research & Web Discovery Agent | Answers from live web sources (docs, versions, errors), cites URLs | `thinkingBudget: 3` | tool-execution |
-| `infra` | Infrastructure & Build Agent | Project skeleton and platform commands: npm/pnpm, prisma migrate/generate, docker compose, xcodegen, pod install, xcodebuild, gradlew, flutter, cargo, go. Looks at what exists, runs the real command in the folder that owns the manifest, proves each step by exit code, writes no feature code. No routing keywords yet: reached through team mode, `-a infra` or `/use infra` | `thinkingBudget: 8`, `autoDiagnostics`, `verifyFixes`; knowledge capped at 14000 chars | tool-execution, 12-fullstack/00-build-protocol, 09-scaffolding, 04-prisma-drizzle, 07-docker-deploy, 03-mobile/ios-build-debug, android-build-debug |
+| `infra` | Infrastructure & Build Agent | Project skeleton and platform commands: npm/pnpm, prisma migrate/generate, docker compose, xcodegen, pod install, xcodebuild, gradlew, flutter, cargo, go. Looks at what exists, runs the real command in the folder that owns the manifest, proves each step by exit code, writes no feature code. No routing keywords yet: reached through team mode, `-a infra` or `/use infra` | `thinkingBudget: 8`, `autoDiagnostics`, `verifyFixes`; knowledge capped at 22000 chars | tool-execution, 13-delivery/05-known-fixes, 02-versions-2026, 12-fullstack/09-scaffolding, 13-delivery/04-local-infra-ci, 13-delivery/00-roadmap, 12-fullstack/04-prisma-drizzle, 03-mobile/ios-build-debug, android-build-debug |
 | `safety` | Safety Reviewer | Read-only review at the end of team mode. NOT in `AGENTS`: not routable, not lockable. Defined in `src/team/roles.ts` | `readOnly`, `autoDiagnostics`, `thinkingBudget: 2` | edge-case-analysis (appended to its prompt) |
 
 `reasoning-core` is `08-logic/00-reasoning-core.md`: a compact (1.4 KB) version of the logic standards (restate the goal, blast radius, edge-case checklist, failure rules, "say what you did not verify"). It sits second so it survives a small `AGENT_SKILL_CHARS` budget.
@@ -25,7 +25,7 @@ Reference for every agent the local worker model can become, the knowledge each 
 On top of this list, two things are added per run by `executor.ts`:
 
 1. `detectStackKnowledge(workspace, agentId)` adds the standards that match the target project (React/Next, .NET, FastAPI, SwiftUI, Compose, Appium, Playwright). For `design` on a mobile project it also adds `mobile-common` and the platform's `*-ui.md` (see `MOBILE_ROLE` in `helpers.ts`). Budget `AGENT_STACK_CHARS` (9000).
-2. **Task-specific standards** from `selectTaskKnowledge(task, agentId)` (section 2). Budget `AGENT_TASK_CHARS` (8000), at most `AGENT_TASK_FILES` (5) files, injected under the heading "TASK-SPECIFIC STANDARDS". Files the agent already carries are skipped.
+2. **Task-specific standards** from `selectTaskKnowledge(task, agentId)` (section 2). Budget `AGENT_TASK_CHARS` (16000), at most `AGENT_TASK_FILES` (5) files, injected under the heading "TASK-SPECIFIC STANDARDS". Files the agent already carries are skipped.
 3. **Project rules**: `AGENTS.md` and `CLAUDE.md` from the target project's root (`loadProjectContext`, `AGENT_PROJECT_CHARS` 3500), under "PROJECT RULES". They never override tool and safety rules.
 
 Budget: `AGENT_SKILL_CHARS` (default 9000; `.env.local` sets 19000 for a 32k-token window). With the default, the last files in an agent's list are cut first, which is why `mcp-protocols.md` comes last for `design`.
@@ -63,13 +63,16 @@ This is how the logic standards reach every agent whose task needs them. Rules a
 | security | auth, JWT, password, token, CORS, XSS (not for `api`) | `07-api/04` | 3 |
 | frontend | component, CSS, Tailwind, responsive, form (dev, api, logic) | `10-design/design-standards`, `04-frontend/modern-frontend` | 3 |
 | appium / playwright | named in the task (not for `qa`) | the matching `02-qa-automation` file | 3 |
-| fullstack-build | full-stack, from scratch, scaffold, monorepo, production-ready, new app/project | `12-fullstack/00-build-protocol.md` | 6 |
+| fullstack-build | full-stack, from scratch, scaffold, monorepo, production-ready, new app/project | `12-fullstack/00-build-protocol.md`, `13-delivery/00-roadmap.md` | 6 |
+| scaffolding | scaffold, create-next-app, nest new, monorepo, new app/project | `12-fullstack/09-scaffolding.md`, `13-delivery/02-versions-2026.md` | 6 |
+| delivery-recipe | Prisma, Next.js, create-next-app, react-hook-form, zod, next-auth | `13-delivery/03-recipe-nextjs-prisma-auth.md` | 5 |
+| git-versioning | git, branch, commit, semver, versioning, changelog, release notes | `13-delivery/01-git-versioning.md` | 3 |
 | nextjs / nestjs / auth-jwt | Next.js, App Router, NestJS, JWT, refresh token | `12-fullstack/01`, `02`, `03` | 4 |
-| orm / neon / object-storage / docker-deploy / ci-testing | Prisma, Drizzle, Neon, R2, S3, Docker, VPS, deploy, GitHub Actions, e2e suite | `12-fullstack/04` to `08` | 3 |
+| orm / neon / object-storage / docker-deploy / ci-testing | Prisma, Drizzle, Neon, R2, S3, Docker, VPS, deploy, GitHub Actions, e2e suite | `12-fullstack/04` to `08` (docker-deploy also `13-delivery/04-local-infra-ci.md`) | 3 |
 | owasp | OWASP, security review/audit | `07-api/05-owasp-checklist.md` | 4 |
 | design-system (design, dev only) | UI, UX, dashboard, landing page, theme, brand, full-stack | `10-design/design-system-workflow.md` | 5 |
 
-`kb-harvester` and `research` never get task standards. The Project Manager (team mode) gets reasoning-core, decomposition and edge cases appended to its prompt (`PM_KNOWLEDGE`), the Safety Reviewer gets the OWASP checklist and the edge-case standard.
+The fullstack, delivery and git rules also apply to `infra`. `kb-harvester` and `research` never get task standards. The Project Manager (team mode) gets reasoning-core, decomposition and edge cases appended to its prompt (`PM_KNOWLEDGE`), the Safety Reviewer gets the OWASP checklist and the edge-case standard.
 
 ### Whole-app tasks
 A change task that says full-stack, monorepo, scaffold, bootstrap or new app/project (`isFullstackBuild`) routes to `dev` (it scores one above the best specialist) unless it is a failure report, a research ask or an automation project, and always prints the `/team` hint.

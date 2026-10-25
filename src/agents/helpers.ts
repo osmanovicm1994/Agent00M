@@ -57,6 +57,22 @@ export function loadKnowledge(
   return out ? `\n\n## ${heading}${out}` : "";
 }
 
+/**
+ * One knowledge file as plain text (front matter removed), or "" when it does not exist. Used for text that is not a
+ * "standard" (the operating guidelines), so it is not wrapped in a STANDARD heading or cut by a character budget.
+ */
+export function readKnowledgeFile(rel: string): string {
+  try {
+    return stripFrontMatter(fs.readFileSync(path.join(KNOWLEDGE_ROOT, rel), "utf8"));
+  } catch {
+    if (!warnedMissing.has(rel)) {
+      warnedMissing.add(rel);
+      console.warn(pc.yellow(`⚠ Knowledge file not found: src/knowledge/${rel}`));
+    }
+    return "";
+  }
+}
+
 /** Legacy single-file helper, kept for backward compatibility. */
 export function loadSkill(skillFolder: string, fileName: string = "README.md"): string {
   return loadKnowledge([`${skillFolder}/${fileName}`]);

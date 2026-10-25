@@ -19,10 +19,21 @@ describe("shared root files are never writable by a parallel worker", () => {
       expect(d.reason).toContain("shared file");
     });
 
-    it(`${file}: refused with a whole-workspace scope`, () => {
+    // The whole-workspace owner (the infra task in a parallel run) is the ONLY writer while it holds the lease: nobody else can
+    // acquire a scope next to it, so the root manifests are its to change (workspaces, scripts, lockfile).
+    it(`${file}: allowed for the whole-workspace owner, who cannot share the workspace`, () => {
+      const locks = new WorkspaceLocks("/proj");
+      expect(locks.tryAcquire("all", ["."]).ok).toBe(true);
+      expect(locks.canWrite("all", file).allowed).toBe(true);
+      expect(locks.tryAcquire("api", ["apps/api/"]).ok).toBe(false);
+    });
+
+    it(`${file}: still refused for a worker once the whole-workspace owner has released`, () => {
       const locks = new WorkspaceLocks("/proj");
       locks.tryAcquire("all", ["."]);
-      expect(locks.canWrite("all", file).allowed).toBe(false);
+      locks.release("all");
+      locks.tryAcquire("api", ["apps/api/"]);
+      expect(locks.canWrite("api", file).allowed).toBe(false);
     });
   }
 
