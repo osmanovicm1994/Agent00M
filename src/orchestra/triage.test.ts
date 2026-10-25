@@ -194,14 +194,18 @@ describe("the attempt gate", () => {
 });
 
 describe("interceptorConfigFromEnv", () => {
-  it("defaults to 5 attempts per command and 10 runs per session, and clamps bad values", () => {
+  it("defaults to 2 attempts per command and 4 runs per session, takes valid overrides, and falls back on bad values", () => {
     const d = interceptorConfigFromEnv({ AGENT_AUTO_DEBUG: "1" });
     expect(d.enabled).toBe(true);
-    expect(d.maxPerKey).toBe(5);
-    expect(d.maxPerRun).toBe(10);
+    expect(d.maxPerKey).toBe(2);
+    expect(d.maxPerRun).toBe(4);
+    const set = interceptorConfigFromEnv({ AGENT_AUTO_DEBUG: "1", AGENT_AUTO_DEBUG_ATTEMPTS: "5", AGENT_AUTO_DEBUG_MAX: "10" });
+    expect(set.maxPerKey).toBe(5);
+    expect(set.maxPerRun).toBe(10);
+    // not a number, or outside the allowed range: the default is used
     const bad = interceptorConfigFromEnv({ AGENT_AUTO_DEBUG: "1", AGENT_AUTO_DEBUG_ATTEMPTS: "abc", AGENT_AUTO_DEBUG_MAX: "9999" });
-    expect(bad.maxPerKey).toBe(5);
-    expect(bad.maxPerRun).toBe(10);
+    expect(bad.maxPerKey).toBe(2);
+    expect(bad.maxPerRun).toBe(4);
   });
   it("is off unless AGENT_AUTO_DEBUG is set", () => {
     expect(interceptorConfigFromEnv({}).enabled).toBe(false);

@@ -339,6 +339,18 @@ npx ts-node src/cli.ts run "task" -p /path --serve   # one-shot run, same socket
 - **Mission**: `TaskManifest.mission` keeps the original request (12000 chars); a follow-up like "continue" is planned against it. Layout named in the request (for example `packages/db`) wins over the default `apps/web` layout; conflicts go to assumptions/questions.
 - Env: `AGENT_TEAM_MAX_TASKS` (default 9, max 12) caps plan size; `AGENT_GUIDELINES=0`; `AGENT_STALL_GUARD=0`.
 
+## Local git workflow in team mode (Oct 25, 2026)
+
+`team/git-flow.ts` (class `GitFlow`, wired into `runTeam` in `team/orchestrator.ts`) gives every team run a reviewable history. It is local only.
+
+- **Branches**: the person's branch (`base`) is never touched. `runTeam` creates `feature/<slug(goal)>`; sequential runs cut `task/NN-<role>-<title>` per task, commit the task's files (conventional message from `commitSubject`: `feat(api): ...`, infra -> `chore`, qa -> `test`, debug -> `fix`, not-done -> `wip: ...`, subject <= 72 chars) and merge it `--no-ff` into the feature branch, then delete it with `branch -d`. Parallel runs (`OrchestraMaster`) commit path-scoped per task on the feature branch (`commitFiles`) and sweep the rest with `commitAll`. The starter-page repair and the safety fix get their own commits.
+- **Never**: push, force, `reset`, `clean`, `rebase`, edit a user file for ignores. Ignores (the tasks folder, secrets such as `.env`) go to `.git/info/exclude`. Nothing is merged into `base`: at the end the run prints the review and merge commands (`result.git.commands`) and any branch that was kept open (`openBranches`).
+- **Safe fallbacks**: any git failure turns the flow off for the rest of the run and the work continues. Skipped when `AGENT_GIT=0`, when the project folder is inside another repo (it must be the repo root), or when the working tree is dirty and the run is not interactive (with `approvePlan` the person is asked). A folder that is not a repo gets `git init`.
+- **Resume**: `TaskManifest.git = { base, feature }` (`task-store.setGit`); `/tasks resume` returns to the saved feature branch.
+- **Engineers**: knowledge `13-delivery/01-git-versioning.md` tells them not to branch/commit themselves in a team task; the harness does it.
+- Tests: `team/git-flow.test.ts` (real git in tmp dirs), `team/orchestrator.test.ts` ("local git"; other orchestrator tests set `AGENT_GIT=0`).
+- Env: `AGENT_GIT=0` disables the whole flow.
+
 ## Known limits
 
 - The `13-delivery/08-recipe-monorepo-db-package.md` layout (`packages/db`) and `prisma generate` itself were not run end to end in the checking sandbox (engine download blocked); the real exit codes on the owner's machine are the proof.

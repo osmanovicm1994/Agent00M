@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { execFileSync } from "child_process";
 import { runTeam } from "./orchestrator";
 
 // runTeam with a fake model and a fake executor: no network, no real agent loop. It checks what the team passes around.
@@ -31,7 +32,7 @@ interface Call {
   context: string;
 }
 
-function fakes(opts: { onDesign?: () => void } = {}) {
+function fakes(opts: { onDesign?: () => void; writeFiles?: boolean } = {}) {
   const calls: Call[] = [];
   const llmCalls: Array<{ system: string; user: string }> = [];
   const llm = {
@@ -50,6 +51,7 @@ function fakes(opts: { onDesign?: () => void } = {}) {
       calls.push({ agent: agent.id, task, context: context ?? "" });
       if (agent.id === "safety") return { finalMessage: "VERDICT: PASS\nCHECKED: x", filesWritten: [], commandsRun: [], stepsTaken: 1 };
       if (agent.id === "design") opts.onDesign?.();
+      if (opts.writeFiles) write(`apps/web/src/${agent.id}.ts`, `export const ${agent.id} = "${calls.length}";\n`);
       return { finalMessage: "Done", filesWritten: [`apps/web/src/${agent.id}.ts`], commandsRun: ["npm run build"], stepsTaken: 3 };
     },
   };
@@ -61,8 +63,11 @@ beforeEach(() => {
   logs = [];
   vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
   delete process.env.AGENT_TASKS_DIR;
+  // Most tests are not about git; the git tests below switch it on.
+  process.env.AGENT_GIT = "0";
 });
 afterEach(() => {
+  delete process.env.AGENT_GIT;
   vi.restoreAllMocks();
   fs.rmSync(ws, { recursive: true, force: true });
 });
@@ -149,5 +154,43 @@ describe("runTeam: the generated starter page", () => {
     expect(res!.complete).toBe(false);
     const report = f.llmCalls.find((c) => c.system.includes("closing out a piece of work"))!;
     expect(report.user).toContain("starterPageStillInPlace");
+  });
+});
+
+describe("runTeam: local git", () => {
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: ws, encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    delete process.env.AGENT_GIT;
+  });
+
+  it("builds on a feature branch, one commit per task, and leaves the base branch alone", async () => {
+    git("init", "-q");
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "T");
+    write("README.md", "hello\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+    const base = git("rev-parse", "--abbrev-ref", "HEAD");
+    const baseHead = git("rev-parse", "HEAD");
+
+    const res = await run(fakes({ writeFiles: true }), "Build the app");
+
+    expect(res!.git).toBeDefined();
+    expect(res!.git!.base).toBe(base);
+    expect(res!.git!.feature).toMatch(/^feature\//);
+    expect(git("rev-parse", base)).toBe(baseHead);
+    const subjects = git("log", "--format=%s", `${base}..${res!.git!.feature}`).split("\n");
+    expect(subjects.some((s) => s.startsWith("feat(api)"))).toBe(true);
+    expect(subjects.some((s) => s.startsWith("feat(ui)"))).toBe(true);
+    expect(git("status", "--porcelain")).toBe("");
+    expect(logs.join("\n")).toContain("git merge");
+  });
+
+  it("does not use git at all with AGENT_GIT=0", async () => {
+    process.env.AGENT_GIT = "0";
+    const res = await run(fakes({ writeFiles: true }), "Build the app");
+    expect(res!.git).toBeUndefined();
+    expect(fs.existsSync(path.join(ws, ".git"))).toBe(false);
   });
 });

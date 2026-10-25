@@ -57,6 +57,8 @@ export interface TaskManifest {
   uxSpec?: string;
   /** Verdict of the last Safety Review, when one ran. */
   safety?: string;
+  /** The local git branches of this job (see git-flow.ts): the branch it started from and the feature branch that holds the work. */
+  git?: { base: string; feature: string };
   tasks: StoredTask[];
 }
 
@@ -250,6 +252,11 @@ export function updateTask(workspace: string, manifest: TaskManifest, index: num
     text = `${text.replace(/\s*$/, "")}\n\n${entry}\n`;
   }
   atomicWrite(file, text);
+}
+
+export function setGit(workspace: string, manifest: TaskManifest, git: { base: string; feature: string }): void {
+  manifest.git = git;
+  saveManifest(workspace, manifest);
 }
 
 export function setSafety(workspace: string, manifest: TaskManifest, verdict: string): void {

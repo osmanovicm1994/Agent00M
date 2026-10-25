@@ -10,6 +10,7 @@
 ## Branches
 - `main` is always green (typecheck, tests, build pass). Work happens on `feature/<name>` (kebab-case). In team mode each task gets `task/<area>-<what>` (for example `task/auth-model`) cut from the feature branch.
 - Merge with `git merge --no-ff <branch>` so history shows the feature, then delete the merged branch. Resolve a conflict by reading both sides; never pick one blindly.
+- Team mode does this for you: before the engineers start, the harness creates `feature/<goal>` (the person's own branch is never touched) and one `task/NN-<role>-<title>` branch per task, commits the task's files with a conventional message and merges it `--no-ff` into the feature branch. As an engineer do NOT create, switch, merge or delete branches and do NOT run `git add` / `git commit` in a team task: stay on the branch you are on and write files; the harness commits them. Outside team mode (a single-agent run) follow the rules in this section yourself.
 - The agent never pushes, force-pushes, rebases shared history or runs `git reset --hard` / `git clean -fd` without approval. Provide the push command for the person.
 
 ## Commits (Conventional Commits)

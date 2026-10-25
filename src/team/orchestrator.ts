@@ -34,6 +34,7 @@ import { planToOrchTasks } from "./parallel";
 import { projectTree } from "./tree";
 import { describeStarter, findStarterContent, starterFixTask, type ScaffoldFinding } from "./scaffold-gate";
 import { findSpecFiles, specWarnings } from "./spec-files";
+import { GitFlow, type GitLevel, type GitSummary } from "./git-flow";
 import { NO_FILES_NUDGE, applyEvidence, isComplete, lacksEvidence } from "./evidence";
 import {
   ASSIGNABLE_ROLES,
@@ -52,6 +53,7 @@ import {
   hasOpenTasks,
   loadTaskManifest,
   readTaskDoc,
+  setGit,
   setSafety,
   tasksDirName,
   updateTask,
@@ -80,6 +82,8 @@ export interface TeamResult {
   interrupted: boolean;
   /** Every task done (builders wrote files), not stopped, and the safety review passed or had nothing to review. */
   complete: boolean;
+  /** The local git branches of this run (see git-flow.ts). Absent when git was not used. */
+  git?: GitSummary;
   report: string;
 }
 
@@ -289,6 +293,19 @@ function fallbackReport(r: Omit<TeamResult, "report">): string {
   return lines.join("\n");
 }
 
+function printGit(g: GitSummary): void {
+  const lines = [
+    `Git: all work of this run is on branch ${g.feature} (your branch ${g.base} is untouched), ${g.commits.length} commit(s).`,
+    ...(g.openBranches.length ? [`Not merged, kept for you: ${g.openBranches.join("; ")}`] : []),
+    ...(g.stoppedBecause ? [`The git workflow stopped early: ${g.stoppedBecause}`] : []),
+    "Review, then merge when you are happy:",
+    ...g.commands.map((c) => `  ${c}`),
+  ];
+  console.log(pc.bold("\n⎇ Git"));
+  lines.forEach((l) => console.log(pc.dim(l)));
+  bus.emit("log", { text: lines.join("\n"), level: "info" });
+}
+
 const emptyPlan = (): PmPlan => ({ goal: "", assumptions: [], risks: [], questions: [], tasks: [] });
 
 /** A result for runs that build nothing (plan only, nothing to resume). `ok` decides how the caller words it. */
@@ -419,6 +436,33 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
   }
 
+  // Local git: a feature branch for the job and one branch per task (see git-flow.ts). Never stops the work.
+  const gitLog = (line: string, level: GitLevel = "info"): void => {
+    console.log(level === "warn" ? pc.yellow(`⚠ git: ${line}`) : pc.dim(`⎇ ${line}`));
+    bus.emit("log", { text: `git: ${line}`, level: level === "warn" ? "warn" : level === "step" ? "step" : "info" });
+  };
+  const gitFlow: GitFlow | null = await GitFlow.start({
+    root: opts.workspaceRoot,
+    goal: plan.goal || missionText,
+    resume: resuming ? manifest?.git : undefined,
+    confirm: opts.approvePlan
+      ? async (question: string) => {
+          const a = await prompts({ type: "confirm", name: "ok", message: question, initial: true });
+          return a.ok === true;
+        }
+      : undefined,
+    log: gitLog,
+    tasksDir: tasksDirName(),
+  });
+  if (gitFlow && manifest) {
+    try {
+      const { base, feature } = gitFlow.info();
+      setGit(opts.workspaceRoot, manifest, { base, feature });
+    } catch {
+      // the task files are a convenience
+    }
+  }
+
   const outcomes: TeamTaskOutcome[] = [];
   const files = new Set<string>();
   const commands: string[] = [];
@@ -501,6 +545,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
 
     if (t.role !== "qa") lastEngineer = t.role;
+    gitFlow?.beginTask(i + 1, t.role, t.title);
     // The task file as it is on disk now: a hand-edited ticket is what the engineer follows.
     const doc = manifest ? readTaskDoc(opts.workspaceRoot, manifest, i) : "";
     // The task text also steers which standards the Executor loads (keywords such as "NextAuth" or "wizard"), so the planner's
@@ -525,6 +570,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     if (status !== rawStatus) console.log(pc.yellow(`⚠ ${title}: no file was written, so this task is NOT counted as done.`));
     const summary = clip(res.finalMessage, MAX_SUMMARY);
     outcomes.push({ role: t.role, title: t.title, status, summary });
+    gitFlow?.endTask(i + 1, t.role, t.title, status, res.filesWritten);
     const note =
       `- ${title} (${status}): ${t.title}. Files: ${res.filesWritten.join(", ") || "none"}. ${clip(res.finalMessage, 300)}` +
       (t.contract ? `\n  Contract: ${clip(t.contract, 500)}` : "");
@@ -590,10 +636,12 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
           `- ${ROLE_TITLES[t.role] ?? t.role} (${status}): ${t.title}. Files: ${o.filesWritten.join(", ") || "none"}.` +
           (t.contract ? `\n  Contract: ${clip(t.contract, 500)}` : "");
         notes.push(note);
+        gitFlow?.commitFiles(t.role, t.title, status, o.filesWritten);
         record(idx, toStored(status), { summary: clip(o.summary, MAX_SUMMARY), note, filesWritten: o.filesWritten, commandsRun: o.commandsRun });
         if (t.role !== "qa") lastEngineer = t.role;
         if (o.status === "interrupted") interrupted = true;
       }
+      gitFlow?.commitAll("chore: save remaining changes from the parallel run");
       const denied = [...new Set(res.denials.map((d) => `${d.owner}: ${d.path}`))];
       if (denied.length) {
         blockedWrites.push(...denied);
@@ -626,6 +674,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
       );
       fixRes.filesWritten.forEach((f) => files.add(f));
       commands.push(...fixRes.commandsRun);
+      gitFlow?.commitAll("fix(ui): replace the generated starter page");
       starterLeft = findStarterContent(opts.workspaceRoot).filter((f) => f.blocking);
       const fixStatus: TaskStatus = fixRes.interrupted ? "interrupted" : starterLeft.length > 0 || isStopped(fixRes) ? "incomplete" : "done";
       outcomes.push({ role: "design", title: fixTitle, status: fixStatus, summary: clip(fixRes.finalMessage, MAX_SUMMARY) });
@@ -654,6 +703,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         );
         fixRes.filesWritten.forEach((f) => files.add(f));
         commands.push(...fixRes.commandsRun);
+        gitFlow?.commitAll("fix(safety): fix the blockers found by the safety review");
         outcomes.push({ role: lastEngineer, title: "Fix safety blockers", status: fixRes.interrupted ? "interrupted" : isStopped(fixRes) ? "incomplete" : "done", summary: clip(fixRes.finalMessage, MAX_SUMMARY) });
         if (fixRes.interrupted) {
           interrupted = true;
@@ -675,6 +725,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
   }
 
+  const gitSummary = gitFlow?.finish();
   const complete = isComplete({ statuses: outcomes.map((o) => o.status), interrupted, safety });
   const base: Omit<TeamResult, "report"> = {
     plan,
@@ -685,6 +736,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     safetyNotes,
     interrupted,
     complete,
+    ...(gitSummary ? { git: gitSummary } : {}),
   };
 
   // Delivery report from the PM, based only on the recorded facts.
@@ -715,6 +767,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
 
   console.log(pc.bold("\n📦 Delivery report"));
   console.log(report);
+  if (gitSummary) printGit(gitSummary);
   if (safety === "FAIL") console.log(pc.red("\n⚠ The Safety Reviewer still reports blockers. Review the findings above before using these changes."));
   if (safety === "UNKNOWN") console.log(pc.yellow("\n⚠ The Safety Reviewer gave no clear verdict. Treat the changes as unreviewed."));
   if (manifest && !complete && hasOpenTasks(manifest)) console.log(pc.dim(`\nTask state is saved in ${tasksDirName()}/. Continue unfinished work with /tasks resume (or run --resume).`));
