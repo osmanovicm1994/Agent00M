@@ -25,7 +25,7 @@ import { styleToolSchemas, runStyleCheck } from "../tools/styles.tool";
 import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
-import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
+import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, repeatedFailureReport, summarizeFailures } from "./run-feedback";
 import type { ExecutorHooks } from "./executor-hooks";
 import { LoopWatch, adviseBeforeRun, diagnoseFailure, formatDiagnosis, haltText, refuseRecursiveInstallScript } from "./toolchain-doctor";
 import { StallGuard, classifyCall, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
@@ -1364,9 +1364,10 @@ When you are done and have no more actions to take, reply normally with a final 
         }
         const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
         const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
+        if (!failed) state.repeats.clear();
         if (repeatCount >= REPEAT_LIMIT) {
-          console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
-          logLine(`Same failure ${repeatCount} times: telling the agent to stop and report.`, "warn");
+          console.log(pc.yellow(`\n(Same failure ${repeatCount} times — the run will stop unless auto-debug verifies a fix.)`));
+          logLine(`Same failure ${repeatCount} times: stopping unless auto-debug verifies a fix.`, "warn");
         }
 
         // The same command succeeding again and again (nothing written in between) is a loop, not progress.
@@ -1390,8 +1391,18 @@ When you are done and have no more actions to take, reply normally with a final 
         // A diagnosed failure is not a code bug the Debug Agent could patch: it would only burn its attempts on it.
         if (failed && !diagnosis && knownFixes.length === 0 && this.hooks.commandInterceptor) {
           autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, command, output: result.output, exitCode: result.exitCode });
-          if (autoDebug?.verified) state.lastRunFailed = false;
+          if (autoDebug?.verified) {
+            state.lastRunFailed = false;
+            state.repeats.clear();
+          }
           if (autoDebug?.halt) state.haltMessage = autoDebug.halt;
+        }
+
+        // Repeat warnings alone relied on the model to obey an instruction. A local model can ignore that nudge and
+        // keep overwriting the same file, so enforce the stop after auto-debug has had its bounded chance to verify a fix.
+        if (repeatCount >= REPEAT_LIMIT && !autoDebug?.verified && !state.haltMessage) {
+          state.haltMessage = repeatedFailureReport(command, result.output, repeatCount);
+          state.haltLabel = "🛑 Stopped: the same command failure repeated without a verified fix.";
         }
 
         return JSON.stringify({

@@ -36,6 +36,9 @@ export const DANGEROUS_COMMAND_RES: RegExp[] = [
   new RegExp(`${BOUNDARY}(sudo|su|rm|rmdir|unlink|shred|dd|mkfs\\w*|chown|kill|pkill|killall|shutdown|reboot|halt)\\b`),
   /\bchmod\b.*\s-\w*R/,
   /\bgit\s+(reset\s+--hard|clean|push|rebase|checkout\s+(--|\.)|restore|stash\s+(drop|clear)|branch\s+-D|filter-branch|update-ref|rm)\b/,
+  // Writing git configuration (user.name, user.email, hooks path, ...) changes who commits are attributed to. A model must not invent
+  // an identity: it asks, even in auto mode. Reading the configuration is fine.
+  /\bgit\s+config\b(?!\s+(?:--get(?:-all)?|--list|-l|--show-origin)\b)/,
   /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/,
   /\b(npm|pnpm|yarn)\s+(publish|unpublish|login|adduser)\b/,
   /\b(npm|pnpm)\s+(i|install|add)\b.*\s(-g|--global)\b|\byarn\s+global\b/,

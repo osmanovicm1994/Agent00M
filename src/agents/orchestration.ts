@@ -131,7 +131,9 @@ export function rankDomains(task: string, opts: RankOptions = {}): DomainScore[]
   }
 
   // Whole-app build: the general dev agent leads, unless the task is really a failure report or a research ask.
-  if (isFullstackBuild(task) && !scores.debug && !scores.research && !opts.automationProject) {
+  // One stray failure word ("if a command fails, report it" in a long spec) is not a failure report: debug has to carry
+  // at least 3 signals to veto the whole-app route.
+  if (isFullstackBuild(task) && (scores.debug ?? 0) < 3 && !scores.research && !opts.automationProject) {
     const best = Math.max(0, ...Object.values(scores));
     scores.dev = best + 1;
   }

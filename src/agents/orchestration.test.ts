@@ -31,6 +31,17 @@ describe("rankDomains / pickByKeywords", () => {
     expect(ids("update the dependencies and look up the latest version of nestjs")).not.toContain("research");
   });
 
+  it("sends a whole-app build to dev even when one stray failure word appears in the spec", () => {
+    const task =
+      "Build or finish an MVP car marketplace. Scaffold the app with a Prisma schema and migrations, REST endpoints and an admin UI. If a command fails, report it.";
+    expect(pickByKeywords(rankDomains(task))).toBe("dev");
+  });
+
+  it("still treats a real failure report as debug even when the task says scaffold", () => {
+    const task = "the scaffold script crashes: npm run build fails with TS2345 and cannot find module";
+    expect(pickByKeywords(rankDomains(task))).toBe("debug");
+  });
+
   it("treats generic test words as QA only in a test-automation project", () => {
     expect(ids("write tests for the login screen")).toEqual([]);
     expect(ids("write tests for the login screen", { automationProject: true })).toEqual(["qa"]);

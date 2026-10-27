@@ -21,9 +21,11 @@
 // its scope. A plan that cannot be run safely in parallel (no scope, overlapping scopes, a cycle) runs one after
 // another exactly as before. A resume always runs the remaining tasks one after another.
 
+import * as fs from "fs";
+import * as path from "path";
 import pc from "picocolors";
 import prompts from "prompts";
-import type { LLMProvider } from "../llm/types";
+import type { ChatOptions, LLMProvider } from "../llm/types";
 import { bus } from "../core/events";
 import type { Executor, ExecutorResult } from "../core/executor";
 import { getAgent } from "../agents/definitions";
@@ -126,6 +128,13 @@ const MAX_SUMMARY = 700;
 // How many tasks one plan may have. A whole application needs 6 to 9 (the planner prompt says so); AGENT_TEAM_MAX_TASKS changes the cap.
 const MAX_PLAN_TASKS = Math.min(12, Math.max(1, Math.floor(Number(process.env.AGENT_TEAM_MAX_TASKS)) || 9));
 
+// Output budget of one Project Manager call. A whole application is 6-12 tasks plus a coverage map for dozens of requirements;
+// 2500 tokens was too small for that. An explicit maxTokens also switches automatic continuation off, so it must be generous.
+// AGENT_PM_MAX_TOKENS changes it (2500-12000).
+const PM_MAX_TOKENS = Math.min(12000, Math.max(2500, Math.floor(Number(process.env.AGENT_PM_MAX_TOKENS)) || 6000));
+// One first try plus two repairs. The repairs see the rejected plan and the exact problems.
+const PM_ATTEMPTS = 3;
+
 const UI_WORDS = /\b(ui|user interface|front-?end|pages?|screens?|dashboard|login|web ?app|website|wizard)\b/i;
 
 /** The plan builds something a person opens in a browser (a UX or frontend task, or the goal says so). */
@@ -138,26 +147,26 @@ function clip(s: string, n: number): string {
   return t.length > n ? `${t.slice(0, n)} …` : t;
 }
 
-async function ask(llm: LLMProvider, system: string, user: string, maxTokens = 2500): Promise<string> {
+async function ask(llm: LLMProvider, system: string, user: string, maxTokens = 2500, extra: ChatOptions = {}): Promise<string> {
   const res = await llm.chat(
     [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
     undefined,
-    { temperature: 0.2, maxTokens },
+    { temperature: 0.2, maxTokens, ...extra },
   );
   return res.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
 // A lead-role step: Gemini first when available, the local model otherwise.
-async function lead(opts: TeamOptions, system: string, user: string, maxTokens: number, json = false): Promise<string> {
+async function lead(opts: TeamOptions, system: string, user: string, maxTokens: number, json = false, extra: ChatOptions = {}): Promise<string> {
   if (opts.think) {
     const text = await opts.think(system, user, maxTokens, json);
     if (text) return text;
     console.log(pc.dim("  (Gemini unavailable for this step, the local model takes over)"));
   }
-  return ask(opts.llm, system, user, maxTokens);
+  return ask(opts.llm, system, user, maxTokens, extra);
 }
 
 // The PM and the UX designer plan from the real tree of the project (three levels), so they know what exists.
@@ -170,10 +179,138 @@ function parsePlan(raw: string): PmPlan {
   return pmPlanSchema.parse(JSON.parse(raw.slice(start, end + 1)));
 }
 
+/** Zod's default message is a multiline JSON array; showing only its first line hides the useful validation path. */
+function describePlanError(error: unknown): string {
+  const issues = (error as { issues?: unknown } | null)?.issues;
+  if (Array.isArray(issues)) {
+    const details = issues.slice(0, 8).map((issue) => {
+      const item = issue as { path?: unknown[]; message?: unknown };
+      const field = Array.isArray(item.path) && item.path.length ? item.path.join(".") : "plan";
+      return `${field}: ${String(item.message ?? "invalid value")}`;
+    });
+    if (issues.length > details.length) details.push(`and ${issues.length - details.length} more validation error(s)`);
+    return details.join("; ");
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, " ").trim().slice(0, 700);
+}
+
+// Text comparison for the coverage check. The request is Markdown (backticks, bold, bullets, curly quotes) and a model that
+// writes a quote into JSON drops or changes those marks, so both sides are reduced to plain lowercase words first.
+function normalizeText(s: string): string {
+  return s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[`*_~]/g, "")
+    .replace(/[\u201C\u201D\u201E\u2018\u2019"']/g, "")
+    .replace(/[\u2013\u2014\u2011]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// A quote may be shortened with an ellipsis ("..." or the single character); every piece must occur, in order.
+function quoteFound(haystack: string, quote: string): boolean {
+  const pieces = quote
+    .split(/\u2026|\.{3}/)
+    .map((p) => normalizeText(p).replace(/^[-\u2022]\s+/, "").replace(/[.;:,!?]+$/, "").trim())
+    .filter((p) => p.length >= 6);
+  if (pieces.length === 0) return false;
+  let from = 0;
+  for (const piece of pieces) {
+    const at = haystack.indexOf(piece, from);
+    if (at === -1) return false;
+    from = at + piece.length;
+  }
+  return true;
+}
+
+function sameCriterion(a: string, b: string): boolean {
+  const x = normalizeText(a);
+  const y = normalizeText(b);
+  return x.length > 0 && y.length > 0 && (x === y || x.includes(y) || y.includes(x));
+}
+
+// Tasks that come from the team's own process (skeleton, installs, final checks), not from one sentence of the request.
+// They need no coverage entry.
+const PROCESS_ROLES = new Set(["infra", "qa", "debug"]);
+
+export interface CoverageReport {
+  /** Problems the planner can fix on a retry. Empty = the coverage map is clean. */
+  issues: string[];
+  /** Coverage entries that were checked against the request and kept. */
+  verified: number;
+}
+
+/**
+ * Checks the PM's traceability map against the request. It is a quality aid, not a gate on the plan itself:
+ * an entry that cannot be verified is dropped from `plan.coverage` (never trusted) and reported as an issue the
+ * planner can repair; it never discards the plan. Quotes are compared without Markdown marks, case and trailing punctuation.
+ */
+export function validatePlanCoverage(plan: PmPlan, source: string): CoverageReport {
+  const issues: string[] = [];
+  const haystack = normalizeText(source);
+  const seen = new Set<string>();
+  const covered = new Set<number>();
+  let verified = 0;
+
+  if (plan.coverage.length === 0) {
+    issues.push("coverage is empty; add one entry per actionable requirement: a short verbatim quote, the task number and one exact acceptance criterion of that task");
+  }
+
+  plan.coverage = plan.coverage.filter((item, i) => {
+    const label = `coverage entry ${i + 1}`;
+    const task = plan.tasks[item.task - 1];
+    if (!task) {
+      issues.push(`${label} points to missing task ${item.task}`);
+      return false;
+    }
+    // The same requirement may legitimately be implemented by two tasks; only an exact repeat for the same task is dropped.
+    const key = `${item.task}|${normalizeText(item.requirement)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+
+    if (!quoteFound(haystack, item.requirement)) {
+      issues.push(`${label}: "${item.requirement.trim().slice(0, 160)}" was not found in the request (case and Markdown marks are ignored). Quote at most 15 words, verbatim, without backticks or asterisks.`);
+      return false;
+    }
+    if (!task.acceptance.some((a) => sameCriterion(a, item.acceptance))) {
+      issues.push(`${label}: the acceptance text does not match any criterion of task ${item.task}; copy one criterion exactly.`);
+      return false;
+    }
+    covered.add(item.task);
+    verified++;
+    return true;
+  });
+
+  plan.tasks.forEach((task, i) => {
+    if (task.acceptance.length > 0 && !covered.has(i + 1) && !PROCESS_ROLES.has(task.role)) {
+      issues.push(`task ${i + 1} (${task.role}) has no verified coverage entry: map a request requirement to it, or remove the task`);
+    }
+  });
+  if (verified === 0 && plan.tasks.length > 0 && issues.length > 0 && !issues[0].startsWith("coverage is empty")) {
+    issues.unshift("no coverage entry could be verified against the request");
+  }
+  return { issues, verified };
+}
+
+// Keeps the rejected answer so a planning failure can be inspected instead of guessed at. Diagnostics only: never throws.
+function saveRejectedPlan(root: string, raw: string): void {
+  if (!raw.trim()) return;
+  try {
+    const dir = path.join(root, tasksDirName());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "rejected-plan.json"), raw);
+    console.log(pc.dim(`  The last rejected plan is saved in ${tasksDirName()}/rejected-plan.json`));
+  } catch {
+    // diagnostics only
+  }
+}
+
 // `mission` is the original request of this job when the current message is a follow-up of it (see TaskManifest.mission);
 // `prior` is the saved plan with its open tasks. Both let the planner finish the job instead of starting a new, smaller one.
 async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManifest | null, specBlock = ""): Promise<PmPlan> {
   const followUp = Boolean(mission && mission.trim() !== opts.task.trim());
+  const coverageSource = [mission, opts.task, opts.context, specBlock].filter(Boolean).join("\n\n");
   const user =
     (followUp ? `<mission>\n${clip(mission as string, 6000)}\n</mission>\n\n` : "") +
     `<request>\n${opts.task}\n</request>\n\n` +
@@ -183,9 +320,22 @@ async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManif
     (specBlock ? `\n\n<referenced_files>\n${specBlock}\n</referenced_files>` : "");
   const system = PM_SYSTEM + (opts.parallel ? PM_PARALLEL_ADDENDUM : "") + PM_KNOWLEDGE;
 
-  let lastErr = "";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const raw = await lead(opts, system, attempt === 0 ? user : `${user}\n\nYour previous answer was not valid (${lastErr}). Reply with ONLY the JSON object.`, 2500, true);
+  // The planner's answer is validated, so it must never come from the response cache (noCache): a rejected answer would be
+  // replayed for every identical request. A repair gets the rejected plan and the exact problems, and a little more temperature
+  // so it does not reproduce the same text.
+  let rejected = "";
+  let feedback: string[] = [];
+  let best: PmPlan | null = null;
+  let bestIssues: string[] = [];
+
+  for (let attempt = 0; attempt < PM_ATTEMPTS; attempt++) {
+    const prompt =
+      attempt === 0
+        ? user
+        : `${user}\n\n<rejected_plan>\n${rejected}\n</rejected_plan>\n\n<validation_errors>\n${feedback.map((f) => `- ${f}`).join("\n")}\n</validation_errors>\n\n` +
+          "Return the SAME plan with ONLY these errors fixed. Keep every valid task and coverage entry. Reply with ONLY the required JSON object (no markdown).";
+    const raw = await lead(opts, system, prompt, PM_MAX_TOKENS, true, { noCache: true, temperature: attempt === 0 ? 0.2 : 0.4 });
+    rejected = raw.length > 12000 ? raw.slice(0, 12000) : raw;
     try {
       const plan = parsePlan(raw);
       // Keep only roles that exist; unknown ones fall back to the general engineer.
@@ -193,12 +343,28 @@ async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManif
         ...t,
         role: (ASSIGNABLE_ROLES as readonly string[]).includes(t.role) ? t.role : "dev",
       }));
-      return plan;
+      const report = validatePlanCoverage(plan, coverageSource);
+      if (report.issues.length === 0) return plan;
+      best = plan;
+      bestIssues = report.issues;
+      feedback = report.issues.slice(0, 12);
     } catch (err: any) {
-      lastErr = String(err?.message ?? err).split("\n")[0].slice(0, 200);
+      feedback = [describePlanError(err)];
+      if (/json|unexpected|end of input/i.test(feedback[0])) {
+        feedback.push("The reply was not valid JSON (it may have been cut off). Keep the same structure and shorten the instructions.");
+      }
     }
   }
-  throw new Error(`could not get a usable plan from the Project Manager (${lastErr})`);
+
+  // The coverage map is a quality aid: when the tasks themselves are valid, use the plan and say plainly what was not verified,
+  // instead of throwing the plan away and letting a single agent attempt the whole job without one.
+  if (best) {
+    best.assumptions.push(`Traceability not fully verified: ${bestIssues.length} issue(s) in the requirement coverage map (first: ${bestIssues[0].slice(0, 160)}).`);
+    console.log(pc.yellow(`⚠ The plan is used, but ${bestIssues.length} coverage issue(s) could not be verified: ${bestIssues.slice(0, 3).join("; ")}`));
+    return best;
+  }
+  saveRejectedPlan(opts.workspaceRoot, rejected);
+  throw new Error(`could not get a usable plan from the Project Manager (${feedback.slice(0, 5).join("; ").slice(0, 700)})`);
 }
 
 function printPlan(plan: PmPlan, parallel: boolean): void {
@@ -216,6 +382,7 @@ function printPlan(plan: PmPlan, parallel: boolean): void {
   if (plan.assumptions.length) console.log(pc.dim(`  Assumptions: ${plan.assumptions.join("; ")}`));
   if (plan.risks.length) console.log(pc.yellow(`  Risks: ${plan.risks.join("; ")}`));
   if (plan.questions.length) console.log(pc.yellow(`  Open questions: ${plan.questions.join("; ")}`));
+  console.log(pc.dim(`  Requirement coverage: ${plan.coverage.length} request items mapped to task acceptance checks.`));
   console.log(pc.dim("  🛡  A Safety Reviewer checks the result at the end.\n"));
 
   // The same plan as plain text for the dashboard.
@@ -228,6 +395,7 @@ function printPlan(plan: PmPlan, parallel: boolean): void {
   if (plan.assumptions.length) lines.push(`Assumptions: ${plan.assumptions.join("; ")}`);
   if (plan.risks.length) lines.push(`Risks: ${plan.risks.join("; ")}`);
   if (plan.questions.length) lines.push(`Open questions: ${plan.questions.join("; ")}`);
+  lines.push(`Requirement coverage: ${plan.coverage.length} request items mapped to task acceptance checks.`);
   bus.emit("log", { text: lines.join("\n"), level: "plan" });
 }
 
@@ -306,7 +474,7 @@ function printGit(g: GitSummary): void {
   bus.emit("log", { text: lines.join("\n"), level: "info" });
 }
 
-const emptyPlan = (): PmPlan => ({ goal: "", assumptions: [], risks: [], questions: [], tasks: [] });
+const emptyPlan = (): PmPlan => ({ goal: "", assumptions: [], risks: [], questions: [], tasks: [], coverage: [] });
 
 /** A result for runs that build nothing (plan only, nothing to resume). `ok` decides how the caller words it. */
 function noWork(plan: PmPlan, report: string, ok: boolean): TeamResult {

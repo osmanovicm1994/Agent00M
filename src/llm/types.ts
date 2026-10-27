@@ -31,6 +31,9 @@ export interface ToolCall {
 export interface ChatOptions {
   maxTokens?: number;
   temperature?: number;
+  // Skip the response cache for this call (neither read nor write). Used for answers that are validated
+  // afterwards (the team planner): a rejected answer must never be replayed from the cache.
+  noCache?: boolean;
 }
 
 // Timing of one chat() call (all continuation requests included).

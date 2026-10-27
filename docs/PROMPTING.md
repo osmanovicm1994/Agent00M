@@ -138,7 +138,7 @@ Use `/team` when the task needs more than one kind of work: "add checkout with A
 
 ### Writing prompts for parallel runs
 
-The Project Manager splits your task and gives every part a **write scope** (the folders it may write) and what it must wait for. You help it by making the split obvious:
+The Project Manager splits your task and gives every part a **write scope** (the folders it may write) and what it must wait for. It also maps quoted requirements to exact acceptance checks; the CLI rejects invalid task/check references and gives the PM one correction attempt. This catches malformed coverage maps, but the PM can still omit a requirement, so review the displayed task list before approval. You help it by making the split obvious:
 
 > Add comments to posts. Database: add a `Comment` model in `apps/api/prisma/schema.prisma` and a migration. API: `apps/api/src/comments/` with `POST /posts/:id/comments` and `GET /posts/:id/comments`, depending on the schema. Web: a comments section in `apps/web/src/app/posts/[id]/`, depending on the API.
 
@@ -150,7 +150,7 @@ Honest limit: a local model serves requests one after another or a few at a time
 
 It reacts to a failed command (missing package, wrong import, schema error, build error), asks the Debug Agent to fix that one failure, and re-runs the command. It is the same model with the same knowledge, so it cannot fix something the model does not know. If it reports "no safe patch", read the finding: it usually tells you what is missing. Risky commands and commands outside the project are never re-run automatically.
 
-**It gives up after 5 attempts on the same command** (`AGENT_AUTO_DEBUG_ATTEMPTS`). There is no sixth try: the run stops and prints a **Project Failure & Triage Report** with four sections: system telemetry and architecture (stack, folders looked at, attempts used), execution log and blockers (the failing command and its exact output), root cause analysis (what each attempt did), and required user intervention (at most two direct questions). Answer those questions in your next prompt, with the new fact, and the agent continues from there.
+Auto-debug defaults to **2 attempts on the same command** (`AGENT_AUTO_DEBUG_ATTEMPTS`) and **4 debug runs per session** (`AGENT_AUTO_DEBUG_MAX`). When its attempts are exhausted, the run stops with a **Project Failure & Triage Report**. Independently, if the same failure signature occurs three times without a successful command or verified fix, the CLI hard-stops and prints a **REPEATED FAILURE STOP** report with the command and captured error evidence. There is no further retry in that run. Apply a root-cause fix, then start or resume the task.
 
 ---
 
@@ -207,8 +207,8 @@ Tips:
 
 - Paste the **first** error, not the last. Later errors are usually consequences.
 - Use `/use debug` or `run -a debug`. It is told to reproduce, find the cause, fix, and prove the fix.
-- With auto-debug on, a command that still fails after 5 debug attempts ends the run with a **triage report** (section 5). Answer its questions; do not just re-send the same prompt.
-- If it fails the same way three times it must stop and give a **stuck report** (what it tried, what it believes is missing). Read it. It tells you what to supply: a version, a config file, a doc page.
+- With auto-debug on, a command that still fails after the configured debug attempts (default 2 per command) ends the run with a **triage report** (section 5). Answer its questions; do not just re-send the same prompt.
+- The CLI also stops after the same failure signature occurs three times without a successful check or verified fix. Its **REPEATED FAILURE STOP** includes the command and captured error evidence; use those details to fix the cause before continuing.
 - Version problems (Prisma 7, ESM vs CommonJS, Tailwind 4) are the most common loops. Say the exact version you want in the prompt.
 - Do not ask the agent to "try something else" without information. Give it a new fact.
 

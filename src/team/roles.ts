@@ -51,12 +51,20 @@ const taskSchema = z.object({
   contract: z.string().nullish().transform((v) => v?.trim() || undefined),
 });
 
+const coverageSchema = z.object({
+  requirement: z.string().min(1),
+  task: z.number().int().min(1),
+  acceptance: z.string().min(1),
+});
+
 export const pmPlanSchema = z.object({
   goal: z.string().min(1),
   assumptions: z.array(z.string()).nullish().transform((v) => v ?? []),
   risks: z.array(z.string()).nullish().transform((v) => v ?? []),
   questions: z.array(z.string()).nullish().transform((v) => v ?? []),
   tasks: z.array(taskSchema).min(1),
+  // Every quoted requirement must point to a task and one of its checkable acceptance criteria.
+  coverage: z.array(coverageSchema).nullish().transform((v) => v ?? []),
 });
 export type PmPlan = z.infer<typeof pmPlanSchema>;
 
@@ -83,12 +91,14 @@ Planning rules:
 7. Never plan destructive actions (deleting data, force-pushing, dropping tables) unless the user asked for exactly that.
 8. Plan from the <project_tree> you are given. It lists the folders and files that really exist (three levels deep; dependencies, build output and secret files are left out). A path in the tree EXISTS: the task must say to read it and change it in place. A path not in the tree does not exist: say it is a new file and name the folder it goes in. Never invent a path, and never plan a second copy of something that is already in the tree. An empty tree means a new project.
 9. When a task needs a platform command (npm install, prisma migrate, xcodegen, pod install, xcodebuild, gradlew, flutter, cargo, go, docker compose), put the exact command and the folder to run it in under "instructions", and make "a command that exits 0" one of the acceptance criteria.
-10. For a db or api task that other tasks build on, fill "contract" with the interface they rely on, in a few lines: tables and columns, endpoints with request and response shapes, environment variable names. Leave it out for other tasks.
+10. For a db or api task that other tasks build on, fill "contract" with the interface they rely on: tables and columns; each endpoint's HTTP method, exact URL, auth rule, request and response; and environment variable names. For dynamic API paths, state the concrete route file as well (for example '/api/listings/[id]' maps to 'src/app/api/listings/[id]/route.ts' in Next.js App Router). Keep collection and item routes distinct. Leave the contract out for other tasks.
 11. LAYOUT. A layout the request names explicitly WINS (for example "Prisma in packages/db", "apps/api", "src/" at the root): plan exactly that, and write the chosen layout into the instructions of every task it touches. If the request and an attached example contradict each other (one says packages/db, the example tree shows a root prisma/ folder), follow the request text, add the conflict to "assumptions" with the choice you made, and put the question in "questions". Never plan both layouts. When the request names no layout, a new Next.js application is ONE full-stack app in apps/web/ (create-next-app puts it there): API route handlers in apps/web/src/app/api/, Prisma in apps/web/prisma/, shared code in apps/web/src/lib/, pages in apps/web/src/app/. Do not invent apps/api or a second package then. When the tree already has an app, use its real folders (rule 8). The scaffold command and the versions are in the engineers' standards: do not write them from memory, say "scaffold the app as in the standards".
-12. COVERAGE: every numbered requirement, role, screen and route in the request must be covered by the acceptance criteria of exactly one task. Before you answer, go through the request line by line against your tasks. A requirement without a task is a mistake in your plan.
+12. COVERAGE: extract every individually actionable requirement from the request, including constraints, negative requirements, screens, routes, validation, security, storage, and verification. For each, add one "coverage" entry quoting a short phrase from the request (at most 15 words, copied verbatim, WITHOUT Markdown marks such as backticks or asterisks), with the 1-based task number and one acceptance criterion of that task copied exactly. Every entry must quote text that actually occurs in the request, point to an existing task, and point to that task's acceptance criterion. Before you answer, audit the request line by line; do not omit requirements just because they are in prose rather than a numbered list. A requirement without a task is a mistake in your plan. Tasks with role infra, qa or debug come from the team's process and need no coverage entry. One entry may stand for several related sentences; fewer accurate entries are better than many long ones.
 13. INTERFACE: when the request has screens, plan design tasks that BUILD them (login, lists, forms or wizards, detail and print views, admin screens), after the API they call. Split a large interface into 2 or 3 design tasks by area. The first design task replaces the generated starter page and the starter title.
 14. ACCEPTANCE CRITERIA are checks, not claims. Good: "npm --prefix apps/web run build exits 0", "file apps/web/src/app/login/page.tsx exists and renders a login form", "a USER asking GET /api/agreements/<id of another user's agreement> gets 403". Bad: "TypeScript compilation passes" written as if it were already true, "UI looks good".
 15. <mission> is the ORIGINAL request, when it is given. <request> may then be only a follow-up ("continue", "next step", a fix). Plan the work still needed to finish the mission, starting from <previous_plan_state> and <project_tree>. Never replace the mission with the text of the follow-up. If <request> is clearly a different job, ignore the mission.
+16. NEW-PROJECT GATE: when the tree is empty, the infra task must scaffold and install the selected stack, then run the project's typecheck and production build before feature tasks begin. Do not treat a successful scaffold build as proof that later features build; the final QA task checks the completed app.
+17. API ROUTE CHECK: acceptance criteria for an API task must name each collection and item route it implements. If a request includes '/:id', '{id}', or another dynamic segment, the task must assign it to a separate concrete dynamic route file when required by the framework, and its acceptance check must exercise that route.
 
 Reply with ONE JSON object and nothing else, in this shape:
 {
@@ -98,6 +108,9 @@ Reply with ONE JSON object and nothing else, in this shape:
   "questions": ["..."],
   "tasks": [
     { "role": "dev", "title": "short title", "instructions": "what to do, where, how", "acceptance": ["checkable criterion"], "contract": "optional, see rule 10" }
+  ],
+  "coverage": [
+    { "requirement": "exact short quote from the request", "task": 1, "acceptance": "exact criterion from that task" }
   ]
 }`;
 

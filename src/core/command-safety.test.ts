@@ -28,6 +28,9 @@ describe("isDangerousCommand (asks even in auto mode)", () => {
     "docker push registry.example.com/app:1",
     "./gradlew publishToMavenRepository",
     "xcrun altool --upload-app -f app.ipa",
+    "git config user.name Developer",
+    "git init -b main && git config user.email dev@example.com",
+    "git config --global user.name Dev",
   ])("flags %s", (cmd) => {
     expect(isDangerousCommand(cmd)).toBe(true);
   });
@@ -52,6 +55,8 @@ describe("isDangerousCommand (asks even in auto mode)", () => {
     "go build ./...",
     "npx prisma migrate dev --name init",
     "docker compose up -d",
+    "git config --get user.name",
+    "git config --list",
   ])("lets %s run in auto mode", (cmd) => {
     expect(isDangerousCommand(cmd)).toBe(false);
   });

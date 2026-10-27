@@ -99,7 +99,7 @@ The id stays `design` because the router, the team roles, `MOBILE_ROLE` and the 
 
 | Role id | Title | How it runs |
 | --- | --- | --- |
-| `pm` | Project Manager | One plain model call (Gemini when the research stage is on), JSON plan with at most 6 tasks, with `PM_KNOWLEDGE` appended. It plans from `<project_tree>` (three levels, names only, from `team/tree.ts`: existing paths are read and changed in place, other paths are new files) and names the exact platform command and folder for `infra` tasks. Also writes the delivery report from recorded facts |
+| `pm` | Project Manager | A plain model call (Gemini when the research stage is on), with one correction attempt for invalid JSON or coverage; usually 6–9 tasks, up to the configured `AGENT_TEAM_MAX_TASKS` cap, with `PM_KNOWLEDGE` appended. It plans from `<project_tree>` (three levels, names only, from `team/tree.ts`: existing paths are read and changed in place, other paths are new files), maps quoted requirements to exact task acceptance criteria, and names the exact platform command and folder for `infra` tasks. The CLI validates coverage references but cannot detect requirements the PM omitted. Also writes the delivery report from recorded facts |
 | `ux` | UX Designer | One plain model call, writes a build spec (screens, components, states, layout, copy, accessibility). No code |
 | `infra`, `design`, `dev`, `api`, `db`, `debug`, `qa` | Engineers | Run through the Executor with the matching agent, each with a fresh small context; each task also gets task-specific standards from its own title and instructions |
 | `safety` | Safety Reviewer | Executor with `safetyAgent` (`readOnly`), ends with `VERDICT: PASS|FAIL`; one fix round on FAIL |

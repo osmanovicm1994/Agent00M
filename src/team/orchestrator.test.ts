@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { execFileSync } from "child_process";
-import { runTeam } from "./orchestrator";
+import { runTeam, validatePlanCoverage } from "./orchestrator";
 
 // runTeam with a fake model and a fake executor: no network, no real agent loop. It checks what the team passes around.
 
@@ -26,22 +26,33 @@ const PLAN = {
   ],
 };
 
+// A valid plan whose coverage map quotes the first words of the request, the way a real planner does. The validator checks every
+// quote against the request, so a fixture without a coverage map would be rejected.
+function planFor(user: string) {
+  const request = /<request>\n([\s\S]*?)\n<\/request>/.exec(user)?.[1] ?? "";
+  const quote = request.split(/\s+/).slice(0, 3).join(" ");
+  return {
+    ...PLAN,
+    coverage: PLAN.tasks.map((t, i) => ({ requirement: quote, task: i + 1, acceptance: t.acceptance[0] })),
+  };
+}
+
 interface Call {
   agent: string;
   task: string;
   context: string;
 }
 
-function fakes(opts: { onDesign?: () => void; writeFiles?: boolean } = {}) {
+function fakes(opts: { onDesign?: () => void; writeFiles?: boolean; plan?: (user: string) => unknown } = {}) {
   const calls: Call[] = [];
-  const llmCalls: Array<{ system: string; user: string }> = [];
+  const llmCalls: Array<{ system: string; user: string; noCache?: boolean }> = [];
   const llm = {
     model: "fake",
-    async chat(messages: Array<{ role: string; content: string }>) {
+    async chat(messages: Array<{ role: string; content: string }>, _tools?: unknown, options?: { noCache?: boolean }) {
       const system = messages[0].content;
       const user = messages[1]?.content ?? "";
-      llmCalls.push({ system, user });
-      if (system.includes("Project Manager of a small software team")) return { content: JSON.stringify(PLAN) };
+      llmCalls.push({ system, user, noCache: options?.noCache });
+      if (system.includes("Project Manager of a small software team")) return { content: JSON.stringify(opts.plan ? opts.plan(user) : planFor(user)) };
       if (system.includes("closing out a piece of work")) return { content: "REPORT" };
       return { content: "" };
     },
@@ -192,5 +203,113 @@ describe("runTeam: local git", () => {
     const res = await run(fakes({ writeFiles: true }), "Build the app");
     expect(res!.git).toBeUndefined();
     expect(fs.existsSync(path.join(ws, ".git"))).toBe(false);
+  });
+});
+
+describe("validatePlanCoverage", () => {
+  const source = "- Require an authenticated `ADMIN` session for every admin page and mutation.\n- Status values are `DRAFT`, `PUBLISHED`, `ARCHIVED`.";
+  const task = (role: string) => ({ role, title: "t", instructions: "", acceptance: ["A1"], scope: [], dependsOn: [] });
+  const plan = (roles: string[], coverage: unknown[]) =>
+    ({ goal: "g", assumptions: [], risks: [], questions: [], tasks: roles.map(task), coverage }) as any;
+
+  it("accepts a quote whose Markdown marks the planner dropped", () => {
+    const p = plan(["api"], [{ requirement: "Require an authenticated ADMIN session for every admin page and mutation", task: 1, acceptance: "A1" }]);
+    const r = validatePlanCoverage(p, source);
+    expect(r.issues).toEqual([]);
+    expect(r.verified).toBe(1);
+  });
+
+  it("accepts a quote with the status values written without backticks", () => {
+    const p = plan(["db"], [{ requirement: "Status values are DRAFT, PUBLISHED, ARCHIVED.", task: 1, acceptance: "A1" }]);
+    expect(validatePlanCoverage(p, source).issues).toEqual([]);
+  });
+
+  it("accepts a quote shortened with an ellipsis", () => {
+    const p = plan(["api"], [{ requirement: "Require an authenticated ADMIN session ... every admin page and mutation.", task: 1, acceptance: "A1" }]);
+    expect(validatePlanCoverage(p, source).verified).toBe(1);
+  });
+
+  it("drops an entry whose quote is not in the request and reports it, without discarding anything else", () => {
+    const p = plan(["api"], [{ requirement: "Support cryptocurrency checkout", task: 1, acceptance: "A1" }]);
+    const r = validatePlanCoverage(p, source);
+    expect(p.coverage).toHaveLength(0);
+    expect(r.verified).toBe(0);
+    expect(r.issues.join("\n")).toContain("was not found in the request");
+  });
+
+  it("keeps one requirement that two tasks implement", () => {
+    const quote = "Require an authenticated ADMIN session";
+    const p = plan(["api", "design"], [
+      { requirement: quote, task: 1, acceptance: "A1" },
+      { requirement: quote, task: 2, acceptance: "A1" },
+    ]);
+    const r = validatePlanCoverage(p, source);
+    expect(r.verified).toBe(2);
+    expect(r.issues).toEqual([]);
+  });
+
+  it("asks for coverage of a feature task but not of infra, qa or debug tasks", () => {
+    const p = plan(["api", "design", "infra", "qa"], [{ requirement: "Require an authenticated ADMIN session", task: 1, acceptance: "A1" }]);
+    const r = validatePlanCoverage(p, source);
+    expect(r.issues.some((i) => i.includes("task 2 (design)"))).toBe(true);
+    expect(r.issues.some((i) => i.includes("task 3") || i.includes("task 4"))).toBe(false);
+  });
+
+  it("rejects an entry that points to a missing task or to an acceptance text that is not the task's", () => {
+    const p = plan(["api"], [
+      { requirement: "Require an authenticated ADMIN session", task: 5, acceptance: "A1" },
+      { requirement: "Require an authenticated ADMIN session", task: 1, acceptance: "something else entirely" },
+    ]);
+    const r = validatePlanCoverage(p, source);
+    expect(r.verified).toBe(0);
+    expect(r.issues.join("\n")).toContain("missing task 5");
+    expect(r.issues.join("\n")).toContain("does not match any criterion");
+  });
+});
+
+describe("runTeam: planning", () => {
+  const pmCalls = (f: ReturnType<typeof fakes>) => f.llmCalls.filter((c) => c.system.includes("Project Manager of a small"));
+
+  it("asks the planner without the response cache, so a rejected plan is never replayed", async () => {
+    const f = fakes();
+    await run(f, "Build it");
+    expect(pmCalls(f).length).toBeGreaterThan(0);
+    for (const c of pmCalls(f)) expect(c.noCache).toBe(true);
+  });
+
+  it("repairs a rejected plan: the second request carries the rejected plan and the exact problem", async () => {
+    let n = 0;
+    const f = fakes({
+      plan: (user) => {
+        n++;
+        const good = planFor(user);
+        return n === 1 ? { ...good, coverage: [{ requirement: "text that is not in the request", task: 1, acceptance: good.tasks[0].acceptance[0] }] } : good;
+      },
+    });
+    const res = await run(f, "Build the agreements app");
+    expect(res).not.toBeNull();
+    const pm = pmCalls(f);
+    expect(pm).toHaveLength(2);
+    expect(pm[1].user).toContain("<rejected_plan>");
+    expect(pm[1].user).toContain("was not found in the request");
+    expect(res!.plan.assumptions.join()).not.toContain("Traceability not fully verified");
+  });
+
+  it("uses the plan, with a warning, when the coverage map cannot be verified after every attempt", async () => {
+    const f = fakes({
+      plan: (user) => ({ ...planFor(user), coverage: [{ requirement: "text that is not in the request", task: 1, acceptance: "x" }] }),
+    });
+    const res = await run(f, "Build the agreements app");
+    expect(res).not.toBeNull();
+    expect(pmCalls(f)).toHaveLength(3);
+    expect(res!.plan.assumptions.join()).toContain("Traceability not fully verified");
+    expect(f.calls.some((c) => c.agent === "api")).toBe(true);
+  });
+
+  it("still fails (null, single-agent fallback) when the planner never returns usable JSON, and keeps the rejected answer", async () => {
+    const f = fakes({ plan: () => "not json" });
+    const res = await run(f, "Build the agreements app");
+    expect(res).toBeNull();
+    expect(fs.existsSync(path.join(ws, "tasks", "rejected-plan.json"))).toBe(true);
   });
 });
