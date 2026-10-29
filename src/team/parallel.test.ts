@@ -38,8 +38,8 @@ describe("planToOrchTasks", () => {
     expect(g.problems).toEqual([]);
     const by = Object.fromEntries(g.tasks.map((t) => [t.id, t]));
     expect(by.t2.dependsOn).toEqual(["t1"]);
-    // a design task also waits for the db task planned before it (the interface is built against the real data)
-    expect([...by.t3.dependsOn].sort()).toEqual(["t1", "t2"]);
+    // a design task waits only for what the planner named (here the api task), not for the db task as well
+    expect([...by.t3.dependsOn].sort()).toEqual(["t2"]);
     expect(by.t4.dependsOn.sort()).toEqual(["t1", "t2", "t3"]);
     expect(by.t2.scope).toEqual(["apps/api/"]);
   });
@@ -49,7 +49,7 @@ describe("planToOrchTasks", () => {
     expect(by.t1.publishes).toBe("t1");
     expect(by.t2.publishes).toBe("t2");
     expect(by.t3.publishes).toBeUndefined();
-    expect([...(by.t3.readsContracts ?? [])].sort()).toEqual(["t1", "t2"]);
+    expect([...(by.t3.readsContracts ?? [])].sort()).toEqual(["t2"]);
   });
 
   it("adds acceptance criteria and the UX spec to the instructions, and leaves UX out of the graph", () => {
@@ -65,17 +65,30 @@ describe("planToOrchTasks", () => {
     expect(g.tasks[1].instructions).toContain("returns 200");
   });
 
-  it("makes a design task wait for the api and db tasks planned before it, even when the planner forgot", () => {
+  it("lets a design task run beside the api and db tasks and hands it their planned contracts", () => {
     const g = planToOrchTasks(
       plan([
-        { role: "db", title: "Schema", scope: ["packages/db/"] },
-        { role: "api", title: "API", scope: ["apps/web/src/app/api/"] },
+        { role: "db", title: "Schema", scope: ["packages/db/"], contract: "table Listing(id, title, price)" },
+        { role: "api", title: "API", scope: ["apps/web/src/app/api/"], contract: "GET /api/listings returns Listing[]" },
         { role: "design", title: "Pages", scope: ["apps/web/src/app/(app)/"] },
       ]),
     );
     expect(g.problems).toEqual([]);
     const by = Object.fromEntries(g.tasks.map((t) => [t.id, t]));
-    expect([...by.t3.dependsOn].sort()).toEqual(["t1", "t2"]);
+    expect(by.t3.dependsOn).toEqual([]);
+    expect(by.t3.instructions).toContain("PLANNED CONTRACTS");
+    expect(by.t3.instructions).toContain("GET /api/listings returns Listing[]");
+  });
+
+  it("still makes a design task wait when the planner names a dependency", () => {
+    const g = planToOrchTasks(
+      plan([
+        { role: "api", title: "API", scope: ["apps/web/src/app/api/"] },
+        { role: "design", title: "Pages", scope: ["apps/web/src/app/(app)/"], dependsOn: [1] },
+      ]),
+    );
+    const by = Object.fromEntries(g.tasks.map((t) => [t.id, t]));
+    expect(by.t2.dependsOn).toEqual(["t1"]);
   });
 
   it("does not make a design task wait for an api task planned AFTER it", () => {

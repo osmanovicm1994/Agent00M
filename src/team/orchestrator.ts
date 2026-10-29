@@ -32,7 +32,11 @@ import { getAgent } from "../agents/definitions";
 import { OrchestraMaster, type TaskRunner } from "../orchestra/orchestra-master";
 import type { WorkspaceLocks } from "../orchestra/workspace-locks";
 import type { Blackboard } from "../orchestra/blackboard";
-import { planToOrchTasks } from "./parallel";
+import { planToOrchTasks, plannedContracts } from "./parallel";
+import { describeDeadLinks, findDeadLinks, linkFixTask, type DeadLink } from "./link-gate";
+import { checkFixTask, failureText, runChecks, summarizeChecks, type VerifyReport } from "./verify-gate";
+import { ensureLocalDatabase, type DbReport } from "./db-gate";
+import { RUN_GUIDE_FILE, writeRunGuide } from "./run-guide";
 import { projectTree } from "./tree";
 import { describeStarter, findStarterContent, starterFixTask, type ScaffoldFinding } from "./scaffold-gate";
 import { findSpecFiles, specWarnings } from "./spec-files";
@@ -424,6 +428,8 @@ function assignment(plan: PmPlan, index: number, notes: string[], uxSpec: string
     plan.assumptions.length ? `Assumptions made by the planner (verify them against the real files): ${plan.assumptions.join("; ")}` : "",
     FILE_RULE,
     notes.length ? `What the team has done so far:\n${notes.join("\n")}` : "",
+    // A screen is built against the planned interfaces of the backend tasks, whether or not they are finished.
+    t.role === "design" ? plannedContracts(plan, index) : "",
     uxSpec ? `## UX SPEC (build to this)\n${clip(uxSpec, 4500)}` : "",
     extra ? clip(extra, 12000) : "",
   ];
@@ -437,7 +443,7 @@ function parseVerdict(text: string): SafetyVerdict {
   return m ? (m[1].toUpperCase() as SafetyVerdict) : "UNKNOWN";
 }
 
-async function review(opts: TeamOptions, plan: PmPlan, files: string[], label: string): Promise<{ verdict: SafetyVerdict; notes: string; interrupted: boolean }> {
+async function review(opts: TeamOptions, plan: PmPlan, files: string[], label: string, checks = ""): Promise<{ verdict: SafetyVerdict; notes: string; interrupted: boolean }> {
   console.log(pc.bold(`\n🛡  ${label}`));
   bus.emit("log", { text: label, level: "step" });
   const res = await opts.executor.run(
@@ -445,7 +451,10 @@ async function review(opts: TeamOptions, plan: PmPlan, files: string[], label: s
     `Review the work done for this goal: ${plan.goal}`,
     `## REVIEW SCOPE\nFiles changed by the team (read every one in full):\n${files.length ? files.map((f) => `- ${f}`).join("\n") : "- (none reported; use git status and git diff if this is a git repository)"}\n` +
       (plan.risks.length ? `\nRisks the planner flagged: ${plan.risks.join("; ")}\n` : "") +
-      "\nEnd with the VERDICT format from your instructions.",
+      (checks
+        ? `\n## BUILD CHECKS RUN BY THE TEAM (real results; you cannot run them yourself)\n${checks}\nA failing check is a BLOCKER for the verdict. Read the files the errors name.\n`
+        : "") +
+      "\nRead at most 4 files per read_multiple_files call: a longer answer is cut off. End with the VERDICT format from your instructions.",
   );
   return { verdict: parseVerdict(res.finalMessage), notes: res.finalMessage, interrupted: Boolean(res.interrupted) };
 }
@@ -674,6 +683,21 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
   };
 
+  // The local database (see db-gate.ts): started with Docker and migrated by the team after the database task, and before a task that
+  // needs data (seed, tests). Safe to call again; the note reaches every later agent through `notes`.
+  const dbState: { report: DbReport | null } = { report: null };
+  const ensureDb = async (): Promise<void> => {
+    const r = await ensureLocalDatabase(opts.workspaceRoot, { log: (l) => console.log(pc.dim(`🗄  ${l}`)) });
+    if (r.status === "skipped") return;
+    if (dbState.report?.note !== r.note) {
+      console.log(r.migrated ? pc.green(`🗄  ${r.note}`) : pc.yellow(`⚠ 🗄  ${r.note}`));
+      bus.emit("log", { text: `Database: ${r.note}`, level: r.migrated ? "info" : "warn" });
+      notes.push(`- Team (database): ${r.note}`);
+    }
+    dbState.report = r;
+    r.created.forEach((f) => files.add(f));
+  };
+
   // One task, one after another. Also runs the UX tasks in parallel mode.
   const runTask = async (i: number): Promise<void> => {
     handled.add(i);
@@ -714,6 +738,8 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
 
     if (t.role !== "qa") lastEngineer = t.role;
     gitFlow?.beginTask(i + 1, t.role, t.title);
+    // Seed scripts and tests need the database to be running.
+    if (t.role === "qa" || /\b(seed|test data|migrat)/i.test(`${t.title} ${t.instructions}`)) await ensureDb();
     // The task file as it is on disk now: a hand-edited ticket is what the engineer follows.
     const doc = manifest ? readTaskDoc(opts.workspaceRoot, manifest, i) : "";
     // The task text also steers which standards the Executor loads (keywords such as "NextAuth" or "wizard"), so the planner's
@@ -733,7 +759,11 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     res.filesWritten.forEach((f) => files.add(f));
     commands.push(...res.commandsRun);
 
-    const rawStatus: TaskStatus = res.interrupted ? "interrupted" : isStopped(res) || res.unresolvedFailure ? "incomplete" : "done";
+    // The database task writes the schema; the team starts PostgreSQL and applies the migration. A migrate that failed only because
+    // no database was running is then no longer a failure of the task.
+    if (t.role === "db" && !res.interrupted) await ensureDb();
+    const dbFixed = t.role === "db" && dbState.report?.migrated === true;
+    const rawStatus: TaskStatus = res.interrupted ? "interrupted" : isStopped(res) || (res.unresolvedFailure && !dbFixed) ? "incomplete" : "done";
     const status = applyEvidence(t.role, rawStatus, res.filesWritten);
     if (status !== rawStatus) console.log(pc.yellow(`⚠ ${title}: no file was written, so this task is NOT counted as done.`));
     const summary = clip(res.finalMessage, MAX_SUMMARY);
@@ -810,6 +840,8 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         if (o.status === "interrupted") interrupted = true;
       }
       gitFlow?.commitAll("chore: save remaining changes from the parallel run");
+      // Parallel tasks cannot wait for the database mid-run: it is started once they are all finished.
+      if (!interrupted && plan.tasks.some((t) => t.role === "db")) await ensureDb();
       const denied = [...new Set(res.denials.map((d) => `${d.owner}: ${d.path}`))];
       if (denied.length) {
         blockedWrites.push(...denied);
@@ -850,11 +882,77 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
   }
 
+  // Every link and button of the interface must lead to a page that exists. One repair run by the frontend engineer builds the
+  // missing pages (or removes links the request does not want public); when links still lead nowhere, the run is not complete.
+  let deadLeft: DeadLink[] = [];
+  if (!interrupted && wantsInterface(plan)) {
+    let linkReport = findDeadLinks(opts.workspaceRoot);
+    deadLeft = linkReport.dead;
+    const linkAgent = getAgent("design");
+    if (deadLeft.length > 0 && linkAgent) {
+      console.log(pc.yellow(`\n⚠ ${deadLeft.length} link(s) lead to pages that do not exist (${describeDeadLinks(deadLeft, 4)}). One repair run follows.`));
+      bus.emit("log", { text: `Links to missing pages: ${describeDeadLinks(deadLeft)}. One repair run follows.`, level: "warn" });
+      const linkTitle = "Build the pages the links lead to";
+      const linkRes = await opts.executor.run(
+        linkAgent,
+        linkTitle,
+        `${linkFixTask(linkReport)}\n\n## ORIGINAL REQUEST\n${clip(missionText, 4500)}\n\n${notes.length ? `What the team has done so far:\n${notes.join("\n")}\n\n` : ""}${FILE_RULE}`,
+      );
+      linkRes.filesWritten.forEach((f) => files.add(f));
+      commands.push(...linkRes.commandsRun);
+      gitFlow?.commitAll("fix(ui): build the pages the links lead to");
+      linkReport = findDeadLinks(opts.workspaceRoot);
+      deadLeft = linkReport.dead;
+      const linkStatus: TaskStatus = linkRes.interrupted ? "interrupted" : deadLeft.length > 0 || isStopped(linkRes) ? "incomplete" : "done";
+      outcomes.push({ role: "design", title: linkTitle, status: linkStatus, summary: clip(linkRes.finalMessage, MAX_SUMMARY) });
+      if (linkRes.interrupted) interrupted = true;
+    }
+  }
+
+  // The project's own typecheck and build, run by the team: the reviewer is read-only and cannot run them, so without this a PASS says
+  // nothing about whether the code compiles. One repair run when they fail; a failure that remains makes the run not complete.
+  let checkReport: VerifyReport | null = null;
+  if (!interrupted && files.size > 0) {
+    await ensureDb();
+    console.log(pc.bold("\n🔧 Running the project's typecheck and build …"));
+    bus.emit("log", { text: "Running the project's typecheck and build…", level: "step" });
+    checkReport = await runChecks(opts.workspaceRoot);
+    console.log(pc.dim(summarizeChecks(checkReport)));
+    bus.emit("log", { text: `Checks: ${summarizeChecks(checkReport)}`, level: checkReport.ok ? "info" : "warn" });
+    if (!checkReport.ok) {
+      const repairAgent = getAgent("dev");
+      const repairTitle = "Fix the failing typecheck or build";
+      if (repairAgent) {
+        console.log(pc.yellow("\n⚠ The project's own checks fail. One repair run follows."));
+        const repairRes = await opts.executor.run(
+          repairAgent,
+          repairTitle,
+          `${checkFixTask(checkReport)}\n\n## ORIGINAL REQUEST\n${clip(missionText, 3000)}\n\n${FILE_RULE}`,
+        );
+        repairRes.filesWritten.forEach((f) => files.add(f));
+        commands.push(...repairRes.commandsRun);
+        gitFlow?.commitAll("fix: make the typecheck and build pass");
+        if (repairRes.interrupted) interrupted = true;
+        else checkReport = await runChecks(opts.workspaceRoot);
+        console.log(pc.dim(summarizeChecks(checkReport)));
+        outcomes.push({
+          role: "dev",
+          title: repairTitle,
+          status: repairRes.interrupted ? "interrupted" : checkReport.ok ? "done" : "incomplete",
+          summary: clip(checkReport.ok ? summarizeChecks(checkReport) : failureText(checkReport, 600), MAX_SUMMARY),
+        });
+      } else {
+        outcomes.push({ role: "dev", title: repairTitle, status: "incomplete", summary: clip(failureText(checkReport, 600), MAX_SUMMARY) });
+      }
+    }
+  }
+  const checkNotes = checkReport ? summarizeChecks(checkReport) + (checkReport.ok ? "" : `\n${failureText(checkReport, 2500)}`) : "";
+
   // Safety review of whatever was written.
   let safety: SafetyVerdict = "NOT_RUN";
   let safetyNotes = "";
   if (!interrupted && files.size > 0) {
-    let r = await review(opts, plan, [...files], "Safety Reviewer is checking the changes …");
+    let r = await review(opts, plan, [...files], "Safety Reviewer is checking the changes …", checkNotes);
     interrupted = r.interrupted;
     safety = r.verdict;
     safetyNotes = r.notes;
@@ -876,7 +974,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         if (fixRes.interrupted) {
           interrupted = true;
         } else {
-          r = await review(opts, plan, [...files], "Safety Reviewer is re-checking …");
+          r = await review(opts, plan, [...files], "Safety Reviewer is re-checking …", checkNotes);
           interrupted = r.interrupted;
           safety = r.verdict;
           safetyNotes = r.notes;
@@ -891,6 +989,28 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     } catch {
       // the task files are a convenience; a failed write here changes nothing about the result
     }
+  }
+
+  // The last task of a finished development: run.md says what to start and where to go. It is written only when EVERY task of the plan
+  // is done (bugs may remain: it says what was verified). A stopped or unfinished run writes nothing, so the file never promises a
+  // working app that was not built. The text is built from the files on disk, not by the model.
+  let runGuide: string | null = null;
+  const developmentFinished = !interrupted && outcomes.length > 0 && outcomes.every((o) => o.status === "done");
+  if (developmentFinished) {
+    runGuide = writeRunGuide({
+      root: opts.workspaceRoot,
+      db: dbState.report,
+      checks: checkReport,
+      deadLinks: deadLeft.map((d) => `${d.file} -> ${d.target}`),
+    });
+    if (runGuide) {
+      files.add(runGuide);
+      gitFlow?.commitAll(`docs: add ${RUN_GUIDE_FILE} (how to start the project)`);
+      console.log(pc.green(`\n📘 ${RUN_GUIDE_FILE} written: it lists what to start and where to go.`));
+      bus.emit("log", { text: `${RUN_GUIDE_FILE} written (how to start the project).`, level: "info" });
+    }
+  } else if (!interrupted) {
+    console.log(pc.dim(`\n${RUN_GUIDE_FILE} was not written: not every task is done yet. It is written when the last open task finishes (/tasks resume).`));
   }
 
   const gitSummary = gitFlow?.finish();
@@ -923,6 +1043,10 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         plannerRisks: plan.risks,
         ...(manifest && hasOpenTasks(manifest) ? { resumeWith: "/tasks resume" } : {}),
         ...(starterLeft.length ? { starterPageStillInPlace: true, starterFiles: starterLeft.map((f) => f.file) } : {}),
+        ...(deadLeft.length ? { linksToMissingPages: deadLeft.slice(0, 10).map((d) => `${d.file} -> ${d.target}`) } : {}),
+        ...(checkReport ? { projectChecks: summarizeChecks(checkReport), projectChecksPassed: checkReport.ok } : {}),
+        ...(dbState.report ? { database: dbState.report.note, databaseReadyAndMigrated: dbState.report.migrated === true } : {}),
+        ...(runGuide ? { runGuideWritten: runGuide } : {}),
         ...(blockedWrites.length ? { writesRefusedOutsideScope: blockedWrites.slice(0, 10) } : {}),
       },
       null,

@@ -222,7 +222,10 @@ const list = (families: string[]) => families.map((f) => `"${f}"`).join(" and ")
 function loopWarnText(families: string[], n: number): string {
   return (
     `STALL WARNING: your last ${n} steps only repeated ${list(families)}. Nothing was written in between, so repeating them gives the same answer. ` +
-    "Do ONE of these now: (a) make one concrete change (write a file, or run a DIFFERENT kind of command such as the fix itself), or (b) end your answer with what you know and what you need from the person. Do not look at the same things again."
+    "You already have the file contents in the conversation above; reading them again changes nothing. Do ONE of these now: " +
+    "(a) write the next file of your task with write_file, even if it is small; " +
+    "(b) run `npm run typecheck` (never tsc with a file name) and fix the FIRST error it prints; or " +
+    "(c) end your answer with what you know and what you need from the person. Do not look at the same things again."
   );
 }
 

@@ -71,6 +71,13 @@ describe("selectTaskKnowledge", () => {
     expect(forDb.some((p) => p.startsWith("06-database/"))).toBe(false);
   });
 
+  it("gives the test strategy to whichever agent gets a task about tests, not to read-only agents", () => {
+    const task = "Write integration tests for POST /api/listings";
+    expect(selectTaskKnowledge(task, "api").map((p) => p.path)).toContain("02-qa-automation/00-test-strategy.md");
+    expect(selectTaskKnowledge(task, "qa").map((p) => p.path)).toContain("02-qa-automation/00-test-strategy.md");
+    expect(selectTaskKnowledge(task, "research")).toEqual([]);
+  });
+
   it("gives nothing to agents that write no code", () => {
     expect(selectTaskKnowledge("Add a payment webhook with retries", "research")).toEqual([]);
     expect(selectTaskKnowledge("Add a payment webhook with retries", "kb-harvester")).toEqual([]);

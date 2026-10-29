@@ -73,6 +73,7 @@ export function repeatedFailureReport(command: string, output: string, count: nu
 export function repeatNote(count: number): string {
   return (
     `The same failure has now happened ${count} times. Stop trying small variations of the same fix. ` +
+    "Before the next attempt, search for the exact error text with the tool and version (web_search), or read the package's documentation or type definitions. " +
     "Write down what the error says, what you already tried and your best theory, then either try ONE clearly different " +
     "approach (a different cause, not a different spelling) or give your final answer explaining where you are stuck. " +
     "If the output lists several different errors, check whether they share one cause before fixing one line. " +

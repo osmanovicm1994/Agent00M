@@ -343,6 +343,15 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     weight: 3,
     onlyFor: FULLSTACK_AGENTS,
   },
+  // Any task that writes or runs tests, whichever agent got it (the API agent wrote the tests in a real run): how to pick
+  // the runner, where the file goes, what it imports, and that only a real test run counts as proof.
+  {
+    id: "test-strategy",
+    test: /\btests?\b|\bvitest\b|\bjest\b|\bspec files?\b|test coverage/i,
+    files: ["02-qa-automation/00-test-strategy.md"],
+    weight: 5,
+    skipFor: NO_CODE_AGENTS,
+  },
   // Other stacks: a new project of that kind has no marker files yet, so detectStackKnowledge cannot see it.
   {
     id: "ios-swift",

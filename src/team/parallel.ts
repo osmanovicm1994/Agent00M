@@ -37,6 +37,23 @@ export function parseDependency(raw: unknown): number | null {
   return null;
 }
 
+/**
+ * The interfaces the planner wrote down for the db and api tasks (tables, endpoints, payloads), as one block of text.
+ * A design task gets it so it can build screens before the API exists. `exceptIndex` leaves out the task that receives it.
+ */
+export function plannedContracts(plan: PmPlan, exceptIndex = -1): string {
+  const parts: string[] = [];
+  plan.tasks.forEach((t, i) => {
+    if (i === exceptIndex || !t.contract) return;
+    parts.push(`### Task ${i + 1} (${t.role}): ${t.title}\n${t.contract.slice(0, 1500)}`);
+  });
+  if (parts.length === 0) return "";
+  return (
+    "## PLANNED CONTRACTS (the backend is built at the same time or later: code against these, do not wait for it)\n" +
+    parts.join("\n\n").slice(0, 5000)
+  );
+}
+
 export interface ParallelPlan {
   tasks: OrchTask[];
   /** Why the plan cannot run in parallel. Empty = it can. */
@@ -93,10 +110,9 @@ export function planToOrchTasks(plan: PmPlan, uxSpec = "", extra = ""): Parallel
     if (e.t.role === "api") {
       for (const o of engineers) if (o.t.role === "db" && o.i < e.i) set.add(o.id);
     }
-    // The interface is built against the real API and data, so a design task waits for the api and db tasks planned before it.
-    if (e.t.role === "design") {
-      for (const o of engineers) if ((o.t.role === "api" || o.t.role === "db") && o.i < e.i) set.add(o.id);
-    }
+    // The interface is NOT made to wait for the api and db tasks: it is built against the planned contracts (see plannedContracts)
+    // while the backend is built, so a failing backend task (no database, a broken route) cannot stop every screen from being built.
+    // Only an explicit dependsOn from the planner makes a design task wait.
     if (e.t.role === "qa") {
       for (const o of engineers) if (o.t.role !== "qa" && o.i < e.i) set.add(o.id);
     }
@@ -114,11 +130,13 @@ export function planToOrchTasks(plan: PmPlan, uxSpec = "", extra = ""): Parallel
     const acceptance = e.t.acceptance.length ? `\nAcceptance criteria:\n${e.t.acceptance.map((a) => `- ${a}`).join("\n")}` : "";
     const ux = uxSpec ? `\n\n## UX SPEC (build to this)\n${uxSpec.slice(0, 4500)}` : "";
     const more = extra.trim() ? `\n\n${extra.trim().slice(0, 10000)}` : "";
+    const contracts = e.t.role === "design" ? plannedContracts(plan, e.i) : "";
+    const planned = contracts ? `\n\n${contracts}` : "";
     return {
       id: e.id,
       agent: e.t.role,
       title: e.t.title,
-      instructions: `${e.t.instructions}${acceptance}${ux}${more}`.trim(),
+      instructions: `${e.t.instructions}${acceptance}${planned}${ux}${more}`.trim(),
       scope,
       dependsOn,
       readsContracts: dependsOn,

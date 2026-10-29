@@ -87,6 +87,22 @@ const RULES: Rule[] = [
     }),
   },
   {
+    id: "seed-script-resolution",
+    // A seed script that cannot find its imports: ts-node does not read the "@/" alias, a .mjs file cannot import a .ts client, and a
+    // path written from the wrong folder resolves to nothing. Must come before prisma-client-missing, whose advice does not fit here.
+    test: (c, o) => /\bseed\b/i.test(c) && /ERR_MODULE_NOT_FOUND|Cannot find package '@\/|Cannot find module [^\n]*seed|TSError|Unknown file extension|ts-node/i.test(o),
+    fix: () => ({
+      title: "The seed script cannot resolve its imports",
+      steps: [
+        "Do not use ts-node and do not write the seed as .mjs/.js: the Prisma 7 client in src/generated/prisma is TypeScript. Use tsx: npm install -D tsx (add --legacy-peer-deps only if npm reports ERESOLVE).",
+        "Put the script at prisma/seed.ts (next to schema.prisma) and import with a RELATIVE path from that file, without a file extension: import { PrismaClient } from \"../src/generated/prisma/client\". A relative path is resolved from the folder of the script, not from where you run the command.",
+        'Create the client with the adapter: import { PrismaPg } from "@prisma/adapter-pg"; new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) }). Hash passwords with bcryptjs directly in the script; do not import app code that uses the "@/" alias or "server-only".',
+        'package.json: "seed": "tsx prisma/seed.ts" (and in prisma.config.ts: migrations: { path: "prisma/migrations", seed: "tsx prisma/seed.ts" }). Load .env with: import "dotenv/config" as the first line.',
+        "Run it once. If it fails with P1001 the database is not running: that is an environment problem, report it (see db-unreachable) instead of rewriting the script.",
+      ],
+    }),
+  },
+  {
     id: "prisma-client-missing",
     test: (_c, o) => /@prisma\/client did not initialize yet|has no exported member '?PrismaClient'?|Cannot find module '[^']*generated\/prisma[^']*'/.test(o),
     fix: () => ({
@@ -104,8 +120,9 @@ const RULES: Rule[] = [
       title: "No database is answering",
       steps: [
         "Do NOT run migrate again. The schema, validate and generate do not need a database.",
-        "If a docker-compose.yml with a db service exists and Docker works: docker compose up -d db, then docker compose ps until it is healthy, then migrate once.",
-        'Otherwise end this step with: "migration not applied: need a running PostgreSQL and a real DATABASE_URL".',
+        "In team mode the team starts the local database itself (docker-compose.yml, docker compose up, migrate) right after the database task: do not write a compose file or start Postgres yourself, and do not rewrite the schema because of this error. A note starting with 'Team (database)' in your assignment tells you whether it is running.",
+        "Outside team mode: if a docker-compose.yml with a db service exists and Docker works: docker compose up -d db, then docker compose ps until it is healthy, then migrate once.",
+        'Otherwise end this step with: "migration not applied: need a running PostgreSQL and a real DATABASE_URL" (add: start Docker Desktop and run /tasks resume).',
       ],
     }),
   },
@@ -155,6 +172,17 @@ const RULES: Rule[] = [
       steps: [
         'Create the client with the adapter: import { PrismaPg } from "@prisma/adapter-pg"; new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) }).',
         "Import PrismaClient from the generator output folder (for example @/generated/prisma/client), keep ONE client file, and make sure @prisma/adapter-pg@7 and pg are installed in that app.",
+      ],
+    }),
+  },
+  {
+    id: "types-node-peer",
+    test: (_c, o) => /ERESOLVE/.test(o) && /peerOptional @types\/node@/.test(o),
+    fix: () => ({
+      title: "A package (for example vitest 5) needs a newer @types/node than the project has",
+      steps: [
+        "Update the cause instead of forcing every install: npm install -D @types/node@^24 (use the major that matches `node -v`, at least 22). Do not downgrade the package that asked for it.",
+        "Then repeat the original command once. If it still reports ERESOLVE, create apps/web/.npmrc containing legacy-peer-deps=true so later installs by every agent work.",
       ],
     }),
   },

@@ -28,7 +28,7 @@ import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote
 import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, repeatedFailureReport, summarizeFailures } from "./run-feedback";
 import type { ExecutorHooks } from "./executor-hooks";
 import { LoopWatch, adviseBeforeRun, diagnoseFailure, formatDiagnosis, haltText, refuseRecursiveInstallScript } from "./toolchain-doctor";
-import { StallGuard, classifyCall, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
+import { StallGuard, classifyCall, isInspectCommand, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
 import { KNOWN_FIX_SHOW_LIMIT, formatKnownFixes, knownFixStopText, matchKnownFixes } from "./known-fixes";
 
 const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas];
@@ -195,8 +195,11 @@ function parseFallbackActions(content: string): ToolCall[] {
 // it changed a named file that was never actually written this session.
 const FILE_MENTION_RE = /\b[\w.\/-]+\.(?:ts|tsx|js|jsx|json)\b/g;
 
+// Product names that look like file names ("Next.js", "Node.js") are not files the agent claims to have changed.
+const NOT_A_FILE_RE = /^(next|node|vue|react|nuxt|express|nest|three|d3|chart|alpine|ember|backbone|socket|p5|deno|bun)\.(js|ts)$/i;
+
 function extractMentionedFiles(content: string): string[] {
-  return [...new Set([...content.matchAll(FILE_MENTION_RE)].map((m) => m[0]))];
+  return [...new Set([...content.matchAll(FILE_MENTION_RE)].map((m) => m[0]))].filter((f) => !NOT_A_FILE_RE.test(f));
 }
 
 function basename(p: string): string {
@@ -854,13 +857,17 @@ When you are done and have no more actions to take, reply normally with a final 
         if (state.lastRunFailed && !state.readOnly && !state.failNudged && nudges < MAX_NUDGES) {
           nudges++;
           state.failNudged = true;
-          console.log(pc.dim("\n(The last command failed — asking the agent to fix it or report it honestly.)"));
+          console.log(pc.dim("\n(The last command failed — asking the agent to find the cause and fix it.)"));
           messages.push({ role: "assistant", content: response.content });
           messages.push({
             role: "user",
             content:
-              "Your last command FAILED (non-zero exit) and you have not changed anything since. Either fix the cause and run it again, " +
-              "or make your final answer say clearly that it still fails, with the error. Do not describe the work as done.",
+              "Your last command FAILED (non-zero exit) and nothing has changed since. Do not summarize and do not apologize. " +
+              "1) Write the one line of the error that matters. 2) If the cause is not obvious from the output and the files you read, search for it: " +
+              "web_search with the exact error text and the tool and version (for example the Next.js, Prisma or Zod version from package.json), " +
+              "or read the package's own documentation or type definitions in the project. " +
+              "3) Apply the fix with write_file, then run the same command again. Only stop when the command passes or the cause is something " +
+              "only the person can change (a missing database, credentials, a tool that is not installed); then say exactly what is needed.",
           });
           continue;
         }
@@ -896,7 +903,8 @@ When you are done and have no more actions to take, reply normally with a final 
         const noWritesAtAll = state.filesWritten.length === 0 && state.commandsRun.length === 0;
         const partialFalseClaim = claimsCompletion && unfulfilledMentions.length > 0;
 
-        if (((claimsCompletion && noWritesAtAll) || partialFalseClaim) && nudges < MAX_NUDGES) {
+        // A review role never writes, so "you mentioned files you did not write" is wrong for it: its report names the files it READ.
+        if (!state.readOnly && ((claimsCompletion && noWritesAtAll) || partialFalseClaim) && nudges < MAX_NUDGES) {
           nudges++;
           const detail = partialFalseClaim
             ? `You mentioned these file(s) but never actually called write_file for them: ${unfulfilledMentions.join(", ")}.`
@@ -1315,8 +1323,11 @@ When you are done and have no more actions to take, reply normally with a final 
         console.log();
         if (result.interrupted) state.interrupted = true;
         state.commandsRun.push(command);
-        state.runsSinceWrite++;
-        if (!diagnostic) state.heavyRuns++;
+        // Looking is not verifying: echo / ls / cat / git status after a change must not satisfy the verify gate.
+        // (A real run auto-ran 78 `echo "... complete"` commands and passed the gate with them.)
+        const inspectOnly = isInspectCommand(command);
+        if (!inspectOnly) state.runsSinceWrite++;
+        if (!diagnostic && !inspectOnly) state.heavyRuns++;
 
         // A failed run: a short list of the failing lines (the middle of a long log is cut), and a stop signal when
         // the same failure keeps coming back.

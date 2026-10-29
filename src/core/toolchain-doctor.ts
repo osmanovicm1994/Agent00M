@@ -22,7 +22,7 @@
 
 import * as path from "path";
 
-export type DiagnosisKind = "install-loop" | "engine-mismatch" | "engine-warning" | "global-npm-upgrade";
+export type DiagnosisKind = "install-loop" | "engine-mismatch" | "engine-warning" | "global-npm-upgrade" | "single-file-tsc";
 
 export interface Diagnosis {
   kind: DiagnosisKind;
@@ -580,6 +580,47 @@ export function diagnoseFailure(input: DiagnoseInput): Diagnosis | null {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// tsc on a single file
+// ---------------------------------------------------------------------------
+
+const TSC_SOURCE_ARG = /\.(?:[cm]?[jt]sx?)$/i;
+
+/**
+ * `npx tsc --noEmit src/app/page.tsx`: naming a file on the command line makes tsc IGNORE tsconfig.json (no jsx setting, no path
+ * aliases, no esModuleInterop), so it prints hundreds of errors from node_modules and about JSX that do not exist in the project.
+ * A real run lost many steps to that output.
+ */
+export function isSingleFileTsc(command: string): boolean {
+  for (const segment of command.split(/&&|\|\||;|\|/)) {
+    const t = tokensOf(segment);
+    const at = t.findIndex((x, i) => i <= 3 && x.replace(/^.*\//, "") === "tsc");
+    if (at < 0) continue;
+    const rest = t.slice(at + 1);
+    if (rest.some((x) => /^(-p|--project|-b|--build)$/.test(x))) continue;
+    if (rest.some((x) => !x.startsWith("-") && TSC_SOURCE_ARG.test(x))) return true;
+  }
+  return false;
+}
+
+function singleFileTscDiagnosis(): Diagnosis {
+  return {
+    kind: "single-file-tsc",
+    summary: "`tsc` with a file name ignores tsconfig.json, so its errors (JSX, path aliases, node_modules types) are not the project's real errors.",
+    facts: [
+      "When files are named on the command line, tsc does not read tsconfig.json: no jsx option, no `@/` path aliases, no esModuleInterop.",
+      "That is why such a run prints dozens of errors in node_modules and 'Cannot use JSX unless the --jsx flag is provided'.",
+    ],
+    steps: [
+      "Run the project's own check instead: `npm run typecheck` (or `npm --prefix apps/web run typecheck`).",
+      "If package.json has no typecheck script, add \"typecheck\": \"tsc --noEmit\" to its scripts and run that, or run `npx tsc --noEmit -p apps/web`.",
+      "Read only the errors for the files you changed; a stale .next/types error means the dev server types are old, not that your file is wrong.",
+    ],
+    doNot: ["Do not run tsc with a file name again.", "Do not add --skipLibCheck or esModuleInterop flags to the command line to hide the output."],
+    userMustAct: false,
+  };
+}
+
 export interface Advice {
   /** The tool result to give the model instead of running the command. */
   refuse: string;
@@ -590,6 +631,10 @@ export interface Advice {
 export function adviseBeforeRun(command: string, readPackageJson: (dir: string) => string | undefined): Advice | null {
   if (isGlobalNpmUpgrade(command)) {
     const diagnosis = globalNpmDiagnosis();
+    return { diagnosis, refuse: `This command was NOT run. ${formatDiagnosis(diagnosis)}` };
+  }
+  if (isSingleFileTsc(command)) {
+    const diagnosis = singleFileTscDiagnosis();
     return { diagnosis, refuse: `This command was NOT run. ${formatDiagnosis(diagnosis)}` };
   }
   for (const dir of installTargets(command)) {
