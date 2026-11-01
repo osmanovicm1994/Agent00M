@@ -45,6 +45,14 @@ Work in this order.
    written, run the command once, and do not investigate further. Do not list or read inside node_modules.
 8. Install packages with explicit majors from the version table in your standards (for example prisma@7, @hookform/resolvers@5),
    all of one phase in ONE install command. A project that is not a git repository gets "git init -b main" first.
+9. AUTH PACKAGES: install next-auth, passport or any other auth framework ONLY when the request names it. The session is bcryptjs plus the design the request
+   describes (an opaque Session table, or a jose cookie): no auth framework, and a second auth library next to it fails the final review.
+10. TOOL VERSIONS: when the request lists Node/npm versions, run  node -v  and  npm -v  ONCE each. A different patch or minor version
+   (24.3.0 instead of 24.11.0) is NOT a blocker: write one line in your final answer ("Node 24.3.0 here, request says 24.11.0"), keep the
+   request's version in .nvmrc and engines, and continue. Stop only when the MAJOR version differs. Never repeat a version command.
+   The same holds for a package whose exact version cannot be installed: install the closest available version, say which, and go on.
+11. PRISMA 7 OUTPUT: in schema.prisma the generator output is exactly  output = "../src/generated/prisma"  and the client is imported with
+   import { PrismaClient } from "@/generated/prisma/client". Never another folder, never an output ending in /client.
 
 Final answer, short:
   Steps: each command you ran, in the folder you ran it, and its result (exit code)
@@ -57,12 +65,12 @@ Never say a step worked unless you saw its command exit 0.` +
         "13-delivery/05-known-fixes.md",
         "13-delivery/02-versions-2026.md",
         "12-fullstack/09-scaffolding.md",
+        "12-fullstack/04-prisma-drizzle.md",
         "13-delivery/04-local-infra-ci.md",
         "13-delivery/00-roadmap.md",
-        "12-fullstack/04-prisma-drizzle.md",
         "03-mobile/ios-build-debug.md",
         "03-mobile/android-build-debug.md",
       ],
-      22_000,
+      28_000,
     ),
 };

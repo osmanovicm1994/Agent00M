@@ -10,6 +10,7 @@ import type {
   ToolSchema,
 } from "../types";
 import { getProfile, resolveNativeTools, resolveNoThink, type ModelProfile } from "../models";
+import { ContextOverflowError, isContextOverflowText, parseContextNumbers } from "../context-error";
 
 // Strips a <think>...</think> reasoning block (DeepSeek R1 style) out of the
 // raw completion text, returning both parts separately. Some LM Studio setups
@@ -352,14 +353,19 @@ export class LMStudioProvider implements LLMProvider {
       );
     }
     const text = String(err?.message ?? err);
-    if (/exceeds? the available context size|context (length|size).*(exceed|too)|n_ctx/i.test(text)) {
-      const used = text.match(/\((\d+) tokens\)/)?.[1] ?? text.match(/n_prompt_tokens\D+(\d+)/)?.[1];
-      const limit = text.match(/n_ctx\D+(\d+)/)?.[1] ?? text.match(/\((\d+) tokens\)\s*\D*?(\d+) tokens/)?.[2];
-      return new Error(
-        `The prompt${used ? ` (${used} tokens)` : ""} does not fit the context window LM Studio loaded the model with` +
-          `${limit ? ` (${limit} tokens)` : ""}. Fix: in LM Studio unload the model and reload it with "Context Length" ` +
-          `at 32768 (16384 minimum); the agent cannot change this from outside. ` +
-          `Alternatively lower AGENT_CONTEXT_CHARS and AGENT_SKILL_CHARS in your .env file.`,
+    if (isContextOverflowText(text)) {
+      // The executor catches this, learns the real window from the numbers, trims the prompt and tries again.
+      // The text is what the person sees when that is not possible (a chat call outside the executor).
+      const { promptTokens, contextTokens } = parseContextNumbers(text);
+      const need = promptTokens ? Math.ceil((promptTokens + 4096) / 4096) * 4096 : 49152;
+      return new ContextOverflowError(
+        `The prompt${promptTokens ? ` (${promptTokens} tokens)` : ""} does not fit the context window LM Studio loaded the model with` +
+          `${contextTokens ? ` (${contextTokens} tokens)` : ""}. The agent trims its prompt to the window it learns about and retries; ` +
+          `if you see this, even the trimmed prompt did not fit. Fix: in LM Studio unload the model and reload it with "Context Length" ` +
+          `of ${need} or more (the prompt plus the reply must fit), and set AGENT_CONTEXT_WINDOW to the length you loaded ` +
+          `so the agent plans for it.`,
+        promptTokens,
+        contextTokens,
       );
     }
     return err instanceof Error ? err : new Error(String(err));

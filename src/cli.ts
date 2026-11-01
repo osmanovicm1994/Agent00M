@@ -31,6 +31,12 @@ import { describeImage, renderBriefForAgents, type DesignBrief } from "./vision/
 
 dotenv.config();
 
+/** True for "/word ..." input that is not a command handled by executeTask (`/team <task>`, `/tasks resume`, `/tasks plan <task>`). */
+export function isUnknownSlashCommand(input: string): boolean {
+  if (!/^\/[a-z][a-z-]*(\s|$)/i.test(input)) return false;
+  return !/^\/team\s+\S/i.test(input) && !/^\/tasks\s+(resume\b|plan\s+\S)/i.test(input);
+}
+
 // The parallel team run in progress (if any), so Ctrl+C can stop all its workers, not only the running shell command.
 let activeParallel: ParallelOptions | undefined;
 
@@ -848,7 +854,8 @@ program
       const promptPrefix = `${agentTag}${tags}`;
 
       rl.question(`${promptPrefix} ${pc.cyan("User > ")}`, async (taskInput) => {
-        const task = taskInput.trim();
+        // "/task resume" (singular) is a common slip for "/tasks resume": accept it instead of sending it to the planner as a new request.
+        const task = taskInput.trim().replace(/^\/task(?=\s|$)/i, "/tasks");
         const normalizedInput = task.toLowerCase();
 
         // --- LOCAL INTERCEPTORS ---
@@ -1102,6 +1109,14 @@ program
         }
 
         if (!task) {
+          askQuestion();
+          return;
+        }
+
+        // A slash command that no handler above knew is a typo, not a task: sent on, it started a full re-plan that archived the saved tasks.
+        // `/team <task>`, `/tasks resume` and `/tasks plan <task>` are handled by executeTask; a path such as /Users/x is not a command.
+        if (isUnknownSlashCommand(task)) {
+          console.log(pc.red(`\n❌ Unknown command: ${task.split(/\s+/)[0]}. Type 'help' to see the commands. (Saved tasks: /tasks, /tasks resume.)\n`));
           askQuestion();
           return;
         }

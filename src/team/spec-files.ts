@@ -96,7 +96,14 @@ function clipText(s: string, n: number): { text: string; truncated: boolean } {
 }
 
 /** The attached files the request names. `root` is the project folder; matching is by file name, case-insensitive. */
-export function findSpecFiles(root: string, requestText: string): SpecFiles {
+export interface SpecLimits {
+  /** Characters kept per file (default 7000). The planner gets a larger value: a spec cut at 7000 characters planned only a third of the job. */
+  maxFileChars?: number;
+  /** Characters kept over all files (default 12000). */
+  maxTotalChars?: number;
+}
+
+export function findSpecFiles(root: string, requestText: string, limits: SpecLimits = {}): SpecFiles {
   const empty: SpecFiles = { texts: [], images: [], unreadable: [], missing: [], block: "" };
   const names = namedFiles(requestText);
   if (names.length === 0) return empty;
@@ -110,7 +117,8 @@ export function findSpecFiles(root: string, requestText: string): SpecFiles {
   }
 
   const result: SpecFiles = { texts: [], images: [], unreadable: [], missing: [], block: "" };
-  let budget = MAX_TOTAL_CHARS;
+  let budget = limits.maxTotalChars ?? MAX_TOTAL_CHARS;
+  const perFile = limits.maxFileChars ?? MAX_FILE_CHARS;
   for (const name of names) {
     const hit = byName.get(name.toLowerCase());
     const ext = path.extname(name).toLowerCase();
@@ -129,7 +137,7 @@ export function findSpecFiles(root: string, requestText: string): SpecFiles {
           result.unreadable.push(`${hit.rel} (too large to include)`);
           continue;
         }
-        const clipped = clipText(fs.readFileSync(hit.abs, "utf8"), Math.min(MAX_FILE_CHARS, budget));
+        const clipped = clipText(fs.readFileSync(hit.abs, "utf8"), Math.min(perFile, budget));
         budget -= clipped.text.length;
         result.texts.push({ file: hit.rel, text: clipped.text, truncated: clipped.truncated });
       } catch {

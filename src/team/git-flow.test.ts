@@ -254,3 +254,43 @@ describe.skipIf(!hasGit)("GitFlow resume", () => {
     expect(git("ls-tree", "-r", "--name-only", info.feature)).toContain("src/half.ts");
   });
 });
+
+describe.skipIf(!hasGit)("GitFlow after an interrupted run", () => {
+  const setup = () => {
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "T");
+    write("README.md", "hi");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+  };
+
+  it("never takes the leftover task branch of an interrupted run for the person's own branch", async () => {
+    setup();
+    git("checkout", "-q", "-b", "task/01-infra-setup");
+    write("a.txt", "work of the interrupted task");
+    git("add", "-A");
+    git("commit", "-q", "-m", "wip: interrupted");
+
+    const mainHead = git("rev-parse", "main");
+    const flow = await start();
+    expect(flow).not.toBeNull();
+    expect(flow!.info().base).toBe("main");
+    expect(git("rev-parse", "--abbrev-ref", "HEAD")).toMatch(/^feature\//);
+    // the interrupted work is kept: the feature branch continues from the task branch
+    expect(git("log", "--format=%s", "main..HEAD")).toContain("wip: interrupted");
+    expect(git("rev-parse", "main")).toBe(mainHead);
+    expect(logs.join("\n")).toContain("task branch of an interrupted run");
+    expect(flow!.finish().commands.join("\n")).toContain("git checkout main");
+  });
+
+  it("repairs a task branch that an earlier run saved as the base when the plan is resumed", async () => {
+    setup();
+    git("checkout", "-q", "-b", "feature/old-run");
+    git("checkout", "-q", "main");
+    const flow = await start({ resume: { base: "task/01-infra-setup", feature: "feature/old-run" } });
+    expect(flow).not.toBeNull();
+    expect(flow!.info().base).toBe("main");
+    expect(flow!.info().feature).toBe("feature/old-run");
+  });
+});

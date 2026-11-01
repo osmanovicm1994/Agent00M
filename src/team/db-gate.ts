@@ -45,6 +45,10 @@ export interface DbGateOptions {
 // already runs, and migrating a new schema into somebody else's database must never happen by accident.
 const FIRST_PORT = 5433;
 const LAST_PORT = 5440;
+// What docker prints when the host port is taken (by another container or by any program).
+const PORT_BUSY_RE = /port is already allocated|address already in use|ports are not available|bind for [^\n]*failed/i;
+// Marker in the compose file this gate writes: only such a file is edited when the port has to move.
+const COMPOSE_MARKER = "Started by the team agent";
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const COMPOSE_NAMES = ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"];
 
@@ -159,6 +163,35 @@ export function composeYaml(t: DbTarget): string {
   ].join("\n");
 }
 
+/** Moves the project's database to another host port: DATABASE_URL (every .env file that holds it) and, when the team wrote it, the compose file. */
+export function movePort(appDir: string, root: string, composeFile: string | null, from: number, to: number): boolean {
+  let moved = false;
+  // A compose file somebody else wrote is never edited, and then nothing else is moved either: URL and port mapping must agree.
+  if (composeFile && !read(path.join(root, composeFile)).includes(COMPOSE_MARKER)) return false;
+  for (const dir of [appDir, root]) {
+    for (const name of [".env.local", ".env"]) {
+      const file = path.join(dir, name);
+      const text = read(file);
+      if (!/^\s*DATABASE_URL\s*=/m.test(text)) continue;
+      const next = text.replace(/^(\s*DATABASE_URL\s*=.*?(?:localhost|127\.0\.0\.1|\[::1\]):)(\d+)/m, (_m, a, p) => (Number(p) === from ? `${a}${to}` : _m));
+      if (next !== text) {
+        fs.writeFileSync(file, next);
+        moved = true;
+      }
+    }
+  }
+  if (composeFile) {
+    const file = path.join(root, composeFile);
+    const text = read(file);
+    const next = text.replace(new RegExp(`"${from}:5432"`), `"${to}:5432"`);
+    if (next !== text) {
+      fs.writeFileSync(file, next);
+      moved = true;
+    }
+  }
+  return moved;
+}
+
 function hasMigrations(appDir: string): boolean {
   const dir = path.join(appDir, "prisma", "migrations");
   try {
@@ -214,13 +247,13 @@ export async function ensureLocalDatabase(root: string, opts: DbGateOptions = {}
       fs.writeFileSync(envFile, `${read(envFile)}${read(envFile) && !read(envFile).endsWith("\n") ? "\n" : ""}DATABASE_URL="${url}"\n`);
       ensureGitignore(root, ".env");
       created.push(rel(envFile));
-      log(`wrote DATABASE_URL (local development) to ${rel(envFile)}`);
+      log(`wrote DATABASE_URL (local development, port ${port}) to ${rel(envFile)}`);
     }
     const target = parseTarget(url);
     if (!target) return skipped("DATABASE_URL is not a PostgreSQL URL");
     if (!LOCAL_HOSTS.has(target.host)) return skipped(`DATABASE_URL points to ${target.host}, not to this computer: the team does not start or change a remote database`);
 
-    const where = `${target.host}:${target.port}`;
+    let where = `${target.host}:${target.port}`;
     let started = false;
 
     const answers = (): Promise<boolean> => answersOn(target.port);
@@ -258,7 +291,18 @@ export async function ensureLocalDatabase(root: string, opts: DbGateOptions = {}
       }
 
       // 3. Start it and wait until it accepts connections.
-      const up = await run(`docker compose -f ${compose.file} up -d ${compose.service}`, root, 300_000);
+      const upCommand = `docker compose -f ${compose.file} up -d ${compose.service}`;
+      let up = await run(upCommand, root, 300_000);
+      // The port is taken (another project's database, any program): move this project's database to the next free port, once per try.
+      for (let tries = 0; up.exitCode !== 0 && PORT_BUSY_RE.test(up.output) && tries < LAST_PORT - FIRST_PORT; tries++) {
+        let next = Math.max(target.port + 1, FIRST_PORT);
+        while (next <= LAST_PORT && (await answersOn(next))) next++;
+        if (next > LAST_PORT || !movePort(appDir, root, compose.file, target.port, next)) break;
+        log(`port ${target.port} is already in use: moving this project's database to port ${next}`);
+        target.port = next;
+        where = `${target.host}:${target.port}`;
+        up = await run(upCommand, root, 300_000);
+      }
       if (up.exitCode !== 0) {
         return {
           status: "failed",

@@ -134,6 +134,42 @@ describe("ensureLocalDatabase", () => {
     expect(calls.some((c) => c.includes("migrate"))).toBe(false);
   });
 
+  it("moves its own database to the next free port when docker says the port is taken", async () => {
+    put("apps/web/prisma/schema.prisma", SCHEMA);
+    put("apps/web/.env", 'DATABASE_URL="postgresql://app:app@localhost:5432/app"\n');
+    put("docker-compose.yml", composeYaml({ host: "localhost", port: 5432, user: "app", password: "app", database: "app" }));
+    const calls: string[] = [];
+    let running = false;
+    const runner: Runner = (command) => {
+      calls.push(command);
+      if (command.includes("up -d")) {
+        if (fs.readFileSync(path.join(root, "docker-compose.yml"), "utf8").includes('"5432:5432"')) {
+          return { exitCode: 1, timedOut: false, output: "Error response from daemon: Bind for 0.0.0.0:5432 failed: port is already allocated" };
+        }
+        running = true;
+      }
+      return { exitCode: 0, timedOut: false, output: "" };
+    };
+    const probe = async (host: string): Promise<boolean> => host !== "::1" && running;
+    const report = await ensureLocalDatabase(root, { runner, probe, pollMs: 0 });
+    expect(report.status).toBe("started");
+    expect(report.migrated).toBe(true);
+    expect(fs.readFileSync(path.join(root, "apps/web/.env"), "utf8")).toContain("localhost:5433/app");
+    expect(fs.readFileSync(path.join(root, "docker-compose.yml"), "utf8")).toContain('"5433:5432"');
+    expect(calls.filter((c) => c.includes("up -d")).length).toBe(2);
+    expect(report.note).toContain("localhost:5433");
+  });
+
+  it("does not edit a compose file the team did not write when its port is taken", async () => {
+    put("apps/web/prisma/schema.prisma", SCHEMA);
+    put("apps/web/.env", 'DATABASE_URL="postgresql://app:app@localhost:5432/app"\n');
+    put("docker-compose.yml", 'services:\n  db:\n    image: postgres:16\n    ports:\n      - "5432:5432"\n');
+    const runner: Runner = (command) => ({ exitCode: command.includes("up -d") ? 1 : 0, timedOut: false, output: "port is already allocated" });
+    const report = await ensureLocalDatabase(root, { runner, probe: async () => false, pollMs: 0 });
+    expect(report.status).toBe("failed");
+    expect(fs.readFileSync(path.join(root, "docker-compose.yml"), "utf8")).toContain('"5432:5432"');
+  });
+
   it("explains what to do when Docker is not running, without writing anything else", async () => {
     put("apps/web/prisma/schema.prisma", SCHEMA);
     put("apps/web/.env", 'DATABASE_URL="postgresql://app:app@localhost:5432/app"\n');

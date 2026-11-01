@@ -36,10 +36,12 @@ import { planToOrchTasks, plannedContracts } from "./parallel";
 import { describeDeadLinks, findDeadLinks, linkFixTask, type DeadLink } from "./link-gate";
 import { checkFixTask, failureText, runChecks, summarizeChecks, type VerifyReport } from "./verify-gate";
 import { ensureLocalDatabase, type DbReport } from "./db-gate";
+import { normalizePrismaOutput } from "./prisma-gate";
 import { RUN_GUIDE_FILE, writeRunGuide } from "./run-guide";
 import { projectTree } from "./tree";
 import { describeStarter, findStarterContent, starterFixTask, type ScaffoldFinding } from "./scaffold-gate";
 import { findSpecFiles, specWarnings } from "./spec-files";
+import { checklistBlock, detectLayout, extractPromises, fullSpecText, layoutBlock, layoutViolation, missingPromises, promiseFixTask, type LayoutKind, type Promises } from "./spec-promises";
 import { GitFlow, type GitLevel, type GitSummary } from "./git-flow";
 import { NO_FILES_NUDGE, applyEvidence, isComplete, lacksEvidence } from "./evidence";
 import {
@@ -128,6 +130,23 @@ export interface TeamOptions {
 }
 
 const MAX_SUMMARY = 700;
+// What the notes of earlier tasks may take in an engineer's assignment (the newest are kept): the first message of a run must
+// leave room for the standards and the conversation in a 32k context window.
+const NOTES_CHARS = 3000;
+
+/** The newest notes that fit in `max` characters (older ones are named, not repeated). */
+export function recentNotes(notes: readonly string[], max: number): string {
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const n = notes[i];
+    if (used + n.length + 1 > max && kept.length > 0) break;
+    kept.unshift(n.length > max ? `${n.slice(0, max)} …` : n);
+    used += Math.min(n.length, max) + 1;
+  }
+  const dropped = notes.length - kept.length;
+  return `${dropped > 0 ? `(${dropped} earlier task note(s) left out; the files they wrote are on disk)\n` : ""}${kept.join("\n")}`;
+}
 
 // How many tasks one plan may have. A whole application needs 6 to 9 (the planner prompt says so); AGENT_TEAM_MAX_TASKS changes the cap.
 const MAX_PLAN_TASKS = Math.min(12, Math.max(1, Math.floor(Number(process.env.AGENT_TEAM_MAX_TASKS)) || 9));
@@ -220,18 +239,42 @@ function quoteFound(haystack: string, quote: string): boolean {
     .filter((p) => p.length >= 6);
   if (pieces.length === 0) return false;
   let from = 0;
+  let exact = true;
   for (const piece of pieces) {
     const at = haystack.indexOf(piece, from);
-    if (at === -1) return false;
+    if (at === -1) {
+      exact = false;
+      break;
+    }
     from = at + piece.length;
   }
-  return true;
+  if (exact) return true;
+  // A small local model rarely copies fifteen words verbatim: reordered or lightly reworded, but clearly the request's own words, still
+  // counts. At least 3 meaningful words and 75% of them must occur in the request.
+  const words = wordsOf(quote);
+  if (words.length < 3) return false;
+  const have = new Set(wordsOf(haystack));
+  return words.filter((w) => have.has(w)).length / words.length >= 0.75;
+}
+
+/** Meaningful words (3+ letters or digits) of a text, lowercase, without Markdown marks. */
+function wordsOf(s: string): string[] {
+  return normalizeText(s)
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length >= 3)
+    .map((w) => (w.length > 4 && w.endsWith("s") ? w.slice(0, -1) : w)); // passwords = password
 }
 
 function sameCriterion(a: string, b: string): boolean {
   const x = normalizeText(a);
   const y = normalizeText(b);
-  return x.length > 0 && y.length > 0 && (x === y || x.includes(y) || y.includes(x));
+  if (x.length > 0 && y.length > 0 && (x === y || x.includes(y) || y.includes(x))) return true;
+  // Same criterion, written a little differently: most words of the shorter one occur in the other.
+  const wa = new Set(wordsOf(a));
+  const wb = new Set(wordsOf(b));
+  if (wa.size === 0 || wb.size === 0) return false;
+  const shared = [...wa].filter((w) => wb.has(w)).length;
+  return shared / Math.min(wa.size, wb.size) >= 0.6;
 }
 
 // Tasks that come from the team's own process (skeleton, installs, final checks), not from one sentence of the request.
@@ -312,7 +355,7 @@ function saveRejectedPlan(root: string, raw: string): void {
 
 // `mission` is the original request of this job when the current message is a follow-up of it (see TaskManifest.mission);
 // `prior` is the saved plan with its open tasks. Both let the planner finish the job instead of starting a new, smaller one.
-async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManifest | null, specBlock = ""): Promise<PmPlan> {
+async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManifest | null, specBlock = "", checklist = ""): Promise<PmPlan> {
   const followUp = Boolean(mission && mission.trim() !== opts.task.trim());
   const coverageSource = [mission, opts.task, opts.context, specBlock].filter(Boolean).join("\n\n");
   const user =
@@ -321,7 +364,8 @@ async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManif
     (followUp && prior ? `<previous_plan_state>\n${describeManifest(prior)}\n</previous_plan_state>\n\n` : "") +
     `<project_tree>\n${projectListing(opts.workspaceRoot)}\n</project_tree>` +
     (opts.context ? `\n\n<extra_context>\n${clip(opts.context, 5000)}\n</extra_context>` : "") +
-    (specBlock ? `\n\n<referenced_files>\n${specBlock}\n</referenced_files>` : "");
+    (specBlock ? `\n\n<referenced_files>\n${specBlock}\n</referenced_files>` : "") +
+    (checklist ? `\n\n<spec_checklist>\n${checklist}\n</spec_checklist>` : "");
   const system = PM_SYSTEM + (opts.parallel ? PM_PARALLEL_ADDENDUM : "") + PM_KNOWLEDGE;
 
   // The planner's answer is validated, so it must never come from the response cache (noCache): a rejected answer would be
@@ -417,7 +461,7 @@ function assignment(plan: PmPlan, index: number, notes: string[], uxSpec: string
     `You are the ${ROLE_TITLES[t.role] ?? t.role}. This is task ${index + 1} of ${plan.tasks.length}: ${t.title}`,
     // The engineers used to see only the planner's one-sentence goal and their own ticket: field lists, roles and wording of the
     // original request were lost on the way. Here is the request itself; the acceptance criteria say which part is yours.
-    mission ? `## ORIGINAL REQUEST (the whole job; your task is one part of it, your acceptance criteria say which part)\n${clip(mission, 4500)}` : "",
+    mission ? `## ORIGINAL REQUEST (the whole job; your task is one part of it, your acceptance criteria say which part)\n${clip(mission, 3000)}` : "",
     doc
       ? `## TASK FILE (your assignment from the Project Manager; follow it, and read its Progress Log if an earlier attempt failed)\n${clip(doc, 4000)}`
       : t.instructions
@@ -427,11 +471,11 @@ function assignment(plan: PmPlan, index: number, notes: string[], uxSpec: string
     plan.risks.length ? `Risks to avoid: ${plan.risks.join("; ")}` : "",
     plan.assumptions.length ? `Assumptions made by the planner (verify them against the real files): ${plan.assumptions.join("; ")}` : "",
     FILE_RULE,
-    notes.length ? `What the team has done so far:\n${notes.join("\n")}` : "",
+    notes.length ? `What the team has done so far:\n${recentNotes(notes, NOTES_CHARS)}` : "",
     // A screen is built against the planned interfaces of the backend tasks, whether or not they are finished.
     t.role === "design" ? plannedContracts(plan, index) : "",
-    uxSpec ? `## UX SPEC (build to this)\n${clip(uxSpec, 4500)}` : "",
-    extra ? clip(extra, 12000) : "",
+    uxSpec ? `## UX SPEC (build to this)\n${clip(uxSpec, 3500)}` : "",
+    extra ? clip(extra, 9000) : "",
   ];
   return parts.filter(Boolean).join("\n\n");
 }
@@ -507,12 +551,25 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
   // Files the request names (their content, or a warning that nobody looked at them), and the context every role gets.
   let specBlock = "";
   let specNotes: string[] = [];
+  // What the planner sees (the spec files in full, not cut at 7000 characters), the checklist the code extracted from them, and the
+  // layout the request names. The engineers get the shorter specBlock: they can read the files themselves.
+  let plannerSpec = "";
+  let checklist = "";
+  let promises: Promises = { files: [], dirs: [], endpoints: [] };
+  let layout: LayoutKind = null;
   const loadSpecs = (text: string): void => {
     const sf = findSpecFiles(opts.workspaceRoot, text);
-    specBlock = sf.block;
+    const full = fullSpecText(opts.workspaceRoot, text);
+    layout = detectLayout(full);
+    promises = extractPromises(full);
+    checklist = checklistBlock(promises);
+    const layoutText = layoutBlock(layout);
+    specBlock = [layoutText, sf.block].filter(Boolean).join("\n\n");
+    plannerSpec = [layoutText, findSpecFiles(opts.workspaceRoot, text, { maxFileChars: 30_000, maxTotalChars: 45_000 }).block].filter(Boolean).join("\n\n");
     specNotes = specWarnings(sf);
   };
-  const roleContext = (): string => [opts.context ?? "", specBlock].filter(Boolean).join("\n\n");
+  // The files the request names come first: when the text is clipped, the research brief goes, not the requirements.
+  const roleContext = (): string => [specBlock, opts.context ?? ""].filter(Boolean).join("\n\n");
 
   if (resuming) {
     const saved = loadTaskManifest(opts.workspaceRoot);
@@ -555,7 +612,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
 
     try {
-      plan = await planWithPm(opts, missionText, priorOpen, specBlock);
+      plan = await planWithPm(opts, missionText, priorOpen, plannerSpec, checklist);
       // The warnings travel with the plan (task files, delivery report), so nobody later assumes the picture was matched.
       for (const n of specNotes) plan.assumptions.push(`Reference files ${n}`);
     } catch (err: any) {
@@ -686,7 +743,23 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
   // The local database (see db-gate.ts): started with Docker and migrated by the team after the database task, and before a task that
   // needs data (seed, tests). Safe to call again; the note reaches every later agent through `notes`.
   const dbState: { report: DbReport | null } = { report: null };
+  // The Prisma 7 client output (see prisma-gate.ts): one folder inside src, imports that resolve, generated once. Runs before the
+  // database step and after tasks that touch the schema, because a flipped output path sent a real run into a typecheck loop.
+  const prismaState: { generated: boolean | null; lastNote: string } = { generated: null, lastNote: "" };
+  const ensurePrisma = async (): Promise<void> => {
+    const r = await normalizePrismaOutput(opts.workspaceRoot, { log: (l) => console.log(pc.dim(`🧬 ${l}`)) });
+    if (!r) return;
+    r.changed.map((c) => c.replace(/ \(removed\)$/, "").replace(/\/$/, "")).forEach((f) => files.add(f));
+    if (r.generated !== null) prismaState.generated = r.generated;
+    if (r.note && r.note !== prismaState.lastNote) {
+      prismaState.lastNote = r.note;
+      console.log(r.generated === false ? pc.yellow(`⚠ 🧬 ${r.note}`) : pc.green(`🧬 ${r.note}`));
+      bus.emit("log", { text: `Prisma: ${r.note}`, level: r.generated === false ? "warn" : "info" });
+      notes.push(`- ${r.note}`);
+    }
+  };
   const ensureDb = async (): Promise<void> => {
+    await ensurePrisma();
     const r = await ensureLocalDatabase(opts.workspaceRoot, { log: (l) => console.log(pc.dim(`🗄  ${l}`)) });
     if (r.status === "skipped") return;
     if (dbState.report?.note !== r.note) {
@@ -762,7 +835,9 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     // The database task writes the schema; the team starts PostgreSQL and applies the migration. A migrate that failed only because
     // no database was running is then no longer a failure of the task.
     if (t.role === "db" && !res.interrupted) await ensureDb();
-    const dbFixed = t.role === "db" && dbState.report?.migrated === true;
+    else if (!res.interrupted && res.filesWritten.some((f) => /schema\.prisma$|(^|\/)db\.ts$|seed\.ts$/.test(f))) await ensurePrisma();
+    // A typecheck that failed only because the client was not generated into the right place is fixed by the gate, not a task failure.
+    const dbFixed = t.role === "db" && (dbState.report?.migrated === true || prismaState.generated === true);
     const rawStatus: TaskStatus = res.interrupted ? "interrupted" : isStopped(res) || (res.unresolvedFailure && !dbFixed) ? "incomplete" : "done";
     const status = applyEvidence(t.role, rawStatus, res.filesWritten);
     if (status !== rawStatus) console.log(pc.yellow(`⚠ ${title}: no file was written, so this task is NOT counted as done.`));
@@ -909,6 +984,42 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
   }
 
+  // What the request lists (files, folders, API endpoints) against the disk. A planner that saw too little, or an engineer that stopped
+  // early, leaves most of a long spec unbuilt while every task says "done" and typecheck passes on the little that exists. Up to two repair
+  // rounds by the general engineer build the missing items; what is still missing makes the run NOT complete and keeps run.md unwritten.
+  let promiseLeft: string[] = [];
+  if (!interrupted && outcomes.length > 0 && promises.files.length + promises.endpoints.length > 0 && process.env.AGENT_TEAM_PROMISES !== "0") {
+    promiseLeft = missingPromises(opts.workspaceRoot, promises, layout);
+    const rounds = Math.max(0, Number(process.env.AGENT_TEAM_PROMISE_ROUNDS ?? 2) || 0);
+    const promiseAgent = getAgent("dev");
+    let ranRounds = 0;
+    let lastSummary = "";
+    for (let round = 1; round <= rounds && promiseLeft.length > 0 && promiseAgent && !interrupted; round++) {
+      console.log(pc.yellow(`\n⚠ ${promiseLeft.length} item(s) the request lists are not built yet (${promiseLeft.slice(0, 4).join("; ")}${promiseLeft.length > 4 ? "; …" : ""}). Repair round ${round}/${rounds}.`));
+      bus.emit("log", { text: `${promiseLeft.length} item(s) listed in the request are missing: ${promiseLeft.slice(0, 10).join("; ")}. Repair round ${round}.`, level: "warn" });
+      const before = promiseLeft.length;
+      const res = await opts.executor.run(
+        promiseAgent,
+        `Build the missing parts of the request (round ${round})`,
+        `${promiseFixTask(promiseLeft, layout, round)}\n\n## ORIGINAL REQUEST\n${clip(missionText, 4500)}\n\n${roleContext()}\n\n${notes.length ? `What the team has done so far:\n${notes.slice(-12).join("\n")}\n\n` : ""}${FILE_RULE}`,
+      );
+      ranRounds++;
+      lastSummary = clip(res.finalMessage, MAX_SUMMARY);
+      res.filesWritten.forEach((f) => files.add(f));
+      commands.push(...res.commandsRun);
+      gitFlow?.commitAll(`feat: build missing parts of the request (round ${round})`);
+      if (res.interrupted) interrupted = true;
+      promiseLeft = missingPromises(opts.workspaceRoot, promises, layout);
+      if (promiseLeft.length >= before && res.filesWritten.length === 0) break; // no progress: another round would repeat it
+    }
+    const violation = layoutViolation(opts.workspaceRoot, layout);
+    if (violation) promiseLeft.push(`layout: ${violation}`);
+    if (ranRounds > 0) {
+      outcomes.push({ role: "dev", title: "Build the missing parts of the request", status: interrupted ? "interrupted" : promiseLeft.length > 0 ? "incomplete" : "done", summary: lastSummary });
+    }
+    if (promiseLeft.length > 0) notes.push(`- Team (request check): ${promiseLeft.length} item(s) the request lists are still missing: ${promiseLeft.slice(0, 12).join("; ")}`);
+  }
+
   // The project's own typecheck and build, run by the team: the reviewer is read-only and cannot run them, so without this a PASS says
   // nothing about whether the code compiles. One repair run when they fail; a failure that remains makes the run not complete.
   let checkReport: VerifyReport | null = null;
@@ -995,7 +1106,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
   // is done (bugs may remain: it says what was verified). A stopped or unfinished run writes nothing, so the file never promises a
   // working app that was not built. The text is built from the files on disk, not by the model.
   let runGuide: string | null = null;
-  const developmentFinished = !interrupted && outcomes.length > 0 && outcomes.every((o) => o.status === "done");
+  const developmentFinished = !interrupted && outcomes.length > 0 && outcomes.every((o) => o.status === "done") && promiseLeft.length === 0;
   if (developmentFinished) {
     runGuide = writeRunGuide({
       root: opts.workspaceRoot,
@@ -1044,6 +1155,7 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
         ...(manifest && hasOpenTasks(manifest) ? { resumeWith: "/tasks resume" } : {}),
         ...(starterLeft.length ? { starterPageStillInPlace: true, starterFiles: starterLeft.map((f) => f.file) } : {}),
         ...(deadLeft.length ? { linksToMissingPages: deadLeft.slice(0, 10).map((d) => `${d.file} -> ${d.target}`) } : {}),
+        ...(promiseLeft.length ? { listedInRequestButNotBuilt: promiseLeft.slice(0, 15), listedInRequestButNotBuiltCount: promiseLeft.length } : {}),
         ...(checkReport ? { projectChecks: summarizeChecks(checkReport), projectChecksPassed: checkReport.ok } : {}),
         ...(dbState.report ? { database: dbState.report.note, databaseReadyAndMigrated: dbState.report.migrated === true } : {}),
         ...(runGuide ? { runGuideWritten: runGuide } : {}),

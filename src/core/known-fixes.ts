@@ -109,7 +109,8 @@ const RULES: Rule[] = [
       title: "Prisma client not generated (or imported from the wrong place)",
       steps: [
         "Run npx prisma generate in the folder that contains schema.prisma (or prisma.config.ts).",
-        "Prisma 7 (generator provider = prisma-client with an output folder): import PrismaClient from that output folder, for example @/generated/prisma/client. Prisma 6 and older import it from @prisma/client.",
+        'Prisma 7 (generator provider = prisma-client): the generator writes client.ts INTO the output folder. Set output = "../src/generated/prisma" in schema.prisma (exactly this, once, never "../generated/..." and never ending in "/client") and import with: import { PrismaClient } from "@/generated/prisma/client". An output that ends in /client creates client/client.ts and the import above then cannot be found. Prisma 6 and older import from @prisma/client.',
+        "In team mode the team normalizes this itself right after the database task (it fixes the output, removes a second generated copy, corrects imports and runs generate): a note starting with 'Team (prisma)' tells you the result. Do not rewrite schema.prisma again because of this error.",
       ],
     }),
   },

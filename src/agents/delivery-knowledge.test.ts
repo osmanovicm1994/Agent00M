@@ -108,9 +108,25 @@ describe("recipes for accounts, roles, pages and records reach the right agents"
     expect(picks("Implement NextAuth login", "research")).toEqual([]);
   });
 
-  it("recognises the two roles written in capitals even without a library name", () => {
-    expect(picks("Roles: ADMIN sees everything, USER only own records", "api")).toContain("13-delivery/06-recipe-auth-rbac-nextauth.md");
+  it("recognises the two roles written in capitals and gives the jose recipe, not NextAuth, when no library is named", () => {
+    const roles = picks("Roles: ADMIN sees everything, USER only own records", "api");
+    expect(roles).toContain("13-delivery/11-recipe-auth-rbac-jose.md");
+    expect(roles).not.toContain("13-delivery/06-recipe-auth-rbac-nextauth.md");
+    expect(picks("the admin user list page", "dev")).not.toContain("13-delivery/11-recipe-auth-rbac-jose.md");
     expect(picks("the admin user list page", "dev")).not.toContain("13-delivery/06-recipe-auth-rbac-nextauth.md");
+  });
+
+  it("gives the opaque-session recipe when the request asks for a Session table with a token hash", () => {
+    const t = "Opaque server-side sessions: a Session table stores tokenHash (SHA-256); roles ADMIN and USER.";
+    const p = picks(t, "api");
+    expect(p).toContain("13-delivery/12-recipe-auth-opaque-session.md");
+    expect(p).not.toContain("13-delivery/11-recipe-auth-rbac-jose.md");
+    expect(p).not.toContain("13-delivery/06-recipe-auth-rbac-nextauth.md");
+  });
+
+  it("loads NextAuth only when the request names it", () => {
+    expect(picks("Implement NextAuth login with roles ADMIN and USER", "api")).toContain("13-delivery/06-recipe-auth-rbac-nextauth.md");
+    expect(picks("Implement NextAuth login with roles ADMIN and USER", "api")).not.toContain("13-delivery/11-recipe-auth-rbac-jose.md");
   });
 
   it("the pages recipe goes to design, dev and qa, not to the api agent", () => {

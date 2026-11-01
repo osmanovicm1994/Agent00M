@@ -30,6 +30,9 @@ import type { ExecutorHooks } from "./executor-hooks";
 import { LoopWatch, adviseBeforeRun, diagnoseFailure, formatDiagnosis, haltText, refuseRecursiveInstallScript } from "./toolchain-doctor";
 import { StallGuard, classifyCall, isInspectCommand, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
 import { KNOWN_FIX_SHOW_LIMIT, formatKnownFixes, knownFixStopText, matchKnownFixes } from "./known-fixes";
+import { ContextOverflowError } from "../llm/context-error";
+import { repeatsEarlierContent } from "./append-guard";
+import { allocateFirstRequest, charsPerToken, clipMiddle, contextWindow, fitConversation, learnCharsPerToken, learnWindow, messagesChars, promptBudgetTokens } from "./context-fit";
 
 const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas];
 
@@ -225,7 +228,8 @@ function extractImportedPackages(content: string): string[] {
   }
   const packages = new Set<string>();
   for (const spec of specifiers) {
-    if (spec.startsWith(".") || spec.startsWith("/")) continue;
+    // Relative paths and tsconfig path aliases ("@/lib/db", "~/x", "#internal") are project files, not packages.
+    if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("@/") || spec.startsWith("~/") || spec.startsWith("#")) continue;
     const clean = spec.startsWith("node:") ? spec.slice(5) : spec;
     if (clean.startsWith("@")) packages.add(clean.split("/").slice(0, 2).join("/"));
     else packages.add(clean.split("/")[0]);
@@ -239,7 +243,9 @@ const PLACEHOLDER_RE =
   /(?:\/\/|#|\/\*|<!--)\s*(?:\.{3}|…)?\s*(?:rest of (?:the )?(?:file|code|implementation)|existing (?:code|content|imports)|remaining (?:code|content)|(?:code|content) (?:here|unchanged)|previous code|same as before)/i;
 
 // Names that legitimately exist in many folders; never flagged as "duplicate".
-const DUPLICATE_NAME_EXEMPT = /^(index\.\w+|readme\.md|claude\.md|skill\.md|package\.json|tsconfig\.json|__init__\.py)$/i;
+// Next.js route files (route.ts, page.tsx, layout.tsx, ...) are named by convention and repeat in every folder.
+const DUPLICATE_NAME_EXEMPT =
+  /^(index\.\w+|readme\.md|claude\.md|skill\.md|package\.json|tsconfig\.json|__init__\.py|(?:route|page|layout|loading|error|global-error|not-found|template|default|middleware|proxy|instrumentation)\.[cm]?[jt]sx?|\.gitkeep|schema\.prisma|globals?\.css)$/i;
 
 // Secret-bearing env files. The agent may read .env.example but never real
 // secrets: file contents are sent to the model (possibly a cloud endpoint) and
@@ -362,6 +368,8 @@ interface SessionState {
   warnedDuplicatePaths: Set<string>;
   warnedUnknownDeps: Set<string>;
   warnedShrink: Set<string>;
+  // append_file chunks that restart the file, refused once (see core/append-guard.ts).
+  warnedRepeatAppend: Set<string>;
   // Lazily computed union of every package.json's dependencies.
   declaredDependencies: Set<string> | null;
   thinkingCalls: number;
@@ -407,6 +415,7 @@ function newSessionState(): SessionState {
     warnedDuplicatePaths: new Set(),
     warnedUnknownDeps: new Set(),
     warnedShrink: new Set(),
+    warnedRepeatAppend: new Set(),
     declaredDependencies: null,
     thinkingCalls: 0,
     thinkingBudget: MAX_THINKING_CALLS,
@@ -547,9 +556,53 @@ export class Executor {
       .join("\n");
   }
 
-  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = ""): string {
-    const stack = loadKnowledge(stackPaths, STACK_KNOWLEDGE_CHARS);
-    const taskKnowledge = loadKnowledge(taskPaths, TASK_KNOWLEDGE_CHARS, "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
+  // Chars the request carries besides the messages: the tools payload (native tool calling only).
+  private toolsPayloadChars(): number {
+    return this.llm.nativeTools === false ? 0 : JSON.stringify(this.toolSchemas).length;
+  }
+
+  // What the whole prompt may use: the context window LM Studio loaded (AGENT_CONTEXT_WINDOW, or what the server said when it
+  // refused a prompt) minus room for the reply. See core/context-fit.ts.
+  private promptBudgetChars(): number {
+    const maxOut = Number(process.env.AI_MAX_TOKENS) || 8192;
+    return Math.floor(promptBudgetTokens(contextWindow(), maxOut) * charsPerToken());
+  }
+
+  // Trims the conversation to the budget: old tool output first, then the middle of the system prompt, then of the task.
+  private fitToWindow(messages: ChatMessage[], scale = 1): void {
+    const r = fitConversation(messages, Math.floor(this.promptBudgetChars() * scale), this.toolsPayloadChars());
+    if (r.clippedSystem || r.clippedFirstUser || r.stillOver) {
+      const text = `Prompt trimmed to fit the model's context window (${contextWindow()} tokens): ${Math.round(r.before / charsPerToken())} -> ${Math.round(r.after / charsPerToken())} tokens (estimate).${r.stillOver ? " It is still larger than the window: reload the model in LM Studio with a larger Context Length." : ""}`;
+      console.log(pc.yellow(`⚠ ${text}`));
+      bus.emit("log", { text, level: "warn" });
+    }
+  }
+
+  // One model call. When the server refuses the prompt because it is larger than the context window it loaded, the numbers in
+  // its answer are learned, the prompt is trimmed to the real window and the call is repeated (twice at most).
+  private async chatWithFit(messages: ChatMessage[]): Promise<LLMResponse> {
+    const tools = this.llm.nativeTools === false ? undefined : this.toolSchemas;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await this.llm.chat(messages, tools);
+        if (res.stats && !res.stats.promptEstimated) learnCharsPerToken(messagesChars(messages) + this.toolsPayloadChars(), res.stats.promptTokens);
+        return res;
+      } catch (err) {
+        if (!(err instanceof ContextOverflowError) || attempt >= 2) throw err;
+        learnWindow(err.contextTokens);
+        learnCharsPerToken(messagesChars(messages) + this.toolsPayloadChars(), err.promptTokens);
+        const text = `The prompt (${err.promptTokens ?? "?"} tokens) did not fit the model's context window (${err.contextTokens ?? "unknown"} tokens). Trimming it and trying again.`;
+        console.log(pc.yellow(`⚠ ${text}`));
+        bus.emit("log", { text, level: "warn" });
+        // Without the server's numbers, take 15% more off with every attempt.
+        this.fitToWindow(messages, err.contextTokens ? 1 : Math.pow(0.85, attempt + 1));
+      }
+    }
+  }
+
+  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = "", knowledgeShare = 1): string {
+    const stack = loadKnowledge(stackPaths, Math.floor(STACK_KNOWLEDGE_CHARS * knowledgeShare));
+    const taskKnowledge = loadKnowledge(taskPaths, Math.floor(TASK_KNOWLEDGE_CHARS * knowledgeShare), "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
     const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
     const native = this.llm.nativeTools !== false;
     const toolSection = native
@@ -731,18 +784,29 @@ When you are done and have no more actions to take, reply normally with a final 
       console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
       logLine("Project rules loaded from AGENTS.md / CLAUDE.md");
     }
-    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext);
-
     // Ground the agent in reality before it can guess: show the real tree as the
     // first thing it sees, so a small local model can't hallucinate a layout.
     const bootstrapTree = this.readTree(".", 2, state);
+    let firstUserContent = `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}${this.existingPlanNote()}`;
+
+    // The standards are the part of the prompt that can shrink: when rules, role text, tools and the task already use most of
+    // the context window, they get a smaller share (see core/context-fit.ts). With a roomy window they are loaded in full.
+    const wantedKnowledge = (stackPaths.length ? STACK_KNOWLEDGE_CHARS : 0) + (taskPaths.length ? TASK_KNOWLEDGE_CHARS : 0);
+    // The standards keep at least 40% of what they want (versions, recipes and exact commands save a build from guessing):
+    // when that does not fit, the middle of the task text gives way first.
+    const otherFixedChars = agent.systemPrompt.length + 9000 + projectContext.length + this.toolsPayloadChars();
+    const alloc = allocateFirstRequest(this.promptBudgetChars(), otherFixedChars, firstUserContent.length, wantedKnowledge);
+    if (alloc.userMaxChars !== null) {
+      firstUserContent = clipMiddle(firstUserContent, alloc.userMaxChars, 0.7);
+      console.log(pc.dim(`Task text shortened to ${alloc.userMaxChars} characters so the standards keep their share of the context window (${contextWindow()} tokens).`));
+    }
+    const share = alloc.share;
+    if (share < 1) console.log(pc.dim(`Standards shortened to ${Math.round(share * 100)}% to fit the model's context window (${contextWindow()} tokens).`));
+    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext, share);
 
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}${this.existingPlanNote()}`,
-      },
+      { role: "user", content: firstUserContent },
     ];
 
     let steps = 0;
@@ -761,12 +825,13 @@ When you are done and have no more actions to take, reply normally with a final 
         };
       }
       this.compactHistory(messages);
+      this.fitToWindow(messages);
       // Updates from the other agents (parallel runs only): what they wrote or published since the last step.
       const teamUpdate = this.hooks.teamUpdates?.(state.agentId);
       if (teamUpdate) messages.push({ role: "user", content: teamUpdate });
       // Models without a tool template get no tools payload (they use fenced blocks).
       bus.emit("llm_request", { step: steps });
-      const response = await this.llm.chat(messages, this.llm.nativeTools === false ? undefined : this.toolSchemas);
+      const response = await this.chatWithFit(messages);
       if (response.content.trim()) {
         bus.emit("agent_thinking", {
           source: "reply",
@@ -1480,7 +1545,17 @@ When you are done and have no more actions to take, reply normally with a final 
     return d;
   }
 
+  /** Runs a write and shows a refusal in the terminal, so a file that never appears has a visible reason in the log. */
   private async handleWrite(append: boolean, args: Record<string, any>, state: SessionState): Promise<string> {
+    const result = await this.handleWriteInner(append, args, state);
+    if (result.startsWith("TOOL ERROR")) {
+      const first = result.split("\n")[0].replace(/^TOOL ERROR:\s*/, "");
+      console.log(pc.yellow(`\n✖ ${append ? "append_file" : "write_file"} refused: ${first.length > 300 ? `${first.slice(0, 300)}…` : first}`));
+    }
+    return result;
+  }
+
+  private async handleWriteInner(append: boolean, args: Record<string, any>, state: SessionState): Promise<string> {
     const toolName = append ? "append_file" : "write_file";
     const p = this.np(args.path);
 
@@ -1613,6 +1688,20 @@ When you are done and have no more actions to take, reply normally with a final 
   private async handleAppend(p: string, content: string, exists: boolean, state: SessionState): Promise<string> {
     if (!exists || !state.filesWritten.includes(p)) {
       return `TOOL ERROR: append_file only continues a file you already created or overwrote with write_file in this session (${p} is not one). Use write_file first.`;
+    }
+
+    // A chunk that starts the file over would glue a second copy to the first (duplicate declarations, a build that cannot pass).
+    // Refused once; the same chunk sent again is allowed, in case the repeat is intended.
+    if (repeatsEarlierContent(this.fs.readFile(p), content)) {
+      const key = `${p}:${content.length}`;
+      if (!state.warnedRepeatAppend.has(key)) {
+        state.warnedRepeatAppend.add(key);
+        return (
+          `TOOL ERROR: refused to append to ${p}: the first lines of this chunk are already in the file, so it looks like you sent the file from the top again. ` +
+          `Do NOT send the file again. Send ONLY the lines that come after the end of the file. It currently ends with:\n${this.tailOf(p)}\n` +
+          "If you really mean to repeat this block, send the same append_file again and it will be allowed."
+        );
+      }
     }
 
     const lines = content.split("\n");

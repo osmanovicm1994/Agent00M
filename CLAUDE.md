@@ -352,6 +352,15 @@ npx ts-node src/cli.ts run "task" -p /path --serve   # one-shot run, same socket
 - Tests: `team/git-flow.test.ts` (real git in tmp dirs), `team/orchestrator.test.ts` ("local git"; other orchestrator tests set `AGENT_GIT=0`).
 - Env: `AGENT_GIT=0` disables the whole flow.
 
+## Context window fit (Oct 31, 2026)
+
+A run died with "the prompt (33307 tokens) does not fit the context window (30720 tokens)". Cause: the first message of an engineer (project tree + task + assignment with original request, task file, UX spec, notes, referenced files) plus the system prompt (operating guidelines, role, up to 9000 + 16000 chars of standards, project rules) plus the tools payload was never measured against the window; only old tool output was compacted, at 60000 characters.
+
+- `core/context-fit.ts` (pure, tested in `context-fit.test.ts`): `contextWindow()` = `AGENT_CONTEXT_WINDOW` (default 32768), never more than the server admitted; `promptBudgetTokens` leaves room for the reply (up to 4096 tokens); characters per token default 3.2 and calibrated from the server's real `prompt_tokens`. `fitConversation` trims in order: old tool/assistant output, the MIDDLE of the system prompt (rules at both ends stay), the MIDDLE of the first user message. Every cut leaves a marker. `knowledgeScale` shrinks the stack/task standards (down to 15%) when rules, role, tools and task already fill the window.
+- `llm/context-error.ts`: `ContextOverflowError` (prompt and window tokens parsed from the server's text). `llm/providers/lmstudio.ts` throws it; `Executor.chatWithFit` learns the window, trims and retries up to twice, with a yellow note. Without a number in the server's text, each retry takes 15% more off.
+- Team assignment caps (`team/orchestrator.ts`): original request 3000, task file 4000, UX spec 3500, notes of earlier tasks 3000 (newest kept, `recentNotes`), referenced files + research brief 9000 (the files first). The planner and UX designer still get the larger spec text.
+- Env: `AGENT_CONTEXT_WINDOW` (tokens loaded in LM Studio). A bigger window is the better fix: at 32k the standards are shortened on big tasks.
+
 ## Known limits
 
 - The `13-delivery/08-recipe-monorepo-db-package.md` layout (`packages/db`) and `prisma generate` itself were not run end to end in the checking sandbox (engine download blocked); the real exit codes on the owner's machine are the proof.

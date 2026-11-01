@@ -79,6 +79,9 @@ const STARTER_GITIGNORE = [
   "",
 ].join("\n");
 
+/** Branches this tool creates for one task (see taskBranchName). */
+const TASK_BRANCH_RE = /^task\/\d{2}-/;
+
 export function slug(s: string, max = 40): string {
   const t = s
     .toLowerCase()
@@ -257,7 +260,9 @@ export class GitFlow {
     // ----- resume: back onto the saved feature branch -----
     if (opts.resume) {
       try {
-        const { base, feature } = opts.resume;
+        const feature = opts.resume.feature;
+        // A task branch is never a base. An earlier run that started while an interrupted run's task branch was checked out saved it as one.
+        const base = TASK_BRANCH_RE.test(opts.resume.base) ? (flow.userBranch() ?? opts.resume.base) : opts.resume.base;
         if (flow.branchExists(feature)) {
           if (branch !== feature) {
             if (flow.isDirty()) flow.commitAllRaw("wip: save interrupted work");
@@ -290,15 +295,26 @@ export class GitFlow {
       }
       let feature = `feature/${slug(opts.goal)}`;
       for (let i = 2; flow.branchExists(feature); i++) feature = `feature/${slug(opts.goal, 36)}-${i}`;
+      // An interrupted run leaves HEAD on its task branch (TASK_BRANCH_RE is this tool's own naming). That branch is not the person's:
+      // the new feature branch continues from it, so the interrupted work is kept, but it is merged into the person's own branch.
+      const own = TASK_BRANCH_RE.test(branch) ? flow.userBranch() : undefined;
+      if (TASK_BRANCH_RE.test(branch)) {
+        log(`HEAD was on ${branch}, a task branch of an interrupted run; ${feature} continues from it${own ? ` and is meant to be merged into ${own}` : ""}`, "warn");
+      }
       flow.git(["checkout", "-q", "-b", feature]);
-      flow.meta.base = branch;
+      flow.meta.base = own ?? branch;
       flow.meta.feature = feature;
-      log(`working on branch ${feature} (base ${branch} stays untouched)`, "step");
+      log(`working on branch ${feature} (base ${own ?? branch} stays untouched)`, "step");
       return flow;
     } catch (err: any) {
       log(`git could not create the feature branch (${String(err?.message ?? err)}), so the branch workflow is skipped`, "warn");
       return null;
     }
+  }
+
+  /** The person's own main line: the first of main, master, develop, trunk that exists. */
+  private userBranch(): string | undefined {
+    return ["main", "master", "develop", "trunk"].find((b) => this.branchExists(b));
   }
 
   /** Local excludes (no project file is edited): bookkeeping, dependencies, build output, secrets. */

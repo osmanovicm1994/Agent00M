@@ -180,6 +180,12 @@ const FULLSTACK_AGENTS = ["dev", "api", "db", "design", "qa", "logic", "infra"];
 
 const BULLET_LIST_RE = /(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*(?:\n\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*){2,}/;
 
+/** The request names NextAuth / Auth.js (or its credentials provider) itself. */
+const NEXTAUTH_NAMED_RE = /\bnext-?auth\b|\bauth\.js\b|credentials provider/i;
+
+/** The request asks for opaque server-side sessions (a Session table with a token hash), not for signed JWT cookies. */
+const OPAQUE_SESSION_RE = /\bopaque\b|\btokenHash\b|\bserver-side sessions?\b|\bsession (?:row|table|model)\b|\bSession model\b/i;
+
 export const KNOWLEDGE_RULES: KnowledgeRule[] = [
   // --- Logic standards ---------------------------------------------------
   {
@@ -399,10 +405,30 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     onlyFor: FULLSTACK_AGENTS,
   },
   {
-    id: "rbac-auth",
-    // Accounts with roles and per-user data. "ADMIN ... USER" in capitals is how a spec writes the two roles.
-    test: (t) => /\bnext-?auth\b|\bauth\.js\b|\brbac\b|role[- ]based|credentials provider|\bownerFilter\b|\bidor\b|per-user|owner(ship)? (check|filter|column)/i.test(t) || /\bADMIN\b[\s\S]{0,80}\bUSER\b/.test(t),
+    id: "rbac-auth-nextauth",
+    // NextAuth only when the request asks for it by name. A real run got next-auth installed (and a second jose session built next to it)
+    // because roles alone used to load this recipe.
+    test: (t) => NEXTAUTH_NAMED_RE.test(t),
     files: ["13-delivery/06-recipe-auth-rbac-nextauth.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "rbac-auth-opaque",
+    // The request's own design wins: opaque tokens whose SHA-256 hash is stored in a Session table.
+    test: (t) => !NEXTAUTH_NAMED_RE.test(t) && OPAQUE_SESSION_RE.test(t),
+    files: ["13-delivery/12-recipe-auth-opaque-session.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "rbac-auth",
+    // Accounts with roles and per-user data, with the jose + bcryptjs session. "ADMIN ... USER" in capitals is how a spec writes the two roles.
+    test: (t) =>
+      !NEXTAUTH_NAMED_RE.test(t) &&
+      !OPAQUE_SESSION_RE.test(t) &&
+      (/\brbac\b|role[- ]based|\bownerFilter\b|\bidor\b|per-user|owner(ship)? (check|filter|column)|\bjose\b|bcrypt|httpOnly|session cookie|\badmin (login|site|panel|area)\b/i.test(t) || /\bADMIN\b[\s\S]{0,80}\bUSER\b/.test(t)),
+    files: ["13-delivery/11-recipe-auth-rbac-jose.md"],
     weight: 6,
     onlyFor: FULLSTACK_AGENTS,
   },

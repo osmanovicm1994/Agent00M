@@ -206,6 +206,31 @@ describe("runTeam: local git", () => {
   });
 });
 
+describe("runTeam: size of the engineers' first message", () => {
+  it("keeps the notes of earlier tasks within a fixed budget, newest first", async () => {
+    const { recentNotes } = await import("./orchestrator");
+    const notes = Array.from({ length: 12 }, (_, i) => `- task ${i + 1}: ${"x".repeat(400)}`);
+    const out = recentNotes(notes, 3000);
+    expect(out.length).toBeLessThan(3300);
+    expect(out).toContain("task 12");
+    expect(out).not.toContain("task 1:");
+    expect(out).toContain("earlier task note(s) left out");
+    expect(recentNotes(["- a", "- b"], 3000)).toBe("- a\n- b");
+    expect(recentNotes([], 3000)).toBe("");
+  });
+
+  it("puts the referenced files before the research brief and keeps the whole assignment bounded", async () => {
+    write("ugovorv1.md", "# Agreement rules\nThe commission is paid on delivery.\n");
+    const f = fakes();
+    await runTeam({ llm: f.llm as any, executor: f.executor as any, task: "Build it as described in ugovorv1.md", workspaceRoot: ws, approvePlan: false, context: "BRIEF ".repeat(3000) });
+    const eng = f.calls.find((c) => c.agent === "api")!;
+    const full = `${eng.task}\n${eng.context}`;
+    expect(full.indexOf("commission is paid")).toBeGreaterThan(-1);
+    expect(full.indexOf("commission is paid")).toBeLessThan(full.indexOf("BRIEF"));
+    expect(eng.context.length).toBeLessThan(30000);
+  });
+});
+
 describe("validatePlanCoverage", () => {
   const source = "- Require an authenticated `ADMIN` session for every admin page and mutation.\n- Status values are `DRAFT`, `PUBLISHED`, `ARCHIVED`.";
   const task = (role: string) => ({ role, title: "t", instructions: "", acceptance: ["A1"], scope: [], dependsOn: [] });
@@ -235,6 +260,23 @@ describe("validatePlanCoverage", () => {
     expect(p.coverage).toHaveLength(0);
     expect(r.verified).toBe(0);
     expect(r.issues.join("\n")).toContain("was not found in the request");
+  });
+
+  it("accepts a quote that reorders the request's own words, and an acceptance text that is worded a little differently", () => {
+    const src = "Passwords are hashed with bcryptjs and the session lives in an httpOnly cookie.";
+    const p = {
+      goal: "g", assumptions: [], risks: [], questions: [],
+      tasks: [{ role: "api", title: "t", instructions: "", acceptance: ["login test: wrong password refused, right one signed in"], scope: [], dependsOn: [] }],
+      coverage: [{ requirement: "Password hashes with bcryptjs; session in an httpOnly cookie.", task: 1, acceptance: "login test wrong password is refused and the right one signed in" }],
+    } as any;
+    const r = validatePlanCoverage(p, src);
+    expect(r.issues).toEqual([]);
+    expect(r.verified).toBe(1);
+  });
+
+  it("still rejects a quote with too few of the request's words", () => {
+    const p = plan(["api"], [{ requirement: "Support cryptocurrency checkout for admin pages", task: 1, acceptance: "A1" }]);
+    expect(validatePlanCoverage(p, source).verified).toBe(0);
   });
 
   it("keeps one requirement that two tasks implement", () => {
