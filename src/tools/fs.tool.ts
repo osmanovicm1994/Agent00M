@@ -403,6 +403,21 @@ export const fsToolSchemas: ToolSchema[] = [
     },
   },
   {
+    name: "edit_file",
+    description:
+      "Change ONE exact piece of an existing file: old_string is replaced by new_string. Use it for any small change instead of rewriting the whole file. old_string must match the file exactly (copy it from read_file, without the line numbers) and must appear only once; add surrounding lines to make it unique. The user reviews a diff and must approve.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path of an existing file, relative to the project root" },
+        old_string: { type: "string", description: "The exact text to replace (unique in the file)" },
+        new_string: { type: "string", description: "The replacement text (empty string deletes old_string)" },
+        replace_all: { type: "boolean", description: "Optional. Replace every match instead of requiring exactly one" },
+      },
+      required: ["path", "old_string", "new_string"],
+    },
+  },
+  {
     name: "append_file",
     description:
       "Append the next chunk to a file you already created with write_file in this session. Use it to write long files in pieces of ~150 lines so nothing gets cut off.",

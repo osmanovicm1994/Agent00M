@@ -14,5 +14,7 @@ node_modules/
 dist/
 .agent_cache/
 _to_delete/
+# Agensi.io skill packages (not pushed to git)
+agensi/
 bench/fullstack/workspace/
 bench/fullstack/results/

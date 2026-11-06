@@ -121,13 +121,18 @@ export class LMStudioProvider implements LLMProvider {
     this.temperatureOverride = config.temperature ?? (Number.isFinite(parsedTemp) ? parsedTemp : undefined);
 
     this.maxTokens = config.maxTokens ?? envNumber("AI_MAX_TOKENS", 8192);
-    this.timeoutMs = config.timeoutMs ?? envNumber("AI_TIMEOUT_MS", 600_000);
+    // 900 s, above LM Studio's own 600 s prediction limit: when a generation is too slow the SERVER's explicit error arrives first,
+    // instead of the client giving up and leaving the server still generating for a request nobody waits for any more.
+    this.timeoutMs = config.timeoutMs ?? envNumber("AI_TIMEOUT_MS", 900_000);
     this.maxContinuations = config.maxContinuations ?? envNumber("AI_MAX_CONTINUATIONS", 6);
     this.showProgress = process.env.AI_STREAM_PROGRESS !== "0" && Boolean(process.stdout.isTTY);
     this.printStats = config.printStats ?? process.env.AI_STATS !== "0";
     this.nativeOverride = config.nativeTools;
 
-    this.client = new OpenAI({ baseURL: this.baseURL, apiKey, maxRetries: 1 });
+    // No automatic retry of a call that failed after it was sent (AI_MAX_RETRIES=1 brings it back): a retry of a timed-out 28k-token
+    // prompt goes into the queue BEHIND the first one, which is still being processed, and doubles the wait.
+    const retries = Number(process.env.AI_MAX_RETRIES);
+    this.client = new OpenAI({ baseURL: this.baseURL, apiKey, maxRetries: Number.isInteger(retries) && retries >= 0 && process.env.AI_MAX_RETRIES ? retries : 0 });
   }
 
   get model(): string {

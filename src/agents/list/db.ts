@@ -28,5 +28,5 @@ If the same typecheck error comes back after you generated, stop editing the sch
       "06-database/02-migration-safety.md",
       "06-database/03-query-performance.md",
       "06-database/04-data-integrity.md",
-    ]),
+    ], 13_500), // about 12.9 KB; at the old 9000 migration safety, query performance and data integrity were cut
 };

@@ -168,7 +168,9 @@ describe("the debug agent is small and carries the known fixes", () => {
     expect(debug.thinkingBudget).toBeLessThanOrEqual(2);
     expect(debug.systemPrompt).toContain("13-delivery/05-known-fixes.md");
     expect(debug.systemPrompt).toContain("PATCHED");
-    expect(debug.systemPrompt.length).toBeLessThan(11_500);
+    // ~2.7 KB prompt + tool rules + fix loop (with the NEEDS INPUT block) + known fixes. Was 11_500 before the fix loop was added.
+    expect(debug.systemPrompt.length).toBeLessThan(13_500);
+    expect(debug.systemPrompt).toContain("NEEDS INPUT");
   });
 
   it("the infra agent carries the known fixes and the versions table", async () => {

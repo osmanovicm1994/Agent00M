@@ -2,6 +2,7 @@ import { FsTools, fsToolSchemas } from "./fs.tool";
 import { SearchTool, searchToolSchemas } from "./search.tool";
 import { ShellTool, shellToolSchema } from "./shell.tool";
 import type { ToolSchema } from "../llm/types";
+import { applyEdit } from "../core/edit-apply";
 
 /**
  * Combined list of all built-in agent tool schemas (no duplicates:
@@ -46,6 +47,13 @@ export class ToolDispatcher {
       case "write_file":
         this.fs.commitWrite(args.path, args.content);
         return `Successfully wrote content to ${args.path}`;
+
+      case "edit_file": {
+        const r = applyEdit(this.fs.readFile(args.path), args.old_string, args.new_string, args.replace_all === true);
+        if (!r.ok) throw new Error(r.error);
+        this.fs.commitWrite(args.path, r.content);
+        return `Successfully edited ${args.path} (${r.replaced} place${r.replaced === 1 ? "" : "s"}, first at line ${r.firstLine})`;
+      }
 
       case "append_file":
         this.fs.appendToFile(args.path, args.content);

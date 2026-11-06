@@ -32,9 +32,12 @@ import { StallGuard, classifyCall, isInspectCommand, stallGuardEnabled, stallOpt
 import { KNOWN_FIX_SHOW_LIMIT, formatKnownFixes, knownFixStopText, matchKnownFixes } from "./known-fixes";
 import { ContextOverflowError } from "../llm/context-error";
 import { repeatsEarlierContent } from "./append-guard";
+import { applyEdit } from "./edit-apply";
+import { selectToolSchemas } from "./tool-select";
+import { ASK_USER_TOOL, askUser, askUserSchema, canAskUser, formatAnswer, limitReached, maxQuestions, parseAskArgs, unattendedAnswer } from "./ask-user";
 import { allocateFirstRequest, charsPerToken, clipMiddle, contextWindow, fitConversation, learnCharsPerToken, learnWindow, messagesChars, promptBudgetTokens } from "./context-fit";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas, askUserSchema];
 
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
@@ -294,6 +297,9 @@ const SUCCESS_REPEAT_LIMIT = 3;
 const blockedRuns = new WeakMap<object, number>();
 const BLOCKED_RUN_LIMIT = 3;
 
+// Questions the agent asked the person in this run (ask_user): capped by AGENT_MAX_QUESTIONS (default 3), see core/ask-user.ts.
+const askCounts = new WeakMap<object, number>();
+
 // Known failures (see known-fixes.ts): how often each fix was shown in this run. A fix that was shown KNOWN_FIX_SHOW_LIMIT times and
 // did not help ends the run with a plain explanation instead of more tries.
 const knownFixShown = new WeakMap<object, Map<string, number>>();
@@ -443,6 +449,8 @@ export class Executor {
   private procs: ProcessManager;
   private search: SearchTool;
   private toolSchemas: ToolSchema[];
+  // The schemas ONE run advertises (see core/tool-select.ts): toolSchemas minus the groups the agent and task do not need.
+  private activeSchemas: ToolSchema[];
   private autoWrite: boolean;
   private autoRun: boolean;
   private warnedNoGit = false;
@@ -465,6 +473,7 @@ export class Executor {
     this.procs = new ProcessManager(this.workspaceRoot);
     this.search = new SearchTool(this.workspaceRoot);
     this.toolSchemas = [...BUILTIN_TOOL_SCHEMAS, ...(mcp?.schemas() ?? [])];
+    this.activeSchemas = this.toolSchemas;
   }
 
   // Toggling auto mode (/auto-write) switches files and commands together, as before.
@@ -543,7 +552,7 @@ export class Executor {
   // Compact "name(arg, optionalArg?): description" list for models that cannot
   // receive a tools payload (no native tool calling).
   private toolReference(): string {
-    return this.toolSchemas
+    return this.activeSchemas
       .map((t) => {
         const params = t.parameters as { properties?: Record<string, unknown>; required?: string[] };
         const required = new Set(params.required ?? []);
@@ -558,7 +567,7 @@ export class Executor {
 
   // Chars the request carries besides the messages: the tools payload (native tool calling only).
   private toolsPayloadChars(): number {
-    return this.llm.nativeTools === false ? 0 : JSON.stringify(this.toolSchemas).length;
+    return this.llm.nativeTools === false ? 0 : JSON.stringify(this.activeSchemas).length;
   }
 
   // What the whole prompt may use: the context window LM Studio loaded (AGENT_CONTEXT_WINDOW, or what the server said when it
@@ -581,7 +590,7 @@ export class Executor {
   // One model call. When the server refuses the prompt because it is larger than the context window it loaded, the numbers in
   // its answer are learned, the prompt is trimmed to the real window and the call is repeated (twice at most).
   private async chatWithFit(messages: ChatMessage[]): Promise<LLMResponse> {
-    const tools = this.llm.nativeTools === false ? undefined : this.toolSchemas;
+    const tools = this.llm.nativeTools === false ? undefined : this.activeSchemas;
     for (let attempt = 0; ; attempt++) {
       try {
         const res = await this.llm.chat(messages, tools);
@@ -603,7 +612,7 @@ export class Executor {
   private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = "", knowledgeShare = 1): string {
     const stack = loadKnowledge(stackPaths, Math.floor(STACK_KNOWLEDGE_CHARS * knowledgeShare));
     const taskKnowledge = loadKnowledge(taskPaths, Math.floor(TASK_KNOWLEDGE_CHARS * knowledgeShare), "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
-    const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
+    const toolNames = this.activeSchemas.map((t) => t.name).join(", ");
     const native = this.llm.nativeTools !== false;
     const toolSection = native
       ? `You have access to these tools: ${toolNames}.\nIf your runtime does not support native tool calls, use these fenced-block formats instead.`
@@ -626,6 +635,12 @@ Tools with simple arguments (read_file, read_multiple_files, get_directory_tree,
 {"name": "get_directory_tree", "arguments": {"path": ".", "maxDepth": 4}}
 \`\`\`
 
+edit_file changes ONE exact piece of an existing file (use it instead of rewriting a whole file for a small change). Its arguments are short, so JSON is fine:
+\`\`\`action
+{"name": "edit_file", "arguments": {"path": "src/a.ts", "old_string": "return 1;", "new_string": "return 2;"}}
+\`\`\`
+old_string must match the file exactly and only once.
+
 write_file and append_file take RAW file content. Never JSON-encode it. Put the path on the opening fence line:
 \`\`\`write_file path/to/file.ts
 <complete raw file content, verbatim>
@@ -637,7 +652,7 @@ If the file content itself contains triple backticks (e.g. a Markdown file), ope
 
 CRITICAL TOOL RULES:
 1. Map the project with ONE get_directory_tree call. Do not crawl with list_directory.
-2. Read-only tools (read_file, read_multiple_files, get_directory_tree, find_files, grep) may be batched: several in one turn is fine. write_file, append_file and run_command: exactly ONE per turn, then wait for the result.
+2. Read-only tools (read_file, read_multiple_files, get_directory_tree, find_files, grep) may be batched: several in one turn is fine. write_file, append_file, edit_file and run_command: exactly ONE per turn, then wait for the result.
 3. Long files: write_file with the first ~150 lines, then append_file with chunks of ~150 lines until done. Never abbreviate with placeholders like "// ... rest of file".
 4. read_file returns the whole file unless it says TRUNCATED. You must read an existing file COMPLETELY before overwriting it, and then send its full new content.
 5. You must inspect a directory (get_directory_tree or list_directory) before creating a new file inside it.
@@ -737,6 +752,10 @@ When you are done and have no more actions to take, reply normally with a final 
     state.readOnly = Boolean(agent.readOnly);
     state.agentId = agent.id;
     state.stall = stallGuardEnabled() ? new StallGuard(stallOptionsFor(agent.id)) : null;
+    this.activeSchemas = selectToolSchemas(this.toolSchemas, agent.id, `${task}\n${extraContext ?? ""}`);
+    if (this.activeSchemas.length < this.toolSchemas.length) {
+      console.log(pc.dim(`Tools for this run: ${this.activeSchemas.length} of ${this.toolSchemas.length} (the rest are not needed for this task; AGENT_TOOL_TRIM=0 sends all).`));
+    }
 
     const stackPaths = detectStackKnowledge(this.workspaceRoot, agent.id);
     if (stackPaths.length) {
@@ -1217,6 +1236,13 @@ When you are done and have no more actions to take, reply normally with a final 
         if (state.readOnly) return READ_ONLY_REFUSAL;
         return this.handleWrite(true, args, state);
 
+      case "edit_file":
+        if (state.readOnly) return READ_ONLY_REFUSAL;
+        return this.handleEdit(args, state);
+
+      case ASK_USER_TOOL:
+        return this.handleAskUser(args, state);
+
       // Web tools (src/tools/web-search.tool.ts): they log their own progress and never throw.
       case "web_search":
         return runWebSearch(args);
@@ -1543,6 +1569,50 @@ When you are done and have no more actions to take, reply normally with a final 
     let d = dir;
     while (d !== "." && !this.fs.isDirectory(d)) d = dirnameOf(d);
     return d;
+  }
+
+  /** ask_user: one short question to the person (terminal or dashboard). Never blocks an unattended run. */
+  private async handleAskUser(args: Record<string, any>, state: SessionState): Promise<string> {
+    const parsed = parseAskArgs(args);
+    if (!parsed.ok) return `TOOL ERROR: ${parsed.error}`;
+    const used = askCounts.get(state) ?? 0;
+    const max = maxQuestions();
+    if (used >= max) return limitReached(used, max);
+    if (!canAskUser(bus.origin(), Boolean(process.stdin.isTTY))) {
+      console.log(pc.dim(`\nThe agent has a question but nobody can answer (no terminal): ${parsed.value.question}`));
+      return unattendedAnswer(parsed.value);
+    }
+    askCounts.set(state, used + 1);
+    const raw = await askUser(parsed.value);
+    return formatAnswer(raw, parsed.value);
+  }
+
+  /**
+   * edit_file: replace one exact piece of an existing file. The new file content is built here and sent through
+   * handleWriteInner, so every write gate (approval and diff, placeholder check, package.json guard, hooks) still applies.
+   */
+  private async handleEdit(args: Record<string, any>, state: SessionState): Promise<string> {
+    const p = this.np(args.path);
+    if (!p || p === ".") return `TOOL ERROR: edit_file requires a file "path".`;
+    if (isSecretPath(p)) return `TOOL ERROR: editing ${p} is blocked (secret env file).`;
+    if (this.fs.isDirectory(p) || !this.fs.fileExists(p)) {
+      return `TOOL ERROR: edit_file only changes a file that already exists, and ${p} was not found. Use write_file to create a new file.`;
+    }
+    const replaceAll = args.replace_all === true || args.replace_all === "true";
+    const r = applyEdit(this.fs.readFile(p), args.old_string, args.new_string, replaceAll);
+    if (!r.ok) {
+      console.log(pc.yellow(`\n✖ edit_file refused: ${r.error.split("\n")[0].slice(0, 300)}`));
+      return `TOOL ERROR: ${r.error}`;
+    }
+    // An exact match proves the model knows this part of the file, so write_file's "read the whole file first" gate does not apply.
+    state.filesRead.add(p);
+    const result = await this.handleWriteInner(false, { path: p, content: r.content }, state);
+    if (result.startsWith("File written:")) {
+      const head = /^File written: \S+ \(\d+ lines\)\./.exec(result)?.[0] ?? `File written: ${p}.`;
+      return `${head} Edited ${r.replaced} place${r.replaced === 1 ? "" : "s"}, the first at line ${r.firstLine}. Run the check that covers this file before the next change.`;
+    }
+    if (result.startsWith("TOOL ERROR")) console.log(pc.yellow(`\n✖ edit_file refused: ${result.split("\n")[0].replace(/^TOOL ERROR:\s*/, "").slice(0, 300)}`));
+    return result;
   }
 
   /** Runs a write and shows a refusal in the terminal, so a file that never appears has a visible reason in the log. */

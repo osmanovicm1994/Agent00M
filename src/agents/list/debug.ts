@@ -15,7 +15,7 @@ const PROMPT = [
   "   If the output has a \"knownFix\" or \"diagnosis\" block, or the standards below list the error, apply that exactly.",
   "2. LOOK only at what the error names: the file and line, the config it complains about, the package.json scripts.",
   "   At most 3 looks (read_file, grep, one ls). Never list, search or read inside node_modules. Never look at the same thing twice.",
-  "3. FIX with the smallest change. When you rewrite a file, send the WHOLE file in one write_file. Before changing a dependency,",
+  "3. FIX with the smallest change: edit_file with an exact old_string for a line or block. Only when you rewrite most of a file, send the WHOLE file in one write_file. Before changing a dependency,",
   "   check the real version with: npm view <package> version engines.node peerDependencies",
   "4. RE-RUN the failing command once. Exit code 0 and no error text = fixed.",
   "5. If it fails with a DIFFERENT error, repeat from step 1 once. If it fails with the SAME error, your fix was wrong:",
@@ -24,7 +24,7 @@ const PROMPT = [
   "Stop and report instead of continuing when:",
   "- the cause is outside the project (Node/npm too old, a missing tool, a missing secret or database, a taken port):",
   "  say which, and give the exact command or setting the person must change;",
-  "- you need information only the person has (a password, a URL, a decision);",
+  "- you need information only the person has (a password, a URL, a decision): ask with the ask_user tool (one question, with a default); if it says nobody can answer, end with the NEEDS INPUT block from the standards below;",
   "- you have used 3 fixes and the command still fails.",
   "",
   "Rules:",
@@ -43,6 +43,8 @@ const PROMPT = [
   "If the request asks for a PATCHED / NOT PATCHED line, end with it.",
 ].join("\n");
 
+// Order matters: loadKnowledge() cuts from the end when the budget is too small. The tool rules and the fix loop come first
+// (a real run dropped tool-execution.md because known-fixes.md filled the old 7000-character budget), then the exact fixes.
 export const debugAgent: AgentDefinition = {
   id: "debug",
   name: "Debugging & Problem-Solving Agent",
@@ -54,5 +56,14 @@ export const debugAgent: AgentDefinition = {
   verifyFixes: true,
   systemPrompt:
     PROMPT +
-    loadKnowledge(["13-delivery/05-known-fixes.md", "00-agent-core/tool-execution.md"], 7_000),
+    loadKnowledge(
+      [
+        "00-agent-core/tool-execution.md",
+        "14-coding/01-fix-loop.md",
+        "13-delivery/05-known-fixes.md",
+      ],
+      // The three files total about 10.2 KB. 14-coding/02-ts-error-codes.md is NOT listed: it did not fit, and the TS errors that
+      // loop most are already answered by known-fixes.md and the matcher in src/core/known-fixes.ts.
+      10_800,
+    ),
 };

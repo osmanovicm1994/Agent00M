@@ -57,7 +57,7 @@ You cannot see the rendered interface. inspect_page reports facts (errors, overf
     "04-frontend/modern-frontend.md",
     "10-design/css-and-tailwind.md",
     "09-ai-agents/mcp-protocols.md",
-  ]);
+  ], 16_800); // about 16.2 KB; at the old 9000 modern-frontend, css-and-tailwind and mcp-protocols were cut
 
 export const designAgent: AgentDefinition = {
   id: "design",

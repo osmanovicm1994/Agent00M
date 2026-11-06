@@ -44,7 +44,7 @@ const LOOP_WARN_AT = [1, 3];
 const LOOP_STOP_AT = 5;
 
 const INSPECT_TOOLS = new Set(["read_file", "read_multiple_files", "list_directory", "get_directory_tree", "find_files", "grep", "process_logs"]);
-const WRITE_TOOLS = new Set(["write_file", "append_file"]);
+const WRITE_TOOLS = new Set(["write_file", "append_file", "edit_file"]);
 
 const INSPECT_VERBS = new Set([
   "ls", "cat", "head", "tail", "find", "grep", "rg", "tree", "stat", "file", "wc", "pwd", "which", "whereis", "du", "type",

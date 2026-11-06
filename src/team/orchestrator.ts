@@ -25,6 +25,9 @@ import * as fs from "fs";
 import * as path from "path";
 import pc from "picocolors";
 import prompts from "prompts";
+import * as readline from "readline";
+import { control } from "../core/control";
+import { pmLanguageNote } from "../core/language";
 import type { ChatOptions, LLMProvider } from "../llm/types";
 import { bus } from "../core/events";
 import type { Executor, ExecutorResult } from "../core/executor";
@@ -366,7 +369,7 @@ async function planWithPm(opts: TeamOptions, mission?: string, prior?: TaskManif
     (opts.context ? `\n\n<extra_context>\n${clip(opts.context, 5000)}\n</extra_context>` : "") +
     (specBlock ? `\n\n<referenced_files>\n${specBlock}\n</referenced_files>` : "") +
     (checklist ? `\n\n<spec_checklist>\n${checklist}\n</spec_checklist>` : "");
-  const system = PM_SYSTEM + (opts.parallel ? PM_PARALLEL_ADDENDUM : "") + PM_KNOWLEDGE;
+  const system = PM_SYSTEM + (opts.parallel ? PM_PARALLEL_ADDENDUM : "") + PM_KNOWLEDGE + pmLanguageNote(`${mission ?? ""}\n${opts.task}`);
 
   // The planner's answer is validated, so it must never come from the response cache (noCache): a rejected answer would be
   // replayed for every identical request. A repair gets the rejected plan and the exact problems, and a little more temperature
@@ -529,6 +532,42 @@ function printGit(g: GitSummary): void {
 
 const emptyPlan = (): PmPlan => ({ goal: "", assumptions: [], risks: [], questions: [], tasks: [], coverage: [] });
 
+/** AGENT_PLAN_REVIEW=1 (or true/yes/on): the person reviews every NEW plan before work starts, also in auto mode. */
+function planReviewWanted(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test((env.AGENT_PLAN_REVIEW ?? "").trim());
+}
+
+/** Asks in the terminal and in the dashboard at once (the first answer wins). y = start, e = save the task files and stop, n = cancel. */
+async function askPlanReview(plan: PmPlan, dir: string): Promise<"yes" | "edit" | "no"> {
+  const question = `Plan ready: ${plan.tasks.length} task(s). Type y to start, e to save the task files in ${dir}/ and stop so you can edit them (then /tasks resume), or n to cancel.`;
+  const { answer } = await control.ask({ kind: "text", question, defaultValue: "y" }, (signal) =>
+    new Promise<string>((resolve, reject) => {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      // Closing a second readline pauses stdin for the main prompt: resume it.
+      const done = () => {
+        rl.close();
+        process.stdin.resume();
+      };
+      signal.addEventListener(
+        "abort",
+        () => {
+          done();
+          reject(new Error("answered elsewhere"));
+        },
+        { once: true },
+      );
+      rl.question(pc.cyan(`${question} [y/e/n] (y): `), { signal }, (a) => {
+        done();
+        resolve(a);
+      });
+    }),
+  );
+  const a = answer.trim().toLowerCase();
+  if (["n", "no", "ne", "cancel"].includes(a)) return "no";
+  if (["e", "edit", "uredi"].includes(a)) return "edit";
+  return "yes";
+}
+
 /** A result for runs that build nothing (plan only, nothing to resume). `ok` decides how the caller words it. */
 function noWork(plan: PmPlan, report: string, ok: boolean): TeamResult {
   return { plan, tasks: [], filesWritten: [], commandsRun: [], safety: "NOT_RUN", safetyNotes: "", interrupted: false, complete: ok, report };
@@ -625,6 +664,17 @@ export async function runTeam(opts: TeamOptions): Promise<TeamResult | null> {
     }
 
     printPlan(plan, Boolean(opts.parallel));
+
+    // Review gate (AGENT_PLAN_REVIEW=1). It also works in auto mode and for tasks started from the dashboard, because it asks through
+    // control.ask. e = the plan is saved as task files and the run stops (the same as /tasks plan), so you can edit them and /tasks resume.
+    if (!opts.approvePlan && !opts.planOnly && planReviewWanted()) {
+      const verdict = await askPlanReview(plan, tasksDirName());
+      if (verdict === "no") {
+        console.log(pc.dim("Plan not started."));
+        return noWork(plan, "Plan not started.", true);
+      }
+      if (verdict === "edit") opts.planOnly = true;
+    }
 
     if (plan.questions.length && opts.approvePlan) {
       console.log(pc.yellow("The planner has open questions. Answer them in your next message if they matter; the team can still start now.\n"));

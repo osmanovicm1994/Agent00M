@@ -36,7 +36,100 @@ function dependencyConflict(output: string): string {
 // Packages that ship their own TypeScript types: an @types/<name> package for them does not exist or is an empty stub.
 export const SELF_TYPED_PACKAGES = ["zod", "bcryptjs", "jose", "pdf-lib", "next-auth", "@prisma/client", "date-fns", "react-hook-form", "@hookform/resolvers"];
 
+// A seed (or any script) that compiles against the generated Prisma client and uses names the schema does not have.
+const SCHEMA_MISMATCH_RE =
+  /\berror TS(?:2551|2353|2339|2561|2724)\b[^\n]*|Unknown (?:argument|field|arg) [`'"]?\w+|diagnosticCodes: \[[^\]]*(?:2551|2353|2339)/;
+
 const RULES: Rule[] = [
+  {
+    id: "next-async-request-api",
+    // Next 15+: cookies(), headers(), draftMode(), params and searchParams return Promises. Using them without await gives TS2339 on a Promise type.
+    test: (_c, o) => /does not exist on type 'Promise<(?:ReadonlyRequestCookies|ReadonlyHeaders|\{)/.test(o),
+    fix: () => ({
+      title: "Next 15/16: cookies(), headers(), params and searchParams are Promises",
+      steps: [
+        'Add await: const store = await cookies(); store.get("name"). The function that contains it must be async, and every function that calls that function must await it.',
+        "Page and route params: export default async function Page({ params }: { params: Promise<{ id: string }> }) { const { id } = await params; }",
+        'Find every place in ONE search (grep for "cookies()" and "headers()" in src), fix them all in the same pass, then run the typecheck once.',
+      ],
+    }),
+  },
+  {
+    id: "next-no-root-layout",
+    test: (_c, o) => /doesn't have a root layout/i.test(o),
+    fix: () => ({
+      title: "Next.js: the app has no root layout",
+      steps: [
+        'Check that src/app/layout.tsx exists (or app/layout.tsx when there is no src folder). Use find_files, not find from the shell.',
+        'If it is missing, write it: import "./globals.css"; export default function RootLayout({ children }: { children: React.ReactNode }) { return <html lang="en"><body>{children}</body></html>; }',
+        "A route group such as (customer) needs no layout of its own. Two pages that resolve to the same URL (src/app/page.tsx and src/app/(customer)/page.tsx) conflict: keep one.",
+        "Do not create a second layout in every route group unless the person asked for different root layouts. Then run the build once.",
+      ],
+    }),
+  },
+  {
+    id: "ui-component-missing",
+    test: (_c, o) => /(?:Cannot find module|Can't resolve) '@\/components\/ui\/[\w-]+'/.test(o),
+    fix: (o) => {
+      const names = [...new Set([...o.matchAll(/@\/components\/ui\/([\w-]+)/g)].map((m) => m[1]))].slice(0, 6);
+      return {
+        title: `The UI component file(s) do not exist: ${names.join(", ")}`,
+        steps: [
+          "Check src/components/ui with find_files. The import points at a component that was never created.",
+          `If components.json exists: npx shadcn@latest add ${names.join(" ")} --yes (once). Then read the generated file before you use it.`,
+          "Without components.json, write each missing component yourself as a small file (one write_file each) with native HTML elements, then fix the imports.",
+          "Create the component first, then the pages that import it. Run the typecheck once afterwards.",
+        ],
+      };
+    },
+  },
+  {
+    id: "ui-component-api-mismatch",
+    // The page was written from memory of another UI library: props the local component does not declare, or the lucide icon used as the date picker.
+    test: (_c, o) =>
+      /Property '(?:onValueChange|onCheckedChange|onOpenChange)' does not exist on type[^\n]*(?:Props|Attributes)/.test(o) ||
+      /Property 'placeholder' does not exist on type 'IntrinsicAttributes & HTMLAttributes<HTMLDivElement>'/.test(o) ||
+      /ReactEventHandler<SVGSVGElement>/.test(o),
+    fix: () => ({
+      title: "A component is used with props it does not have",
+      steps: [
+        "Open the component file in src/components/ui (read_file) and use ONLY the props and sub-components it declares. The same name differs between libraries: a Radix select uses onValueChange with SelectTrigger/SelectValue; a native select wrapper uses value, onChange and <option> children.",
+        "Calendar from lucide-react is an ICON (SVG props only). The date picker is Calendar from @/components/ui/calendar. Import the icon as CalendarIcon.",
+        "If the component you need is not what the file offers, replace the component file with the right one (npx shadcn@latest add <name> --yes --overwrite) or change the page to the component's real API. Fix every use in that page in one whole-file write.",
+      ],
+    }),
+  },
+  {
+    id: "seed-schema-mismatch",
+    // The TypeScript or Prisma error names a model, field or unique key that is not in schema.prisma. This is NOT an import problem
+    // (changing the import path will not help), so it must come before seed-script-resolution.
+    test: (_c, o) => SCHEMA_MISMATCH_RE.test(o) && /prisma\/seed\.|\bseed\b|WhereUniqueInput|WhereInput|OrderByWithRelationInput|(?:Create|Update)(?:Many)?Input|on type 'PrismaClient/i.test(o),
+    fix: () => ({
+      title: "The script uses model or field names that are not in prisma/schema.prisma",
+      steps: [
+        "Read prisma/schema.prisma ONCE and copy the names exactly: model names become camelCase singular on the client (model ShopSetting -> prisma.shopSetting), field names and enum values stay as written. The error text often names the right one (\"Did you mean 'shopSetting'?\"). This applies to EVERY file the typecheck lists (seed, API routes, pages), not only the seed: fix them all in the same pass. A field missing on a RESULT object means it is not in `select`: add it.",
+        "A unique key in where: {} must be a field marked @unique / @id, or a @@unique([a, b]) written as a_b. If the schema has no such key, use findFirst + create/update instead of upsert, or add the @@unique to the schema and run a migration.",
+        "Do NOT run `prisma db pull`: it overwrites schema.prisma with what the database has, and every model the database does not have yet (a schema change that was never migrated) disappears from the schema. If the schema has a model the database lacks: npx prisma migrate dev --name <change>, then npx prisma generate.",
+        "Do not change import paths or the runner because of this error: the imports resolved, the names did not match. Fix the names in ONE write_file, then run the seed once.",
+      ],
+    }),
+  },
+  {
+    id: "seed-env-not-loaded",
+    // tsx and node do not read .env, and Prisma 7 no longer loads it for the client either. The usual symptoms: a script that checks
+    // process.env throws, or pg gets no connection string and fails with the SASL password error.
+    test: (_c, o) =>
+      /SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string|must be set in the environment|DATABASE_URL (?:is )?(?:not set|missing|undefined|required)/i.test(o),
+    fix: () => ({
+      title: "The environment variables are not loaded into the script",
+      steps: [
+        "tsx and node do not read .env. Run the script with: tsx --env-file=.env prisma/seed.ts (Node 20.6+; use --env-file=.env.local only if the variables really live there), or make `import \"dotenv/config\";` the FIRST line of the script (it loads .env, not .env.local).",
+        "Put DATABASE_URL and every variable the script requires (for example ADMIN_EMAIL, ADMIN_INITIAL_PASSWORD) into .env. .env.example gets placeholders only.",
+        "Do not invent credentials such as password123 and do not set them inline in the command. Use the values the request or .env.example gives; if there are none, ask the person, or generate a random password in the script and print it once.",
+        "The local database port is in the 'Local PostgreSQL is running at localhost:<port>' note, not 5432. Do not edit the seed because of this error.",
+      ],
+    }),
+  },
   {
     id: "prisma-hash-comment",
     test: (_c, o) => /P1012|not a valid field or attribute definition/.test(o) && /^\s*\d+\s*\|[^\n]*\s#/m.test(o),
@@ -90,7 +183,8 @@ const RULES: Rule[] = [
     id: "seed-script-resolution",
     // A seed script that cannot find its imports: ts-node does not read the "@/" alias, a .mjs file cannot import a .ts client, and a
     // path written from the wrong folder resolves to nothing. Must come before prisma-client-missing, whose advice does not fit here.
-    test: (c, o) => /\bseed\b/i.test(c) && /ERR_MODULE_NOT_FOUND|Cannot find package '@\/|Cannot find module [^\n]*seed|TSError|Unknown file extension|ts-node/i.test(o),
+    test: (c, o) =>
+      /\bseed\b/i.test(c) && /ERR_MODULE_NOT_FOUND|Cannot find package '@\/|Cannot find module [^\n]*seed|TSError|Unknown file extension|ts-node/i.test(o) && !SCHEMA_MISMATCH_RE.test(o),
     fix: () => ({
       title: "The seed script cannot resolve its imports",
       steps: [
@@ -167,7 +261,7 @@ const RULES: Rule[] = [
   },
   {
     id: "prisma7-client-ctor",
-    test: (_c, o) => /PrismaClient needs to be constructed|requires either "adapter" or "accelerateUrl"|engine type "client" requires/i.test(o),
+    test: (_c, o) => /PrismaClient needs to be constructed|requires either "adapter" or "accelerateUrl"|engine type "client" requires|instantiated without any options|driver adapter is required/i.test(o),
     fix: () => ({
       title: "Prisma 7: the client needs a driver adapter",
       steps: [
@@ -280,7 +374,7 @@ const RULES: Rule[] = [
 ];
 
 /** The known fixes that match a failed command's output, best first. */
-export function matchKnownFixes(command: string, output: string, max = 2): KnownFix[] {
+export function matchKnownFixes(command: string, output: string, max = 3): KnownFix[] {
   const found: KnownFix[] = [];
   for (const rule of RULES) {
     if (found.length >= max) break;

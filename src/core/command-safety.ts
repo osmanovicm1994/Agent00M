@@ -48,7 +48,8 @@ export const DANGEROUS_COMMAND_RES: RegExp[] = [
   /\bgradlew?\b.*\bpublish\w*/i,
   /\bdocker\s+(system\s+prune|rm|rmi|volume\s+(rm|prune)|compose\s+down\b.*\s-v)/,
   /\b(drop|truncate)\s+(database|table|schema)\b/i,
-  /\bprisma\s+(migrate\s+reset|db\s+push\s+--force-reset)\b|\bmigrate:fresh\b|\bdb:drop\b|\bschema:drop\b/,
+  // `prisma db pull` rewrites schema.prisma from the database: models that were never migrated disappear from the schema.
+  /\bprisma\s+(migrate\s+reset|db\s+push\s+--force-reset|db\s+pull)\b|\bmigrate:fresh\b|\bdb:drop\b|\bschema:drop\b/,
   /\b(brew|pip3?|gem)\s+(uninstall|remove)\b/,
   />\s*\/dev\/(sd|disk|nvme)|:\(\)\s*\{/,
   // Writing files through the shell skips the write_file gates (read before overwrite, diff, placeholder

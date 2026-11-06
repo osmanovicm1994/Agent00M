@@ -14,13 +14,17 @@ Ground every conclusion in the actual code: inspect the project with get_directo
 read the relevant files before reasoning about them. Unless the user explicitly asks you to
 change files, deliver your result as a final written answer (plan, findings, risks, ordered
 steps) and do NOT call write_file or run_command.` +
-    loadKnowledge([
-      "08-logic/01-problem-decomposition.md",
-      "08-logic/02-edge-case-analysis.md",
-      "08-logic/03-distributed-systems.md",
-      "08-logic/04-root-cause-debugging.md",
-      "00-agent-core/tool-execution.md",
-      "01-architecture/architecture-patterns.md",
-      "08-logic/05-debugging-playbook.md",
-    ]),
+    // Tool rules first (they were cut at the old 9000 budget). 05-debugging-playbook.md is not listed: the failure-playbook rule in
+    // orchestration.ts adds it to a logic task that is about a failure.
+    loadKnowledge(
+      [
+        "00-agent-core/tool-execution.md",
+        "08-logic/01-problem-decomposition.md",
+        "08-logic/02-edge-case-analysis.md",
+        "08-logic/03-distributed-systems.md",
+        "08-logic/04-root-cause-debugging.md",
+        "01-architecture/architecture-patterns.md",
+      ],
+      12_800,
+    ),
 };

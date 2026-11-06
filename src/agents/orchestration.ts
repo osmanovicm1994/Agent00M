@@ -14,6 +14,8 @@
 // Keep patterns specific. Generic words ("test", "fix", "page", "button", "component" alone) must not
 // route; they fall through to the model router.
 
+import { wantsBosnian } from "../core/language";
+
 // ---------------------------------------------------------------------------
 // Routing signals
 // ---------------------------------------------------------------------------
@@ -283,7 +285,8 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     test: /\bfull[- ]?stack\b|from scratch|\bscaffold|\bbootstrap|\bmonorepo\b|production[- ]ready|\bnew (web )?(app|application|project)\b/i,
     // The roadmap (phases with gates, git, versioning) rides along with the build protocol: one rule, so the protocol stays first.
     files: ["12-fullstack/00-build-protocol.md", "13-delivery/00-roadmap.md"],
-    weight: 6,
+    // 10: the build protocol stays first, ahead of the coding protocol (write-code, 9) that rides along with every code task.
+    weight: 10,
     onlyFor: FULLSTACK_AGENTS,
   },
   {
@@ -458,6 +461,72 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     id: "git-versioning",
     test: /\bgit\b|\bbranch(es)?\b|\bcommits?\b|\bsemver\b|\bversioning\b|changelog|\brelease (notes|process|tag)\b|version control|git ?flow/i,
     files: ["13-delivery/01-git-versioning.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  // --- Coding reliability (14-coding): how to write files that compile, fix errors without looping, update dependencies. ----
+  // Weights are the highest on purpose: the task budget keeps the heaviest files first and shortens the rest.
+  {
+    id: "write-code",
+    // Creating or changing code. A bare rename or delete is too small to be worth the prompt space.
+    test: /\b(add|create|implement|build|write|generate|scaffold|fix|refactor|migrate|install|upgrade|update|change|modify)\b/i,
+    files: ["14-coding/00-write-code-protocol.md"],
+    weight: 9,
+    skipFor: [...NO_CODE_AGENTS, "debug"],
+  },
+  {
+    id: "fix-loop",
+    test: /\bfail(s|ed|ing|ure)\b|\bTS\d{4}\b|crash|exception|won'?t (start|build|compile|run)|typecheck|\bbroken\b/i,
+    files: ["14-coding/01-fix-loop.md"],
+    weight: 8,
+    skipFor: [...NO_CODE_AGENTS, "debug"],
+  },
+  {
+    id: "ts-error-codes",
+    test: /\bTS\d{4}\b|type ?check|\btsc\b|type error|not assignable|does not exist on type|Cannot find module|Module not found/i,
+    files: ["14-coding/02-ts-error-codes.md"],
+    weight: 7,
+    skipFor: [...NO_CODE_AGENTS, "debug"],
+  },
+  {
+    id: "bosnian",
+    // AGENT_LANGUAGE=bs forces it (the engineers' task text is English, so only the setting reaches them); a Bosnian request is detected too.
+    test: (t) => wantsBosnian(t),
+    files: ["14-coding/07-language-bosnian.md"],
+    weight: 7,
+  },
+  {
+    id: "nextjs-ui-pitfalls",
+    test: /\bnext\.?js\b|app router|\bshadcn\b|components\/ui|\bcookies\(|root layout|route group|"use client"|\bpage\.tsx\b|\blayout\.tsx\b|lucide|react-day-picker|\bcalendar\b/i,
+    files: ["14-coding/03-nextjs-ui-pitfalls.md"],
+    weight: 6,
+    onlyFor: [...FULLSTACK_AGENTS, "debug"],
+  },
+  {
+    id: "prisma-contract",
+    test: /\bprisma\b|schema\.prisma|\bseed\b|WhereUniqueInput|\benum\b/i,
+    files: ["14-coding/04-prisma-contract.md"],
+    weight: 6,
+    onlyFor: [...FULLSTACK_AGENTS, "debug"],
+  },
+  {
+    id: "dependency-updates",
+    test: /dependenc(y|ies)|node_modules|\boutdated\b|npm (update|outdated|audit|ci)\b|\bjdk\b|gradle wrapper|pod update|pip install -U|\bnuget\b|third[- ]party|3rd[- ]party|upgrade (node|java|npm|next|react|prisma|packages?|libraries)|nadogradi|ažuriraj/i,
+    files: ["14-coding/05-dependency-updates.md"],
+    weight: 6,
+    skipFor: NO_CODE_AGENTS,
+  },
+  {
+    id: "ask-or-decide",
+    test: /\b(not sure|unclear|ambiguous|either|which (one|option|approach)|your choice|you decide|decide for me|best option)\b|\b(ne znam|nije jasno|odluči|ti odluči|po tvom)\b/i,
+    files: ["14-coding/06-ask-the-user.md"],
+    weight: 5,
+    skipFor: NO_CODE_AGENTS,
+  },
+  {
+    id: "tool-extras",
+    test: /\bdocker|\bdeploy|predeploy|\bbrowser\b|inspect_page|e2e|end-to-end|query-docs/i,
+    files: ["00-agent-core/tool-execution-extras.md"],
     weight: 3,
     onlyFor: FULLSTACK_AGENTS,
   },
