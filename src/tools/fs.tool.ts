@@ -44,20 +44,67 @@ export interface TreeResult {
   dirs: string[];
 }
 
+// Secret-bearing env files. The agent may read .env.example but never real secrets: file contents
+// are sent to the model (possibly a cloud endpoint) and stored in the response cache.
+export function isSecretPath(p: string): boolean {
+  const name = path.basename(p).toLowerCase();
+  if (!name.startsWith(".env")) return false;
+  return !/\.(example|sample|template)$/.test(name);
+}
+
+// True when `target` is `base` itself or lies inside it. path.relative avoids the "/proj" vs
+// "/proj-evil" prefix bypass of startsWith(), and a folder literally named "..foo" is not an escape.
+function isInside(base: string, target: string): boolean {
+  const rel = path.relative(base, target);
+  if (rel === "") return true;
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
 export class FsTools {
   private readonly root: string;
+  // The root with symlinks resolved (on macOS /var is a link to /private/var), for the boundary check.
+  private readonly realRoot: string;
 
   constructor(workspaceRoot: string) {
     this.root = path.resolve(workspaceRoot);
+    try {
+      this.realRoot = fs.realpathSync(this.root);
+    } catch {
+      this.realRoot = this.root;
+    }
+  }
+
+  // The real location of `full` on disk: symlinks resolved for the part that exists, the rest
+  // appended as written. A symlink (even a dangling one) that leaves the workspace is refused,
+  // so a link inside the project cannot be used to read or write files outside it.
+  private canonical(full: string, shown: string): string {
+    let probe = full;
+    for (;;) {
+      try {
+        const real = fs.realpathSync(probe);
+        return path.join(real, path.relative(probe, full));
+      } catch {
+        let isLink = false;
+        try {
+          isLink = fs.lstatSync(probe).isSymbolicLink();
+        } catch {
+          // does not exist: look at its parent
+        }
+        if (isLink) throw new Error(`Refusing to follow a broken symlink: ${shown}`);
+        const parent = path.dirname(probe);
+        if (parent === probe) return full;
+        probe = parent;
+      }
+    }
   }
 
   private resolve(relativePath: string): string {
     const full = path.resolve(this.root, relativePath);
-    // path.relative avoids the "/proj" vs "/proj-evil" prefix bypass that a
-    // plain startsWith() check allows.
-    const rel = path.relative(this.root, full);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    if (!isInside(this.root, full)) {
       throw new Error(`Refusing to access path outside workspace: ${relativePath}`);
+    }
+    if (!isInside(this.realRoot, this.canonical(full, relativePath))) {
+      throw new Error(`Refusing to access path outside workspace (symlink): ${relativePath}`);
     }
     return full;
   }
@@ -67,6 +114,10 @@ export class FsTools {
     const full = this.resolve(relativePath);
     if (!fs.existsSync(full)) {
       throw new Error(`File not found: ${relativePath}`);
+    }
+    // A symlink named like a normal file can still point at a real .env: judge the real target.
+    if (isSecretPath(this.canonical(full, relativePath))) {
+      throw new Error(`Reading ${relativePath} is blocked (it resolves to a secret env file).`);
     }
     return fs.readFileSync(full, "utf8");
   }
@@ -250,6 +301,35 @@ export class FsTools {
     fs.renameSync(tmp, full);
   }
 
+  /**
+   * Atomic binary write for downloads: a temp file is hard-linked into place, which fails when the target already
+   * exists, so a download can never replace a file (not even one that appeared while it was running).
+   * The path goes through the same workspace and symlink checks as every other write.
+   */
+  commitNewBinary(relativePath: string, data: Uint8Array): void {
+    const full = this.resolve(relativePath);
+    if (isSecretPath(full)) throw new Error(`Writing ${relativePath} is blocked (secret env file).`);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    // The directory may have been created through a symlink between the check and now: check again.
+    if (!isInside(this.realRoot, this.canonical(full, relativePath))) {
+      throw new Error(`Refusing to access path outside workspace (symlink): ${relativePath}`);
+    }
+    const tmp = `${full}.agent-dl-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, data, { flag: "wx" });
+    try {
+      fs.linkSync(tmp, full);
+    } catch (err: any) {
+      if (err?.code === "EEXIST") throw new Error(`${relativePath} already exists; downloads never overwrite files.`);
+      throw err;
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // best effort
+      }
+    }
+  }
+
   appendToFile(relativePath: string, content: string): void {
     const full = this.resolve(relativePath);
     fs.appendFileSync(full, content, "utf8");
@@ -320,6 +400,21 @@ export const fsToolSchemas: ToolSchema[] = [
         content: { type: "string", description: "The full content of the file (or of its first chunk)" },
       },
       required: ["path", "content"],
+    },
+  },
+  {
+    name: "edit_file",
+    description:
+      "Change ONE exact piece of an existing file: old_string is replaced by new_string. Use it for any small change instead of rewriting the whole file. old_string must match the file exactly (copy it from read_file, without the line numbers) and must appear only once; add surrounding lines to make it unique. The user reviews a diff and must approve.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path of an existing file, relative to the project root" },
+        old_string: { type: "string", description: "The exact text to replace (unique in the file)" },
+        new_string: { type: "string", description: "The replacement text (empty string deletes old_string)" },
+        replace_all: { type: "boolean", description: "Optional. Replace every match instead of requiring exactly one" },
+      },
+      required: ["path", "old_string", "new_string"],
     },
   },
   {

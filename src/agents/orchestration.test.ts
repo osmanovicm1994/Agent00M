@@ -31,6 +31,17 @@ describe("rankDomains / pickByKeywords", () => {
     expect(ids("update the dependencies and look up the latest version of nestjs")).not.toContain("research");
   });
 
+  it("sends a whole-app build to dev even when one stray failure word appears in the spec", () => {
+    const task =
+      "Build or finish an MVP car marketplace. Scaffold the app with a Prisma schema and migrations, REST endpoints and an admin UI. If a command fails, report it.";
+    expect(pickByKeywords(rankDomains(task))).toBe("dev");
+  });
+
+  it("still treats a real failure report as debug even when the task says scaffold", () => {
+    const task = "the scaffold script crashes: npm run build fails with TS2345 and cannot find module";
+    expect(pickByKeywords(rankDomains(task))).toBe("debug");
+  });
+
   it("treats generic test words as QA only in a test-automation project", () => {
     expect(ids("write tests for the login screen")).toEqual([]);
     expect(ids("write tests for the login screen", { automationProject: true })).toEqual(["qa"]);
@@ -38,9 +49,34 @@ describe("rankDomains / pickByKeywords", () => {
 });
 
 describe("selectTaskKnowledge", () => {
-  it("loads the edge-case standards first for payment/retry work", () => {
+  it("loads the write-code protocol first, then the edge-case standards for payment/retry work", () => {
     const picks = selectTaskKnowledge("Add a payment webhook with retries", "dev");
-    expect(picks[0].path).toBe("08-logic/02-edge-case-analysis.md");
+    expect(picks[0].path).toBe("14-coding/00-write-code-protocol.md");
+    expect(picks[1].path).toBe("08-logic/02-edge-case-analysis.md");
+  });
+
+  it("adds the coding-reliability standards that match the task", () => {
+    const paths = (t: string, a = "dev") => selectTaskKnowledge(t, a, 8).map((p) => p.path);
+    expect(paths("npm run typecheck fails with TS2339 in src/lib/auth.ts", "design")).toEqual(
+      expect.arrayContaining(["14-coding/01-fix-loop.md", "14-coding/02-ts-error-codes.md"]),
+    );
+    expect(paths("fix the prisma seed script")).toContain("14-coding/04-prisma-contract.md");
+    expect(paths("build the Next.js booking page with a shadcn select")).toContain("14-coding/03-nextjs-ui-pitfalls.md");
+    expect(paths("upgrade the outdated dependencies and the JDK")).toContain("14-coding/05-dependency-updates.md");
+    // the debug agent carries the fix loop itself
+    expect(paths("npm run build fails", "debug")).not.toContain("14-coding/01-fix-loop.md");
+  });
+
+  it("loads the Bosnian standard for a Bosnian request or AGENT_LANGUAGE=bs, never for English", () => {
+    const has = (t: string) => selectTaskKnowledge(t, "dev", 8).some((p) => p.path === "14-coding/07-language-bosnian.md");
+    expect(has("Napravi stranicu za prijavu korisnika, treba i greške")).toBe(true);
+    expect(has("Create a login page for users")).toBe(false);
+    process.env.AGENT_LANGUAGE = "bs";
+    try {
+      expect(has("Create a login page for users")).toBe(true);
+    } finally {
+      delete process.env.AGENT_LANGUAGE;
+    }
   });
 
   it("loads distributed-systems standards for queue work", () => {
@@ -58,6 +94,13 @@ describe("selectTaskKnowledge", () => {
     const forDb = selectTaskKnowledge("add a migration for the users table", "db").map((p) => p.path);
     expect(forDev).toContain("06-database/02-migration-safety.md");
     expect(forDb.some((p) => p.startsWith("06-database/"))).toBe(false);
+  });
+
+  it("gives the test strategy to whichever agent gets a task about tests, not to read-only agents", () => {
+    const task = "Write integration tests for POST /api/listings";
+    expect(selectTaskKnowledge(task, "api").map((p) => p.path)).toContain("02-qa-automation/00-test-strategy.md");
+    expect(selectTaskKnowledge(task, "qa").map((p) => p.path)).toContain("02-qa-automation/00-test-strategy.md");
+    expect(selectTaskKnowledge(task, "research")).toEqual([]);
   });
 
   it("gives nothing to agents that write no code", () => {

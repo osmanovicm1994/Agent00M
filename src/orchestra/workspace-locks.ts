@@ -21,7 +21,7 @@ export function normalizeScope(scope: string): string {
 export function relativeInside(root: string, target: string): string | null {
   const abs = path.isAbsolute(target) ? path.resolve(target) : path.resolve(root, target);
   const rel = path.relative(path.resolve(root), abs).replace(/\\/g, "/");
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  if (rel === ".." || rel.startsWith("../") || path.isAbsolute(rel)) return null;
   return rel;
 }
 
@@ -94,7 +94,11 @@ export class WorkspaceLocks {
       record(true);
       return { allowed: true };
     }
-    if (this.shared.some((s) => inScope(rel, s)) && !mine.some((s) => inScope(rel, s) && normalizeScope(s) === rel)) {
+    // An owner of the WHOLE workspace (scope "./") cannot run next to anybody else: any other scope overlaps it, so tryAcquire
+    // refuses a second lease while it is held. It is therefore the only writer, and the shared files are its to change.
+    const solo = mine.some((s) => normalizeScope(s) === "");
+    // No exception for an exact-file scope: a plan that hands "package.json" to a worker does not make it writable.
+    if (!solo && this.shared.some((s) => inScope(rel, s))) {
       record(false);
       return {
         allowed: false,

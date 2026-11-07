@@ -4,7 +4,7 @@ A local, Copilot-CLI-style coding agent. It runs a tool-using loop against a **l
 
 Everything runs locally by default. The only feature that sends data off the machine is the optional Gemini research stage (opt-in).
 
-The current references are `CLAUDE.md` (architecture and conventions) and `docs/AGENTS.md` (agents, routing, knowledge). `docs/MODELS.md` covers models and LM Studio settings.
+**New here? Read `docs/PROMPTING.md` first**: how to write prompts so the agent builds what you want (it is also the Guide screen in the web dashboard, under Guide / More, and the "How to prompt the agent" page on the Agents tab of the iPhone app). The current references are `CLAUDE.md` (architecture and conventions) and `docs/AGENTS.md` (agents, routing, knowledge). `docs/MODELS.md` covers models and LM Studio settings.
 
 ## Quick start
 
@@ -37,7 +37,7 @@ npx ts-node src/cli.ts agents
 | `npm run models` / `npm run bench` | List LM Studio models / measure speed and tool calling |
 | `npm run search:test -- "query"` | Diagnose web search engines |
 
-Chat slash commands: `/help` lists them (`/agents`, `/use <id>`, `/auto`, `/model`, `/auto-write`, `/auto-run`, `/research`, `/plan`, `/team`, `/image`, `/clear`, `/exit`).
+Chat slash commands: `/help` lists them (`/agents`, `/use <id>`, `/auto`, `/model`, `/auto-write`, `/auto-run`, `/research`, `/plan`, `/team`, `/parallel`, `/auto-debug`, `/image`, `/clear`, `/exit`). The same switches (team, parallel, auto-write, auto-run, auto-debug, research, planner) are toggles in the dashboard's Prompt panel; terminal and dashboard share one state.
 
 ## Building a full-stack app with the agent (Next.js + NestJS)
 
@@ -82,19 +82,41 @@ When something fails: paste the error into a new task (`run "npm --prefix apps/a
 1. **Routing** (`src/agents/router.ts`, signals in `src/agents/orchestration.ts`): forced agent (`-a`, `/use`) > research-stage recommendation > keyword score with one strict winner > one capped model call > `dev`.
 2. **Standards** (`src/knowledge/`): each agent always carries its own standards, the project's stack standards are detected automatically, and **task-specific standards** (logic standards such as edge cases, decomposition, distributed work, root causes; cross-domain files such as migration safety) are added from the task text.
 3. **Execution** (`src/core/executor.ts`): read-only tools run together, writes and commands run one per turn with approval. Safety gates stay on in every mode.
-4. **Team mode** (`/team`, `--team`): a Project Manager plans, engineers build, a read-only Safety Reviewer checks.
+4. **Team mode** (`/team`, `--team`): a Project Manager plans, engineers build, a read-only Safety Reviewer checks. The PM maps quoted request requirements to task acceptance checks; the CLI rejects mappings that do not point to real request text, tasks, and checks, then asks the PM to correct the plan once.
 
-Agents: `dev`, `api`, `db`, `design` (frontend developer), `logic`, `kb-harvester`, `qa`, `debug`, `research`.
+Agents: `dev`, `api`, `db`, `design` (frontend developer), `logic`, `kb-harvester`, `qa`, `debug`, `research`, `infra` (project skeleton and platform commands: npm, prisma, docker compose, xcodegen, pod install, xcodebuild, gradlew, flutter, cargo, go). In team mode the Project Manager plans from a three-level tree of the project (so it knows which files exist and which are new), maps requirements to task checks, and puts `infra` first when a skeleton or an install is needed. For API contracts it should name concrete route files, including separate dynamic item routes where the framework requires them.
+
+## Parallel team and auto-debug
+
+Both need **auto-write and auto-run on** (nobody can answer approval prompts while several agents work, or while a debug run is in progress). Details: `docs/ORCHESTRA.md`.
+
+| What | Switch | What it does |
+| --- | --- | --- |
+| Parallel team | `/parallel` in chat, `--parallel` with `--team`, dashboard switch | The Project Manager gives every task a write scope and the tasks it waits for. Independent engineer tasks (for example API and DB) then run at the same time, each only allowed to write inside its own folders. A plan that cannot run safely in parallel (no scopes, overlapping scopes, a cycle) runs one task after another. Ctrl+C stops the whole team: running commands stop at once, agents stop before their next step, tasks that did not start are skipped. |
+| Auto-debug | `/auto-debug` in chat, `--auto-debug`, `AGENT_AUTO_DEBUG=1`, dashboard switch | When a command fails in a way the Debug Agent can fix (missing package, wrong import, schema error...), the Debug Agent runs, the failing agent waits, and the command is rerun to check the fix. Defaults are 2 attempts per command and 4 debug runs per session. Risky commands and commands outside the project are never re-run automatically. It uses the same local model, so it cannot fix what the model does not know. |
+| Repeated failure stop | Always on | After the same failure signature appears three times without a successful command or a verified auto-debug fix, the Executor ends the run with a report containing the command and captured error evidence. This is enforced by the CLI; the model does not have to obey a stop instruction. |
+
+Settings (env file): `AGENT_LLM_CONCURRENCY` (model calls at once, default 2; keep it at or below LM Studio's Max Concurrent Predictions), `AGENT_TASK_MAX_STEPS` (steps per parallel task, default 60), `AGENT_AUTO_DEBUG_ATTEMPTS` (debug attempts on the same command, default 2), `AGENT_AUTO_DEBUG_MAX` (debug runs per session, default 4), `AGENT_AUTO_DEBUG_STEPS` (steps per debug run, default 10). Invalid numbers fall back to the default. A local model serves parallel requests more slowly each, so the speed-up is smaller than the task count suggests.
 
 ## Safety
 
-- File tools are scoped to the target project. Real `.env` files cannot be read.
+- File tools are scoped to the target project, also through symlinks (a link that points outside the project is refused, and search does not follow links). Real `.env` files cannot be read, including through a symlink.
 - Every write shows a diff and asks, unless auto mode is on. Risky commands (rm, sudo, git push/reset, kill, publish, shell redirects and `sed -i` that bypass the write gates ...) ask even in auto mode.
 - **There is no sandbox.** Auto mode runs model-chosen commands on your machine. Use it only on projects under git; the agent warns when it is not.
+
+## Notifications on the phone
+
+**Native iPhone app** (`ios/AgentMustafa`): Agents tab, Notifications card, with a switch for "needs approval" and one for "finished or failed". The app asks iOS for permission once; if you said no, the card links to iOS Settings. The notification fires only while the app is closed or in the background, and iOS suspends the app's connection soon after you leave it, so it arrives only in that short window.
+
+**Web dashboard**: Settings (More on a phone) has the same switches. On iPhone this works in the web app added to the Home Screen (iOS 16.4+) over HTTPS (`npm run chat:ui:remote`), again only while the app is alive.
+
+**Alerts that always arrive**: set `AGENT_NOTIFY_URL` (ntfy, see `src/notify.ts`); the computer then pushes by itself, whatever the phone app is doing. Notification text never contains commands, paths or project content.
 
 ## Seeing the UI
 
 The model cannot see pictures. The `inspect_page` tool renders a localhost dev server (or a static `.html` file) in headless Chromium and returns facts: console errors, failed requests, horizontal overflow at phone and desktop widths, structure and accessibility problems. Run `npx playwright install chromium` once. Visual design still needs a human look.
+
+The `check_styles` tool checks that the styling is wired up at all (Tailwind plugin, PostCSS config, global stylesheet, layout import); a Next.js + Tailwind 4 app without `postcss.config.mjs` renders as plain HTML. The design agent runs it before reporting. It does not judge how the page looks.
 
 ## Adding things
 

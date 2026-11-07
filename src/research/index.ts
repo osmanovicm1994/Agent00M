@@ -18,7 +18,7 @@
 //   AGENT_PLANNER=auto|always|off   auto (default): plan only when the research says it is needed
 //   AGENT_RESEARCH_GROUNDING=0      understand the request without Google Search
 //   AGENT_RESEARCH_TIMEOUT_MS       research call timeout (default: AGENT_TRIAGE_TIMEOUT_MS, 60000)
-//   AGENT_RESEARCH_MAX_CHARS        size of the brief handed to the local model (default 2800, 1800 with a plan)
+//   AGENT_RESEARCH_MAX_CHARS        TOTAL size of brief + plan handed to the local model (default 2800, 4600 with a plan; see budget.ts)
 //   AGENT_RESEARCH_CONFIRM=1        ask before the brief/plan is given to the local agent
 
 import pc from "picocolors";
@@ -26,6 +26,7 @@ import prompts from "prompts";
 import { GeminiTriageClient } from "../gateway/gemini";
 import { redactSecrets } from "../gateway/redact";
 import { runWebResearch } from "../tools/web-search.tool";
+import { combineContext, contextBudget } from "./budget";
 import { PlannerAgent, type PlanOutcome } from "./planner-agent";
 import { renderResearchContext } from "./render";
 import { ResearchAgent, type PreviousTurn, type ResearchOutcome } from "./research-agent";
@@ -145,8 +146,9 @@ export class ResearchPipeline {
 
     if (!research && !plan) return null;
 
-    const researchCap = Number(process.env.AGENT_RESEARCH_MAX_CHARS) || (plan ? 1800 : 2800);
-    const context = [research ? renderResearchContext(research.brief, research.sources, researchCap) : "", plan?.context ?? ""].filter(Boolean).join("\n\n");
+    // One combined cap: the brief and the plan together never exceed AGENT_RESEARCH_MAX_CHARS.
+    const budget = contextBudget(Boolean(plan));
+    const context = combineContext(research ? renderResearchContext(research.brief, research.sources, budget.research) : "", plan?.context ?? "", budget);
 
     const outcome: PipelineOutcome = {
       context,

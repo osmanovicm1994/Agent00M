@@ -14,6 +14,8 @@
 // Keep patterns specific. Generic words ("test", "fix", "page", "button", "component" alone) must not
 // route; they fall through to the model router.
 
+import { wantsBosnian } from "../core/language";
+
 // ---------------------------------------------------------------------------
 // Routing signals
 // ---------------------------------------------------------------------------
@@ -131,7 +133,9 @@ export function rankDomains(task: string, opts: RankOptions = {}): DomainScore[]
   }
 
   // Whole-app build: the general dev agent leads, unless the task is really a failure report or a research ask.
-  if (isFullstackBuild(task) && !scores.debug && !scores.research && !opts.automationProject) {
+  // One stray failure word ("if a command fails, report it" in a long spec) is not a failure report: debug has to carry
+  // at least 3 signals to veto the whole-app route.
+  if (isFullstackBuild(task) && (scores.debug ?? 0) < 3 && !scores.research && !opts.automationProject) {
     const best = Math.max(0, ...Object.values(scores));
     scores.dev = best + 1;
   }
@@ -174,9 +178,15 @@ interface KnowledgeRule {
 const NO_CODE_AGENTS = ["kb-harvester", "research"];
 
 /** Agents that build or review application code and therefore get the full-stack building-block standards. */
-const FULLSTACK_AGENTS = ["dev", "api", "db", "design", "qa", "logic"];
+const FULLSTACK_AGENTS = ["dev", "api", "db", "design", "qa", "logic", "infra"];
 
 const BULLET_LIST_RE = /(?:^|\n)\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*(?:\n\s*(?:\d+[.)]|[-*•])\s+\S[^\n]*){2,}/;
+
+/** The request names NextAuth / Auth.js (or its credentials provider) itself. */
+const NEXTAUTH_NAMED_RE = /\bnext-?auth\b|\bauth\.js\b|credentials provider/i;
+
+/** The request asks for opaque server-side sessions (a Session table with a token hash), not for signed JWT cookies. */
+const OPAQUE_SESSION_RE = /\bopaque\b|\btokenHash\b|\bserver-side sessions?\b|\bsession (?:row|table|model)\b|\bSession model\b/i;
 
 export const KNOWLEDGE_RULES: KnowledgeRule[] = [
   // --- Logic standards ---------------------------------------------------
@@ -273,14 +283,16 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
   {
     id: "fullstack-build",
     test: /\bfull[- ]?stack\b|from scratch|\bscaffold|\bbootstrap|\bmonorepo\b|production[- ]ready|\bnew (web )?(app|application|project)\b/i,
-    files: ["12-fullstack/00-build-protocol.md"],
-    weight: 6,
+    // The roadmap (phases with gates, git, versioning) rides along with the build protocol: one rule, so the protocol stays first.
+    files: ["12-fullstack/00-build-protocol.md", "13-delivery/00-roadmap.md"],
+    // 10: the build protocol stays first, ahead of the coding protocol (write-code, 9) that rides along with every code task.
+    weight: 10,
     onlyFor: FULLSTACK_AGENTS,
   },
   {
     id: "scaffolding",
-    test: /\bscaffold|create-next-app|\bnest new\b|@nestjs\/cli|\bmonorepo\b|\bnew (web )?(app|application|project)\b/i,
-    files: ["12-fullstack/09-scaffolding.md"],
+    test: /\bscaffold|create-next-app|\bnest new\b|@nestjs\/cli|\bmonorepo\b|\bnew (web |full[- ]?stack )?(app|application|project)\b/i,
+    files: ["12-fullstack/09-scaffolding.md", "13-delivery/02-versions-2026.md"],
     weight: 6,
     onlyFor: FULLSTACK_AGENTS,
   },
@@ -329,7 +341,7 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
   {
     id: "docker-deploy",
     test: /\bdocker(file)?\b|docker[- ]compose|\bvps\b|\bdeploy(ment|ing)?\b|\bnginx\b|\bcaddy\b|reverse proxy|\bci\/cd\b/i,
-    files: ["12-fullstack/07-docker-deploy.md"],
+    files: ["12-fullstack/07-docker-deploy.md", "13-delivery/04-local-infra-ci.md"],
     weight: 3,
     onlyFor: FULLSTACK_AGENTS,
   },
@@ -339,6 +351,15 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     files: ["12-fullstack/08-ci-testing.md"],
     weight: 3,
     onlyFor: FULLSTACK_AGENTS,
+  },
+  // Any task that writes or runs tests, whichever agent got it (the API agent wrote the tests in a real run): how to pick
+  // the runner, where the file goes, what it imports, and that only a real test run counts as proof.
+  {
+    id: "test-strategy",
+    test: /\btests?\b|\bvitest\b|\bjest\b|\bspec files?\b|test coverage/i,
+    files: ["02-qa-automation/00-test-strategy.md"],
+    weight: 5,
+    skipFor: NO_CODE_AGENTS,
   },
   // Other stacks: a new project of that kind has no marker files yet, so detectStackKnowledge cannot see it.
   {
@@ -376,6 +397,138 @@ export const KNOWLEDGE_RULES: KnowledgeRule[] = [
     files: ["10-design/design-system-workflow.md"],
     weight: 5,
     onlyFor: ["design", "dev"],
+  },
+  // --- Delivery knowledge (13-delivery): exact, checked recipes and the project lifecycle. -------------------
+  {
+    id: "delivery-recipe",
+    // Specific on purpose: "login" or "session" alone must not pull a Next.js recipe into a mobile task.
+    test: /\bprisma\b|\bnext\.?js\b|create-next-app|react-hook-form|\bzod\b|\bnext-auth\b|\bauth\.js\b/i,
+    files: ["13-delivery/03-recipe-nextjs-prisma-auth.md"],
+    weight: 5,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "rbac-auth-nextauth",
+    // NextAuth only when the request asks for it by name. A real run got next-auth installed (and a second jose session built next to it)
+    // because roles alone used to load this recipe.
+    test: (t) => NEXTAUTH_NAMED_RE.test(t),
+    files: ["13-delivery/06-recipe-auth-rbac-nextauth.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "rbac-auth-opaque",
+    // The request's own design wins: opaque tokens whose SHA-256 hash is stored in a Session table.
+    test: (t) => !NEXTAUTH_NAMED_RE.test(t) && OPAQUE_SESSION_RE.test(t),
+    files: ["13-delivery/12-recipe-auth-opaque-session.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "rbac-auth",
+    // Accounts with roles and per-user data, with the jose + bcryptjs session. "ADMIN ... USER" in capitals is how a spec writes the two roles.
+    test: (t) =>
+      !NEXTAUTH_NAMED_RE.test(t) &&
+      !OPAQUE_SESSION_RE.test(t) &&
+      (/\brbac\b|role[- ]based|\bownerFilter\b|\bidor\b|per-user|owner(ship)? (check|filter|column)|\bjose\b|bcrypt|httpOnly|session cookie|\badmin (login|site|panel|area)\b/i.test(t) || /\bADMIN\b[\s\S]{0,80}\bUSER\b/.test(t)),
+    files: ["13-delivery/11-recipe-auth-rbac-jose.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "ui-pages",
+    test: /\bwizard\b|multi-step|login (page|form|screen)|print (view|preview|stylesheet|layout)|pdf preview|admin (page|screen|panel|area)|starter page|\bdetail (view|page)\b/i,
+    files: ["13-delivery/07-recipe-ui-pages.md"],
+    weight: 6,
+    onlyFor: ["design", "dev", "qa"],
+  },
+  {
+    id: "monorepo-db-package",
+    // Only when the request names the layout. "monorepo" alone must not load it (the default is one app in apps/web).
+    test: /packages\/db\b|packages\/database\b|@app\/db\b|\b(db|database|prisma) package\b/i,
+    files: ["13-delivery/08-recipe-monorepo-db-package.md"],
+    weight: 6,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  {
+    id: "legal-records",
+    test: /\b(agreements?|invoices?|ugovor\w*|legal (document|record)s?|purchase contract|sales? contract|commission contract)\b/i,
+    files: ["13-delivery/09-records-and-legal-documents.md"],
+    weight: 4,
+    onlyFor: ["db", "api", "dev", "design", "qa"],
+  },
+  {
+    id: "git-versioning",
+    test: /\bgit\b|\bbranch(es)?\b|\bcommits?\b|\bsemver\b|\bversioning\b|changelog|\brelease (notes|process|tag)\b|version control|git ?flow/i,
+    files: ["13-delivery/01-git-versioning.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
+  },
+  // --- Coding reliability (14-coding): how to write files that compile, fix errors without looping, update dependencies. ----
+  // Weights are the highest on purpose: the task budget keeps the heaviest files first and shortens the rest.
+  {
+    id: "write-code",
+    // Creating or changing code. A bare rename or delete is too small to be worth the prompt space.
+    test: /\b(add|create|implement|build|write|generate|scaffold|fix|refactor|migrate|install|upgrade|update|change|modify)\b/i,
+    files: ["14-coding/00-write-code-protocol.md"],
+    weight: 9,
+    skipFor: [...NO_CODE_AGENTS, "debug"],
+  },
+  {
+    id: "fix-loop",
+    test: /\bfail(s|ed|ing|ure)\b|\bTS\d{4}\b|crash|exception|won'?t (start|build|compile|run)|typecheck|\bbroken\b/i,
+    files: ["14-coding/01-fix-loop.md"],
+    weight: 8,
+    skipFor: [...NO_CODE_AGENTS, "debug"],
+  },
+  {
+    id: "ts-error-codes",
+    test: /\bTS\d{4}\b|type ?check|\btsc\b|type error|not assignable|does not exist on type|Cannot find module|Module not found/i,
+    files: ["14-coding/02-ts-error-codes.md"],
+    weight: 7,
+    skipFor: [...NO_CODE_AGENTS, "debug"],
+  },
+  {
+    id: "bosnian",
+    // AGENT_LANGUAGE=bs forces it (the engineers' task text is English, so only the setting reaches them); a Bosnian request is detected too.
+    test: (t) => wantsBosnian(t),
+    files: ["14-coding/07-language-bosnian.md"],
+    weight: 7,
+  },
+  {
+    id: "nextjs-ui-pitfalls",
+    test: /\bnext\.?js\b|app router|\bshadcn\b|components\/ui|\bcookies\(|root layout|route group|"use client"|\bpage\.tsx\b|\blayout\.tsx\b|lucide|react-day-picker|\bcalendar\b/i,
+    files: ["14-coding/03-nextjs-ui-pitfalls.md"],
+    weight: 6,
+    onlyFor: [...FULLSTACK_AGENTS, "debug"],
+  },
+  {
+    id: "prisma-contract",
+    test: /\bprisma\b|schema\.prisma|\bseed\b|WhereUniqueInput|\benum\b/i,
+    files: ["14-coding/04-prisma-contract.md"],
+    weight: 6,
+    onlyFor: [...FULLSTACK_AGENTS, "debug"],
+  },
+  {
+    id: "dependency-updates",
+    test: /dependenc(y|ies)|node_modules|\boutdated\b|npm (update|outdated|audit|ci)\b|\bjdk\b|gradle wrapper|pod update|pip install -U|\bnuget\b|third[- ]party|3rd[- ]party|upgrade (node|java|npm|next|react|prisma|packages?|libraries)|nadogradi|ažuriraj/i,
+    files: ["14-coding/05-dependency-updates.md"],
+    weight: 6,
+    skipFor: NO_CODE_AGENTS,
+  },
+  {
+    id: "ask-or-decide",
+    test: /\b(not sure|unclear|ambiguous|either|which (one|option|approach)|your choice|you decide|decide for me|best option)\b|\b(ne znam|nije jasno|odluči|ti odluči|po tvom)\b/i,
+    files: ["14-coding/06-ask-the-user.md"],
+    weight: 5,
+    skipFor: NO_CODE_AGENTS,
+  },
+  {
+    id: "tool-extras",
+    test: /\bdocker|\bdeploy|predeploy|\bbrowser\b|inspect_page|e2e|end-to-end|query-docs/i,
+    files: ["00-agent-core/tool-execution-extras.md"],
+    weight: 3,
+    onlyFor: FULLSTACK_AGENTS,
   },
 ];
 

@@ -42,8 +42,7 @@
 // report it. Only enable automated query submission where you have permission to do so.
 
 import * as cheerio from "cheerio";
-import * as dns from "dns";
-import * as net from "net";
+import { assertPublicUrl } from "./net-guard";
 import { chromium, type Browser, type Page } from "playwright";
 import pc from "picocolors";
 import type { ToolSchema } from "../llm/types";
@@ -863,50 +862,6 @@ export async function searchWeb(
 // ---------------------------------------------------------------------------
 // Fetching pages (public web only)
 // ---------------------------------------------------------------------------
-
-function isPrivateIp(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const p = ip.split(".").map(Number);
-    const [a, b] = p;
-    return (
-      a === 0 || a === 10 || a === 127 || a >= 224 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 192 && b === 0 && p[2] === 0) ||
-      (a === 198 && (b === 18 || b === 19))
-    );
-  }
-  if (net.isIPv6(ip)) {
-    const l = ip.toLowerCase();
-    if (l === "::" || l === "::1") return true;
-    if (l.startsWith("fc") || l.startsWith("fd") || l.startsWith("fe8") || l.startsWith("fe9") || l.startsWith("fea") || l.startsWith("feb")) return true;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(l);
-    if (mapped) return isPrivateIp(mapped[1]);
-    return false;
-  }
-  return true;
-}
-
-async function assertPublicUrl(u: URL): Promise<void> {
-  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error(`only http(s) pages can be read (got ${u.protocol})`);
-  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".lan")) {
-    throw new Error("refused: local addresses are not fetched");
-  }
-  if (net.isIP(host)) {
-    if (isPrivateIp(host)) throw new Error("refused: private network addresses are not fetched");
-    return;
-  }
-  let addrs: Array<{ address: string }>;
-  try {
-    addrs = await dns.promises.lookup(host, { all: true });
-  } catch {
-    throw new Error(`could not resolve ${host}`);
-  }
-  if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) throw new Error("refused: the address resolves to a private network");
-}
 
 /** GitHub "blob" pages are HTML wrappers; the raw file is what the agent needs. */
 function rewriteUrl(raw: string): string {

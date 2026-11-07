@@ -18,5 +18,5 @@ write_file action, always send the FULL new file content, not a fragment.` +
       "00-agent-core/golden-rules.md",
       "09-ai-agents/mcp-protocols.md",
       "01-architecture/architecture-patterns.md",
-    ]),
+    ], 9_800), // the five files total about 9.2 KB
 };

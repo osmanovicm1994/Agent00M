@@ -1,16 +1,20 @@
+# Secrets and local env files: ignored by default ...
 .env
-.env.nim
 .env.*
-.env.example
-.env.local
+# ... except the documented reference and the committed profiles (no secrets in them; keys go in .env)
+!.env.example
+!.env.local
 !.env.qwen3coder
 !.env.devstral
 !.env.codestral
+# NIM holds a real cloud key: never commit it (listed last so no negation above can re-include it)
+.env.nim
 node_modules/
 .DS_Store
 dist/
 .agent_cache/
 _to_delete/
+# Agensi.io skill packages (not pushed to git)
+agensi/
 bench/fullstack/workspace/
 bench/fullstack/results/
-.env

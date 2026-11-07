@@ -118,6 +118,8 @@ export type ServerMessage =
   | ({ kind: "settings" } & SettingsState)
   // Answer to list_files: names only (never file contents), without secret env files and heavy folders.
   | { kind: "files"; root: string; entries: FileEntry[]; truncated: boolean }
+  // Answer to get_guide: the prompting tutorial (docs/PROMPTING.md) as Markdown text.
+  | { kind: "guide"; markdown: string }
   // Feedback for a command (rejected task, bad token, ...).
   | { kind: "notice"; level: "info" | "error"; text: string };
 
@@ -129,6 +131,8 @@ export type ClientCommand =
   | { kind: "answer_question"; id: string; answer: string }
   // Ask for the project tree of the folder the agent works in.
   | { kind: "list_files" }
+  // Ask for the prompting tutorial as text (the native iOS app shows it; the web app bundles its own copy).
+  | { kind: "get_guide" }
   // Same as Ctrl+C in the terminal while a command runs: stops the running shell command(s).
   | { kind: "stop_command" }
   // Turn team mode on or off for tasks from now on (same as /team in the terminal).

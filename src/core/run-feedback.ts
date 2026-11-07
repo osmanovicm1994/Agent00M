@@ -49,11 +49,31 @@ export class RepeatTracker {
     this.counts.set(signature, n);
     return n;
   }
+
+  /** A successful check means the previous identical failure was resolved or is no longer current. */
+  clear(): void {
+    this.counts.clear();
+  }
+}
+
+/** A concrete terminal report used when the executor stops an identical failure loop. */
+export function repeatedFailureReport(command: string, output: string, count: number): string {
+  const evidence = summarizeFailures(output, 8) || output.trim().split("\n").slice(-8).join("\n") || "No useful error output was captured.";
+  return [
+    "REPEATED FAILURE STOP",
+    `Command: ${command}`,
+    `Same failure observed: ${count} times`,
+    "Failure evidence:",
+    evidence,
+    "Tried: the command was rerun without a verified fix; the CLI stopped further retries to prevent a loop.",
+    "Next step: inspect the listed errors and affected files, make one root-cause change, then run this check once.",
+  ].join("\n");
 }
 
 export function repeatNote(count: number): string {
   return (
     `The same failure has now happened ${count} times. Stop trying small variations of the same fix. ` +
+    "Before the next attempt, search for the exact error text with the tool and version (web_search), or read the package's documentation or type definitions. " +
     "Write down what the error says, what you already tried and your best theory, then either try ONE clearly different " +
     "approach (a different cause, not a different spelling) or give your final answer explaining where you are stuck. " +
     "If the output lists several different errors, check whether they share one cause before fixing one line. " +

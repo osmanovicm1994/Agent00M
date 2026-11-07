@@ -9,6 +9,17 @@ const KNOWLEDGE_ROOT = path.resolve(__dirname, "../../src/knowledge");
 
 const DEFAULT_MAX_CHARS = Number(process.env.AGENT_SKILL_CHARS) || 9000;
 const warnedMissing = new Set<string>();
+const warnedTruncated = new Set<string>();
+
+/** Says once per list which standards did not fit the budget, so missing guidance is visible instead of silent. */
+function warnTruncatedOnce(all: string[], cut: string[], maxChars: number): void {
+  const key = all.join("|");
+  if (warnedTruncated.has(key)) return;
+  warnedTruncated.add(key);
+  console.warn(
+    pc.yellow(`⚠ Knowledge budget of ${maxChars} characters is too small: cut or dropped ${cut.join(", ")}. Raise AGENT_SKILL_CHARS or shorten the list.`),
+  );
+}
 
 function stripFrontMatter(text: string): string {
   return text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
@@ -29,6 +40,7 @@ export function loadKnowledge(
   heading: string = "ENGINEERING STANDARDS (follow these strictly)",
 ): string {
   let out = "";
+  const cut: string[] = [];
 
   for (const rel of relPaths) {
     const full = path.join(KNOWLEDGE_ROOT, rel);
@@ -50,11 +62,30 @@ export function loadKnowledge(
       out += block;
     } else {
       if (remaining > 400) out += block.slice(0, remaining) + "\n[...truncated to fit the prompt budget]";
+      cut.push(...relPaths.slice(relPaths.indexOf(rel)));
       break;
     }
   }
 
+  if (cut.length > 0) warnTruncatedOnce(relPaths, cut, maxChars);
+
   return out ? `\n\n## ${heading}${out}` : "";
+}
+
+/**
+ * One knowledge file as plain text (front matter removed), or "" when it does not exist. Used for text that is not a
+ * "standard" (the operating guidelines), so it is not wrapped in a STANDARD heading or cut by a character budget.
+ */
+export function readKnowledgeFile(rel: string): string {
+  try {
+    return stripFrontMatter(fs.readFileSync(path.join(KNOWLEDGE_ROOT, rel), "utf8"));
+  } catch {
+    if (!warnedMissing.has(rel)) {
+      warnedMissing.add(rel);
+      console.warn(pc.yellow(`⚠ Knowledge file not found: src/knowledge/${rel}`));
+    }
+    return "";
+  }
 }
 
 /** Legacy single-file helper, kept for backward compatibility. */

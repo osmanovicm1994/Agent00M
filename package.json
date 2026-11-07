@@ -27,6 +27,8 @@
     "remote:on": "bash scripts/remote.sh on",
     "remote:off": "bash scripts/remote.sh off",
     "remote:status": "bash scripts/remote.sh status",
+    "deps:check": "bash scripts/deps-check.sh",
+    "deps:update": "bash scripts/deps-update.sh",
     "web": "npm --prefix web run dev",
     "web:install": "npm --prefix web install",
     "models": "dotenv -e .env.local -- ts-node src/cli.ts models",

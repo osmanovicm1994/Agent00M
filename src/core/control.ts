@@ -8,7 +8,7 @@ import { randomUUID } from "crypto";
 import { bus } from "./events";
 import type { PlannerMode, SettingKey, SettingsState } from "./event-types";
 
-export const MAX_TASK_CHARS = 8000;
+export const MAX_TASK_CHARS = 15000;
 export const MAX_ANSWER_CHARS = 1000;
 
 // Plain shape (not a union) so it type-checks the same with or without strict mode.

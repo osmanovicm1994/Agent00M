@@ -6,7 +6,7 @@
 // Rules (all of them make a wrong plan fall back to the normal one-after-another run instead of running unsafely):
 //  - every engineer task needs a `scope` (the folders/files it may write);
 //  - `dependsOn` holds task numbers (1-based, as printed in the plan);
-//  - the usual order is added when the PM left it out: db before api, everything before qa;
+//  - the usual order is added when the PM left it out: db before api, api/db before design, everything before qa;
 //  - tasks that can run at the same time must not own overlapping paths (OrchestraMaster.validate checks it);
 //  - UX tasks are not part of the graph: they run first, and their spec is given to every engineer task.
 
@@ -16,6 +16,9 @@ import type { PmPlan } from "./roles";
 type PlanTask = PmPlan["tasks"][number];
 
 const WRITES_CONTRACT = new Set(["db", "api"]);
+
+/** The scope of an infra task: the whole project (normalizeScope turns it into the empty scope that matches every path). */
+export const WHOLE_PROJECT = "./";
 
 /** "apps/api/**" and "apps/api/*" mean the folder; "./src" means "src". */
 export function cleanScope(raw: string): string {
@@ -34,6 +37,23 @@ export function parseDependency(raw: unknown): number | null {
   return null;
 }
 
+/**
+ * The interfaces the planner wrote down for the db and api tasks (tables, endpoints, payloads), as one block of text.
+ * A design task gets it so it can build screens before the API exists. `exceptIndex` leaves out the task that receives it.
+ */
+export function plannedContracts(plan: PmPlan, exceptIndex = -1): string {
+  const parts: string[] = [];
+  plan.tasks.forEach((t, i) => {
+    if (i === exceptIndex || !t.contract) return;
+    parts.push(`### Task ${i + 1} (${t.role}): ${t.title}\n${t.contract.slice(0, 1500)}`);
+  });
+  if (parts.length === 0) return "";
+  return (
+    "## PLANNED CONTRACTS (the backend is built at the same time or later: code against these, do not wait for it)\n" +
+    parts.join("\n\n").slice(0, 5000)
+  );
+}
+
 export interface ParallelPlan {
   tasks: OrchTask[];
   /** Why the plan cannot run in parallel. Empty = it can. */
@@ -42,7 +62,11 @@ export interface ParallelPlan {
   indexOf: Map<string, number>;
 }
 
-export function planToOrchTasks(plan: PmPlan, uxSpec = ""): ParallelPlan {
+/**
+ * `extra` is context every engineer task should carry (the original request, the content of the files it names).
+ * Sequential runs get it through the team assignment; the parallel runner only sees `instructions`, so it is added there.
+ */
+export function planToOrchTasks(plan: PmPlan, uxSpec = "", extra = ""): ParallelPlan {
   const problems: string[] = [];
   const indexOf = new Map<string, number>();
   const engineers: Array<{ t: PlanTask; i: number; id: string }> = [];
@@ -74,12 +98,21 @@ export function planToOrchTasks(plan: PmPlan, uxSpec = ""): ParallelPlan {
     deps.set(e.id, set);
   }
 
-  // Default order the PM prompt already asks for: db before api, everything before qa.
+  // Default order the PM prompt already asks for: infra (skeleton, installs) first, db before api, everything before qa.
   for (const e of engineers) {
     const set = deps.get(e.id)!;
+    if (e.t.role !== "infra") {
+      for (const o of engineers) if (o.t.role === "infra" && o.i < e.i) set.add(o.id);
+    } else {
+      // An infra task owns the whole project, so it also waits for everything planned before it.
+      for (const o of engineers) if (o.i < e.i) set.add(o.id);
+    }
     if (e.t.role === "api") {
       for (const o of engineers) if (o.t.role === "db" && o.i < e.i) set.add(o.id);
     }
+    // The interface is NOT made to wait for the api and db tasks: it is built against the planned contracts (see plannedContracts)
+    // while the backend is built, so a failing backend task (no database, a broken route) cannot stop every screen from being built.
+    // Only an explicit dependsOn from the planner makes a design task wait.
     if (e.t.role === "qa") {
       for (const o of engineers) if (o.t.role !== "qa" && o.i < e.i) set.add(o.id);
     }
@@ -89,16 +122,21 @@ export function planToOrchTasks(plan: PmPlan, uxSpec = ""): ParallelPlan {
   deps.forEach((set) => set.forEach((id) => needed.add(id)));
 
   const tasks: OrchTask[] = engineers.map((e) => {
-    const scope = (e.t.scope ?? []).map(cleanScope).filter(Boolean);
+    // An infra task runs first and alone (every other task waits for it, see above), so it owns the whole project: it creates
+    // folders the planner could not know about yet (the scaffold's own folder), and may write the root files too.
+    const scope = e.t.role === "infra" ? [WHOLE_PROJECT] : (e.t.scope ?? []).map(cleanScope).filter(Boolean);
     if (scope.length === 0) problems.push(`task ${e.i + 1} (${e.t.title}) has no scope (the folders it may write)`);
     const dependsOn = [...(deps.get(e.id) ?? [])];
     const acceptance = e.t.acceptance.length ? `\nAcceptance criteria:\n${e.t.acceptance.map((a) => `- ${a}`).join("\n")}` : "";
     const ux = uxSpec ? `\n\n## UX SPEC (build to this)\n${uxSpec.slice(0, 4500)}` : "";
+    const more = extra.trim() ? `\n\n${extra.trim().slice(0, 10000)}` : "";
+    const contracts = e.t.role === "design" ? plannedContracts(plan, e.i) : "";
+    const planned = contracts ? `\n\n${contracts}` : "";
     return {
       id: e.id,
       agent: e.t.role,
       title: e.t.title,
-      instructions: `${e.t.instructions}${acceptance}${ux}`.trim(),
+      instructions: `${e.t.instructions}${acceptance}${planned}${ux}${more}`.trim(),
       scope,
       dependsOn,
       readsContracts: dependsOn,

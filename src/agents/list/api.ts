@@ -25,5 +25,5 @@ always propose full-file content for write_file.` +
       "07-api/02-validation-pipes.md",
       "07-api/03-error-handling.md",
       "07-api/04-security-protocols.md",
-    ]),
+    ], 14_000), // the seven files total about 13.6 KB; at the old 9000 the validation, error and security standards were cut
 };

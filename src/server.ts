@@ -15,6 +15,7 @@ import { AGENTS } from "./agents/definitions";
 import { bus } from "./core/events";
 import { control, MAX_ANSWER_CHARS } from "./core/control";
 import { listWorkspace } from "./core/file-tree";
+import { readGuide } from "./core/guide";
 import type { AgentInfo, ClientCommand, ServerMessage, SettingKey } from "./core/event-types";
 import { REMOTE_MODE, detectTailscale, resolveRemoteHost } from "./remote";
 import { startNotifier } from "./notify";
@@ -94,6 +95,7 @@ function parseCommand(raw: unknown): ClientCommand | undefined {
     return { kind: "answer_question", id: value.id, answer: value.answer.slice(0, MAX_ANSWER_CHARS) };
   }
   if (value?.kind === "list_files") return { kind: "list_files" };
+  if (value?.kind === "get_guide") return { kind: "get_guide" };
   if (value?.kind === "stop_command") return { kind: "stop_command" };
   if (value?.kind === "set_team" && typeof value.on === "boolean") return { kind: "set_team", on: value.on };
   if (value?.kind === "set_setting" && typeof value.key === "string" && (typeof value.value === "boolean" || typeof value.value === "string")) {
@@ -162,6 +164,12 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
     socket.on("message", (raw: unknown) => {
       const command = parseCommand(raw);
       if (!command) return;
+      // The tutorial is plain documentation: any connection may read it (even a read-only one).
+      if (command.kind === "get_guide") {
+        const markdown = readGuide();
+        send(markdown ? { kind: "guide", markdown } : { kind: "notice", level: "error", text: "The prompting guide (docs/PROMPTING.md) was not found next to the agent." });
+        return;
+      }
       if (!canControl) {
         send({ kind: "notice", level: "error", text: "This dashboard is read-only: open the URL printed in the terminal (it carries the control token)." });
         return;

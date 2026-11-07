@@ -59,6 +59,8 @@ export interface OrchestraOptions {
   concurrency?: number;
   /** Stop starting new tasks after the first failure. Default false: independent branches continue. */
   failFast?: boolean;
+  /** External cancel (Ctrl+C): no new task starts, running ones get `ctx.signal` aborted, the rest are marked skipped. */
+  signal?: AbortSignal;
   log?(line: string): void;
 }
 
@@ -137,6 +139,24 @@ export class OrchestraMaster {
     const abort = new AbortController();
     let stopping = false;
 
+    // Stops scheduling, tells running tasks to stop (ctx.signal) and marks everything that has not started as skipped.
+    const stopAll = (reason: string) => {
+      if (stopping) return;
+      stopping = true;
+      abort.abort();
+      for (const t of pending.values()) {
+        outcomes[t.id] = { status: "skipped", summary: reason, filesWritten: [], commandsRun: [] };
+        order.push(t.id);
+      }
+      pending.clear();
+    };
+    const onExternalAbort = () => {
+      log("orchestra: stopped by the user");
+      stopAll("stopped by the user (Ctrl+C)");
+    };
+    if (this.opts.signal?.aborted) onExternalAbort();
+    else this.opts.signal?.addEventListener("abort", onExternalAbort, { once: true });
+
     const finish = (id: string, outcome: TaskOutcome) => {
       outcomes[id] = outcome;
       order.push(id);
@@ -202,16 +222,9 @@ export class OrchestraMaster {
 
       const doneId = await Promise.race(running.values());
       running.delete(doneId);
-      if (this.opts.failFast && outcomes[doneId].status !== "done" && !stopping) {
-        stopping = true;
-        abort.abort();
-        for (const t of pending.values()) {
-          outcomes[t.id] = { status: "skipped", summary: "stopped after a failure (failFast)", filesWritten: [], commandsRun: [] };
-          order.push(t.id);
-        }
-        pending.clear();
-      }
+      if (this.opts.failFast && outcomes[doneId].status !== "done") stopAll("stopped after a failure (failFast)");
     }
+    this.opts.signal?.removeEventListener("abort", onExternalAbort);
 
     return {
       outcomes,

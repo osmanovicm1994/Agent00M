@@ -33,6 +33,8 @@ Notes: new dependencies, assumptions, follow-ups. Omit if empty.
 - Every data-driven component handles loading, empty, error, success and disabled/pending states. Never show raw errors to the user.
 - TypeScript strict: typed props, no any, state modelled so impossible states cannot be represented. Derive values during render instead of copying them into state.
 - Performance: no layout shift (reserve space for images and async content), lazy-load heavy or below-the-fold parts, no needless dependencies, no needless client-side JavaScript. In Next.js keep Server Components the default and put "use client" at the lowest leaf.
+- Every link, button and menu item you write must lead to a page that exists. Before you finish, list the hrefs and router.push targets you used and check that each has a page.tsx (or route handler). If the target is a screen the task asks for, build it for real; never link to a route nobody builds. Screens the request keeps out of public navigation (admin, staff login) are still built, just not linked from public pages.
+- You may code against a PLANNED CONTRACTS block in your assignment before the backend exists: use the exact URLs and payloads it names, keep data access in one small module (for example src/lib/api-client.ts) so it is easy to wire up, and do not invent endpoints.
 - Add stable data-testid attributes to elements a UI test must reach.
 - Smallest correct change: do not restyle or refactor unrelated code. Leave no TODO placeholders, commented-out code or console.log behind.
 
@@ -55,7 +57,7 @@ You cannot see the rendered interface. inspect_page reports facts (errors, overf
     "04-frontend/modern-frontend.md",
     "10-design/css-and-tailwind.md",
     "09-ai-agents/mcp-protocols.md",
-  ]);
+  ], 16_800); // about 16.2 KB; at the old 9000 modern-frontend, css-and-tailwind and mcp-protocols were cut
 
 export const designAgent: AgentDefinition = {
   id: "design",

@@ -3,7 +3,8 @@ import * as path from "path";
 import type { ChatMessage, LLMProvider, LLMResponse, ToolCall, ToolSchema } from "../llm/types";
 import type { AgentDefinition } from "../agents/definitions";
 import { detectStackKnowledge, loadKnowledge, loadProjectContext } from "../agents/helpers";
-import { FsTools, fsToolSchemas } from "../tools/fs.tool";
+import { operatingGuidelines } from "../agents/operating-guidelines";
+import { FsTools, fsToolSchemas, isSecretPath as isSecretFile } from "../tools/fs.tool";
 import { ShellTool, shellToolSchema, clampTimeoutMs, condenseOutput } from "../tools/shell.tool";
 import { SearchTool, searchToolSchemas } from "../tools/search.tool";
 import type { McpManager } from "../mcp/client";
@@ -24,10 +25,19 @@ import { styleToolSchemas, runStyleCheck } from "../tools/styles.tool";
 import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
-import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, summarizeFailures } from "./run-feedback";
+import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, repeatedFailureReport, summarizeFailures } from "./run-feedback";
 import type { ExecutorHooks } from "./executor-hooks";
+import { LoopWatch, adviseBeforeRun, diagnoseFailure, formatDiagnosis, haltText, refuseRecursiveInstallScript } from "./toolchain-doctor";
+import { StallGuard, classifyCall, isInspectCommand, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
+import { KNOWN_FIX_SHOW_LIMIT, formatKnownFixes, knownFixStopText, matchKnownFixes } from "./known-fixes";
+import { ContextOverflowError } from "../llm/context-error";
+import { repeatsEarlierContent } from "./append-guard";
+import { applyEdit } from "./edit-apply";
+import { selectToolSchemas } from "./tool-select";
+import { ASK_USER_TOOL, askUser, askUserSchema, canAskUser, formatAnswer, limitReached, maxQuestions, parseAskArgs, unattendedAnswer } from "./ask-user";
+import { allocateFirstRequest, charsPerToken, clipMiddle, contextWindow, fitConversation, learnCharsPerToken, learnWindow, messagesChars, promptBudgetTokens } from "./context-fit";
 
-const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas];
+const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [...fsToolSchemas, shellToolSchema, ...searchToolSchemas, ...webToolSchemas, ...browserToolSchemas, ...processToolSchemas, planToolSchema, designSearchSchema, ...deployToolSchemas, ...styleToolSchemas, askUserSchema];
 
 // Agents that never change code, so they are never asked to run a check after writing.
 const NO_VERIFY_AGENTS = new Set(["kb-harvester", "research"]);
@@ -42,7 +52,8 @@ const MAX_NUDGES = 6;
 // Budget for the auto-detected stack standards in the system prompt (mobile adds role-specific detail files).
 const STACK_KNOWLEDGE_CHARS = Number(process.env.AGENT_STACK_CHARS) || 9000;
 // Budget for the task-specific standards (logic, cross-domain) chosen from the task text, see agents/orchestration.ts.
-const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 8000;
+// 16000 (was 8000): the delivery recipes (13-delivery) are exact and replace dozens of debugging calls; one prefill costs far less.
+const TASK_KNOWLEDGE_CHARS = Number(process.env.AGENT_TASK_CHARS) || 16000;
 
 // True when `dir` or one of its parents is a git working tree (changes can be reviewed and reverted).
 function insideGitRepo(dir: string): boolean {
@@ -190,8 +201,11 @@ function parseFallbackActions(content: string): ToolCall[] {
 // it changed a named file that was never actually written this session.
 const FILE_MENTION_RE = /\b[\w.\/-]+\.(?:ts|tsx|js|jsx|json)\b/g;
 
+// Product names that look like file names ("Next.js", "Node.js") are not files the agent claims to have changed.
+const NOT_A_FILE_RE = /^(next|node|vue|react|nuxt|express|nest|three|d3|chart|alpine|ember|backbone|socket|p5|deno|bun)\.(js|ts)$/i;
+
 function extractMentionedFiles(content: string): string[] {
-  return [...new Set([...content.matchAll(FILE_MENTION_RE)].map((m) => m[0]))];
+  return [...new Set([...content.matchAll(FILE_MENTION_RE)].map((m) => m[0]))].filter((f) => !NOT_A_FILE_RE.test(f));
 }
 
 function basename(p: string): string {
@@ -217,7 +231,8 @@ function extractImportedPackages(content: string): string[] {
   }
   const packages = new Set<string>();
   for (const spec of specifiers) {
-    if (spec.startsWith(".") || spec.startsWith("/")) continue;
+    // Relative paths and tsconfig path aliases ("@/lib/db", "~/x", "#internal") are project files, not packages.
+    if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("@/") || spec.startsWith("~/") || spec.startsWith("#")) continue;
     const clean = spec.startsWith("node:") ? spec.slice(5) : spec;
     if (clean.startsWith("@")) packages.add(clean.split("/").slice(0, 2).join("/"));
     else packages.add(clean.split("/")[0]);
@@ -231,15 +246,16 @@ const PLACEHOLDER_RE =
   /(?:\/\/|#|\/\*|<!--)\s*(?:\.{3}|…)?\s*(?:rest of (?:the )?(?:file|code|implementation)|existing (?:code|content|imports)|remaining (?:code|content)|(?:code|content) (?:here|unchanged)|previous code|same as before)/i;
 
 // Names that legitimately exist in many folders; never flagged as "duplicate".
-const DUPLICATE_NAME_EXEMPT = /^(index\.\w+|readme\.md|claude\.md|skill\.md|package\.json|tsconfig\.json|__init__\.py)$/i;
+// Next.js route files (route.ts, page.tsx, layout.tsx, ...) are named by convention and repeat in every folder.
+const DUPLICATE_NAME_EXEMPT =
+  /^(index\.\w+|readme\.md|claude\.md|skill\.md|package\.json|tsconfig\.json|__init__\.py|(?:route|page|layout|loading|error|global-error|not-found|template|default|middleware|proxy|instrumentation)\.[cm]?[jt]sx?|\.gitkeep|schema\.prisma|globals?\.css)$/i;
 
 // Secret-bearing env files. The agent may read .env.example but never real
 // secrets: file contents are sent to the model (possibly a cloud endpoint) and
 // stored in the response cache.
+// The rule itself lives in tools/fs.tool.ts so FsTools can also apply it to the REAL target of a symlink.
 function isSecretPath(p: string): boolean {
-  const name = basename(p).toLowerCase();
-  if (!name.startsWith(".env")) return false;
-  return !/\.(example|sample|template)$/.test(name);
+  return isSecretFile(p);
 }
 
 function ensureTrailingNewline(s: string): string {
@@ -275,6 +291,18 @@ function logLine(text: string, level: "info" | "warn" = "info"): void {
 // agent can be told to stop (a failing command has its own tracker, RepeatTracker).
 const successRuns = new WeakMap<object, Map<string, number>>();
 const SUCCESS_REPEAT_LIMIT = 3;
+
+// Commands refused before running (a known install loop, an npm self-upgrade): how many per run. The model is told what to do
+// instead each time; when it proposes a blocked command again and again the run stops with the same explanation for the person.
+const blockedRuns = new WeakMap<object, number>();
+const BLOCKED_RUN_LIMIT = 3;
+
+// Questions the agent asked the person in this run (ask_user): capped by AGENT_MAX_QUESTIONS (default 3), see core/ask-user.ts.
+const askCounts = new WeakMap<object, number>();
+
+// Known failures (see known-fixes.ts): how often each fix was shown in this run. A fix that was shown KNOWN_FIX_SHOW_LIMIT times and
+// did not help ends the run with a plain explanation instead of more tries.
+const knownFixShown = new WeakMap<object, Map<string, number>>();
 
 async function confirm(message: string, detail?: string): Promise<boolean> {
   // Runs started from the dashboard are approved there; terminal runs keep the terminal prompt
@@ -328,6 +356,9 @@ export interface ExecutorResult {
   commandsRun: string[];
   // The user pressed Ctrl+C during a command; the team orchestrator stops instead of moving on.
   interrupted?: boolean;
+  // The last command that ran failed and nothing fixed it before the run ended. A parallel task with this flag is
+  // not "done": its dependents must not start on top of a red build or test.
+  unresolvedFailure?: boolean;
 }
 
 // Per-run bookkeeping used to catch a model's bad behavior (guessing paths,
@@ -343,6 +374,8 @@ interface SessionState {
   warnedDuplicatePaths: Set<string>;
   warnedUnknownDeps: Set<string>;
   warnedShrink: Set<string>;
+  // append_file chunks that restart the file, refused once (see core/append-guard.ts).
+  warnedRepeatAppend: Set<string>;
   // Lazily computed union of every package.json's dependencies.
   declaredDependencies: Set<string> | null;
   thinkingCalls: number;
@@ -357,6 +390,12 @@ interface SessionState {
   runsSinceWrite: number;
   // The latest command exited non-zero and nothing was written since.
   lastRunFailed: boolean;
+  // Set when auto-debug used up its attempts: the run ends with this report (see InterceptResult.halt).
+  haltMessage?: string;
+  // What the terminal prints when it ends the run (default: the auto-debug wording).
+  haltLabel?: string;
+  // How many times a review role tried a command it may not run.
+  readOnlyRefusals: number;
   failNudged: boolean;
   // Identical failures seen in this run (see run-feedback.ts).
   repeats: RepeatTracker;
@@ -369,6 +408,8 @@ interface SessionState {
   interrupted: boolean;
   // Id of the agent running in this session (used by the hooks).
   agentId: string;
+  // Catches an agent that goes in circles (see stall-guard.ts). null when switched off (AGENT_STALL_GUARD=0).
+  stall: StallGuard | null;
 }
 
 function newSessionState(): SessionState {
@@ -380,6 +421,7 @@ function newSessionState(): SessionState {
     warnedDuplicatePaths: new Set(),
     warnedUnknownDeps: new Set(),
     warnedShrink: new Set(),
+    warnedRepeatAppend: new Set(),
     declaredDependencies: null,
     thinkingCalls: 0,
     thinkingBudget: MAX_THINKING_CALLS,
@@ -394,8 +436,10 @@ function newSessionState(): SessionState {
     planUsed: false,
     planNudged: false,
     readOnly: false,
+    readOnlyRefusals: 0,
     interrupted: false,
     agentId: "agent",
+    stall: null,
   };
 }
 
@@ -405,6 +449,8 @@ export class Executor {
   private procs: ProcessManager;
   private search: SearchTool;
   private toolSchemas: ToolSchema[];
+  // The schemas ONE run advertises (see core/tool-select.ts): toolSchemas minus the groups the agent and task do not need.
+  private activeSchemas: ToolSchema[];
   private autoWrite: boolean;
   private autoRun: boolean;
   private warnedNoGit = false;
@@ -427,6 +473,7 @@ export class Executor {
     this.procs = new ProcessManager(this.workspaceRoot);
     this.search = new SearchTool(this.workspaceRoot);
     this.toolSchemas = [...BUILTIN_TOOL_SCHEMAS, ...(mcp?.schemas() ?? [])];
+    this.activeSchemas = this.toolSchemas;
   }
 
   // Toggling auto mode (/auto-write) switches files and commands together, as before.
@@ -455,6 +502,15 @@ export class Executor {
   // Shell commands run without asking (risky ones still ask).
   private autoRunEnabled(): boolean {
     return this.autoRun;
+  }
+
+  // package.json of a folder (relative to the workspace), for the install-loop checks; undefined when there is none or it is outside.
+  private readPackageJson(dir: string): string | undefined {
+    try {
+      return this.fs.readFile(path.posix.join(dir === "" ? "." : dir, "package.json"));
+    } catch {
+      return undefined;
+    }
   }
 
   // Normalizes a model-supplied path: forward slashes, no leading "./",
@@ -496,7 +552,7 @@ export class Executor {
   // Compact "name(arg, optionalArg?): description" list for models that cannot
   // receive a tools payload (no native tool calling).
   private toolReference(): string {
-    return this.toolSchemas
+    return this.activeSchemas
       .map((t) => {
         const params = t.parameters as { properties?: Record<string, unknown>; required?: string[] };
         const required = new Set(params.required ?? []);
@@ -509,10 +565,54 @@ export class Executor {
       .join("\n");
   }
 
-  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = ""): string {
-    const stack = loadKnowledge(stackPaths, STACK_KNOWLEDGE_CHARS);
-    const taskKnowledge = loadKnowledge(taskPaths, TASK_KNOWLEDGE_CHARS, "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
-    const toolNames = this.toolSchemas.map((t) => t.name).join(", ");
+  // Chars the request carries besides the messages: the tools payload (native tool calling only).
+  private toolsPayloadChars(): number {
+    return this.llm.nativeTools === false ? 0 : JSON.stringify(this.activeSchemas).length;
+  }
+
+  // What the whole prompt may use: the context window LM Studio loaded (AGENT_CONTEXT_WINDOW, or what the server said when it
+  // refused a prompt) minus room for the reply. See core/context-fit.ts.
+  private promptBudgetChars(): number {
+    const maxOut = Number(process.env.AI_MAX_TOKENS) || 8192;
+    return Math.floor(promptBudgetTokens(contextWindow(), maxOut) * charsPerToken());
+  }
+
+  // Trims the conversation to the budget: old tool output first, then the middle of the system prompt, then of the task.
+  private fitToWindow(messages: ChatMessage[], scale = 1): void {
+    const r = fitConversation(messages, Math.floor(this.promptBudgetChars() * scale), this.toolsPayloadChars());
+    if (r.clippedSystem || r.clippedFirstUser || r.stillOver) {
+      const text = `Prompt trimmed to fit the model's context window (${contextWindow()} tokens): ${Math.round(r.before / charsPerToken())} -> ${Math.round(r.after / charsPerToken())} tokens (estimate).${r.stillOver ? " It is still larger than the window: reload the model in LM Studio with a larger Context Length." : ""}`;
+      console.log(pc.yellow(`⚠ ${text}`));
+      bus.emit("log", { text, level: "warn" });
+    }
+  }
+
+  // One model call. When the server refuses the prompt because it is larger than the context window it loaded, the numbers in
+  // its answer are learned, the prompt is trimmed to the real window and the call is repeated (twice at most).
+  private async chatWithFit(messages: ChatMessage[]): Promise<LLMResponse> {
+    const tools = this.llm.nativeTools === false ? undefined : this.activeSchemas;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await this.llm.chat(messages, tools);
+        if (res.stats && !res.stats.promptEstimated) learnCharsPerToken(messagesChars(messages) + this.toolsPayloadChars(), res.stats.promptTokens);
+        return res;
+      } catch (err) {
+        if (!(err instanceof ContextOverflowError) || attempt >= 2) throw err;
+        learnWindow(err.contextTokens);
+        learnCharsPerToken(messagesChars(messages) + this.toolsPayloadChars(), err.promptTokens);
+        const text = `The prompt (${err.promptTokens ?? "?"} tokens) did not fit the model's context window (${err.contextTokens ?? "unknown"} tokens). Trimming it and trying again.`;
+        console.log(pc.yellow(`⚠ ${text}`));
+        bus.emit("log", { text, level: "warn" });
+        // Without the server's numbers, take 15% more off with every attempt.
+        this.fitToWindow(messages, err.contextTokens ? 1 : Math.pow(0.85, attempt + 1));
+      }
+    }
+  }
+
+  private buildSystemPrompt(agent: AgentDefinition, stackPaths: string[], taskPaths: string[] = [], projectContext = "", knowledgeShare = 1): string {
+    const stack = loadKnowledge(stackPaths, Math.floor(STACK_KNOWLEDGE_CHARS * knowledgeShare));
+    const taskKnowledge = loadKnowledge(taskPaths, Math.floor(TASK_KNOWLEDGE_CHARS * knowledgeShare), "TASK-SPECIFIC STANDARDS (chosen because of this task; follow them)");
+    const toolNames = this.activeSchemas.map((t) => t.name).join(", ");
     const native = this.llm.nativeTools !== false;
     const toolSection = native
       ? `You have access to these tools: ${toolNames}.\nIf your runtime does not support native tool calls, use these fenced-block formats instead.`
@@ -522,7 +622,11 @@ export class Executor {
             : ""
         }`;
 
-    return `${agent.systemPrompt}${stack}${taskKnowledge}${projectContext}
+    // The operating guidelines come first: how to work, before what the role is and what it knows. The block is the same for
+    // every building role, so the model server can reuse its cached prompt prefix across agents.
+    const guidelines = operatingGuidelines(agent.id);
+
+    return `${guidelines ? `${guidelines}\n\n---\n\n` : ""}${agent.systemPrompt}${stack}${taskKnowledge}${projectContext}
 
 ${toolSection}
 
@@ -530,6 +634,12 @@ Tools with simple arguments (read_file, read_multiple_files, get_directory_tree,
 \`\`\`action
 {"name": "get_directory_tree", "arguments": {"path": ".", "maxDepth": 4}}
 \`\`\`
+
+edit_file changes ONE exact piece of an existing file (use it instead of rewriting a whole file for a small change). Its arguments are short, so JSON is fine:
+\`\`\`action
+{"name": "edit_file", "arguments": {"path": "src/a.ts", "old_string": "return 1;", "new_string": "return 2;"}}
+\`\`\`
+old_string must match the file exactly and only once.
 
 write_file and append_file take RAW file content. Never JSON-encode it. Put the path on the opening fence line:
 \`\`\`write_file path/to/file.ts
@@ -542,7 +652,7 @@ If the file content itself contains triple backticks (e.g. a Markdown file), ope
 
 CRITICAL TOOL RULES:
 1. Map the project with ONE get_directory_tree call. Do not crawl with list_directory.
-2. Read-only tools (read_file, read_multiple_files, get_directory_tree, find_files, grep) may be batched: several in one turn is fine. write_file, append_file and run_command: exactly ONE per turn, then wait for the result.
+2. Read-only tools (read_file, read_multiple_files, get_directory_tree, find_files, grep) may be batched: several in one turn is fine. write_file, append_file, edit_file and run_command: exactly ONE per turn, then wait for the result.
 3. Long files: write_file with the first ~150 lines, then append_file with chunks of ~150 lines until done. Never abbreviate with placeholders like "// ... rest of file".
 4. read_file returns the whole file unless it says TRUNCATED. You must read an existing file COMPLETELY before overwriting it, and then send its full new content.
 5. You must inspect a directory (get_directory_tree or list_directory) before creating a new file inside it.
@@ -641,6 +751,11 @@ When you are done and have no more actions to take, reply normally with a final 
     state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
     state.readOnly = Boolean(agent.readOnly);
     state.agentId = agent.id;
+    state.stall = stallGuardEnabled() ? new StallGuard(stallOptionsFor(agent.id)) : null;
+    this.activeSchemas = selectToolSchemas(this.toolSchemas, agent.id, `${task}\n${extraContext ?? ""}`);
+    if (this.activeSchemas.length < this.toolSchemas.length) {
+      console.log(pc.dim(`Tools for this run: ${this.activeSchemas.length} of ${this.toolSchemas.length} (the rest are not needed for this task; AGENT_TOOL_TRIM=0 sends all).`));
+    }
 
     const stackPaths = detectStackKnowledge(this.workspaceRoot, agent.id);
     if (stackPaths.length) {
@@ -688,18 +803,29 @@ When you are done and have no more actions to take, reply normally with a final 
       console.log(pc.dim("Project rules loaded from AGENTS.md / CLAUDE.md"));
       logLine("Project rules loaded from AGENTS.md / CLAUDE.md");
     }
-    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext);
-
     // Ground the agent in reality before it can guess: show the real tree as the
     // first thing it sees, so a small local model can't hallucinate a layout.
     const bootstrapTree = this.readTree(".", 2, state);
+    let firstUserContent = `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}${this.existingPlanNote()}`;
+
+    // The standards are the part of the prompt that can shrink: when rules, role text, tools and the task already use most of
+    // the context window, they get a smaller share (see core/context-fit.ts). With a roomy window they are loaded in full.
+    const wantedKnowledge = (stackPaths.length ? STACK_KNOWLEDGE_CHARS : 0) + (taskPaths.length ? TASK_KNOWLEDGE_CHARS : 0);
+    // The standards keep at least 40% of what they want (versions, recipes and exact commands save a build from guessing):
+    // when that does not fit, the middle of the task text gives way first.
+    const otherFixedChars = agent.systemPrompt.length + 9000 + projectContext.length + this.toolsPayloadChars();
+    const alloc = allocateFirstRequest(this.promptBudgetChars(), otherFixedChars, firstUserContent.length, wantedKnowledge);
+    if (alloc.userMaxChars !== null) {
+      firstUserContent = clipMiddle(firstUserContent, alloc.userMaxChars, 0.7);
+      console.log(pc.dim(`Task text shortened to ${alloc.userMaxChars} characters so the standards keep their share of the context window (${contextWindow()} tokens).`));
+    }
+    const share = alloc.share;
+    if (share < 1) console.log(pc.dim(`Standards shortened to ${Math.round(share * 100)}% to fit the model's context window (${contextWindow()} tokens).`));
+    const systemPrompt = this.buildSystemPrompt(agent, stackPaths, taskPaths, projectContext, share);
 
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `Project tree (path ".", depth 2):\n${bootstrapTree}\n\nTask: ${task}${extraContext ? `\n\n${extraContext}` : ""}${this.existingPlanNote()}`,
-      },
+      { role: "user", content: firstUserContent },
     ];
 
     let steps = 0;
@@ -707,13 +833,24 @@ When you are done and have no more actions to take, reply normally with a final 
 
     while (steps < this.maxSteps) {
       steps++;
+      // Cancelled from outside (Ctrl+C on a parallel team run): stop before spending another model call.
+      if (this.hooks.cancelled?.()) {
+        return {
+          finalMessage: "Stopped by the user (Ctrl+C).",
+          stepsTaken: steps - 1,
+          filesWritten: state.filesWritten,
+          commandsRun: state.commandsRun,
+          interrupted: true,
+        };
+      }
       this.compactHistory(messages);
+      this.fitToWindow(messages);
       // Updates from the other agents (parallel runs only): what they wrote or published since the last step.
       const teamUpdate = this.hooks.teamUpdates?.(state.agentId);
       if (teamUpdate) messages.push({ role: "user", content: teamUpdate });
       // Models without a tool template get no tools payload (they use fenced blocks).
       bus.emit("llm_request", { step: steps });
-      const response = await this.llm.chat(messages, this.llm.nativeTools === false ? undefined : this.toolSchemas);
+      const response = await this.chatWithFit(messages);
       if (response.content.trim()) {
         bus.emit("agent_thinking", {
           source: "reply",
@@ -804,13 +941,17 @@ When you are done and have no more actions to take, reply normally with a final 
         if (state.lastRunFailed && !state.readOnly && !state.failNudged && nudges < MAX_NUDGES) {
           nudges++;
           state.failNudged = true;
-          console.log(pc.dim("\n(The last command failed — asking the agent to fix it or report it honestly.)"));
+          console.log(pc.dim("\n(The last command failed — asking the agent to find the cause and fix it.)"));
           messages.push({ role: "assistant", content: response.content });
           messages.push({
             role: "user",
             content:
-              "Your last command FAILED (non-zero exit) and you have not changed anything since. Either fix the cause and run it again, " +
-              "or make your final answer say clearly that it still fails, with the error. Do not describe the work as done.",
+              "Your last command FAILED (non-zero exit) and nothing has changed since. Do not summarize and do not apologize. " +
+              "1) Write the one line of the error that matters. 2) If the cause is not obvious from the output and the files you read, search for it: " +
+              "web_search with the exact error text and the tool and version (for example the Next.js, Prisma or Zod version from package.json), " +
+              "or read the package's own documentation or type definitions in the project. " +
+              "3) Apply the fix with write_file, then run the same command again. Only stop when the command passes or the cause is something " +
+              "only the person can change (a missing database, credentials, a tool that is not installed); then say exactly what is needed.",
           });
           continue;
         }
@@ -846,7 +987,8 @@ When you are done and have no more actions to take, reply normally with a final 
         const noWritesAtAll = state.filesWritten.length === 0 && state.commandsRun.length === 0;
         const partialFalseClaim = claimsCompletion && unfulfilledMentions.length > 0;
 
-        if (((claimsCompletion && noWritesAtAll) || partialFalseClaim) && nudges < MAX_NUDGES) {
+        // A review role never writes, so "you mentioned files you did not write" is wrong for it: its report names the files it READ.
+        if (!state.readOnly && ((claimsCompletion && noWritesAtAll) || partialFalseClaim) && nudges < MAX_NUDGES) {
           nudges++;
           const detail = partialFalseClaim
             ? `You mentioned these file(s) but never actually called write_file for them: ${unfulfilledMentions.join(", ")}.`
@@ -872,6 +1014,7 @@ When you are done and have no more actions to take, reply normally with a final 
           filesWritten: state.filesWritten,
           commandsRun: state.commandsRun,
           interrupted: state.interrupted,
+          unresolvedFailure: state.lastRunFailed && !state.readOnly,
         };
       }
 
@@ -883,7 +1026,22 @@ When you are done and have no more actions to take, reply normally with a final 
         bus.emit("tool_running", { callId: calls[i].id, tool: calls[i].name, args: truncate(calls[i].arguments, 1500) });
         const rawResult = await this.handleToolCall(calls[i], state, response.finishReason === "length");
         bus.emit("tool_result", { callId: calls[i].id, ok: toolSucceeded(rawResult), preview: truncate(rawResult, 1500) });
-        const result = clip(rawResult);
+        let result = clip(rawResult);
+
+        // Going in circles: the same few steps over and over with nothing written in between. Warn the model, then stop the run.
+        const stallEvent = state.stall ? classifyCall(calls[i].name, calls[i].arguments, rawResult) : null;
+        if (state.stall && stallEvent) {
+          const verdict = state.stall.record(stallEvent);
+          if (verdict.level === "warn" && verdict.message) {
+            console.log(pc.yellow(`\n(Stall guard: ${verdict.message.slice(0, 110)}...)`));
+            logLine("Stall guard: the agent is repeating the same steps; told it to change approach.", "warn");
+            result += `\n\n${verdict.message}`;
+          } else if (verdict.level === "stop" && verdict.message && !state.haltMessage) {
+            logLine("Stall guard: the agent kept repeating the same steps; stopping the run.", "warn");
+            state.haltMessage = verdict.message;
+            state.haltLabel = "\u{1F501} Stopped: the agent was going in circles.";
+          }
+        }
 
         // Once a write has succeeded the content lives on disk. Drop it from the
         // history (it would otherwise be re-sent to the model on every later turn,
@@ -906,6 +1064,19 @@ When you are done and have no more actions to take, reply normally with a final 
             : "";
         messages.push({ role: "tool", content: result + notice, toolCallId: calls[i].id });
 
+        // The automatic debug attempts are used up: stop here with the triage report. No further attempt, no 6th run.
+        if (state.haltMessage) {
+          console.log(pc.red(`\n${state.haltLabel ?? "🚨 Automatic debugging gave up; stopping with a triage report."}`));
+          console.log(pc.bold("\nAgent:"), state.haltMessage);
+          return {
+            finalMessage: state.haltMessage,
+            stepsTaken: steps,
+            filesWritten: state.filesWritten,
+            commandsRun: state.commandsRun,
+            unresolvedFailure: true,
+          };
+        }
+
         if (state.interrupted) {
           console.log(pc.yellow("\n⏹ Stopped: you interrupted the running command. Tell the agent how to continue."));
           return {
@@ -925,6 +1096,7 @@ When you are done and have no more actions to take, reply normally with a final 
       filesWritten: state.filesWritten,
       commandsRun: state.commandsRun,
       interrupted: state.interrupted,
+      unresolvedFailure: state.lastRunFailed && !state.readOnly,
     };
   }
 
@@ -1064,6 +1236,13 @@ When you are done and have no more actions to take, reply normally with a final 
         if (state.readOnly) return READ_ONLY_REFUSAL;
         return this.handleWrite(true, args, state);
 
+      case "edit_file":
+        if (state.readOnly) return READ_ONLY_REFUSAL;
+        return this.handleEdit(args, state);
+
+      case ASK_USER_TOOL:
+        return this.handleAskUser(args, state);
+
       // Web tools (src/tools/web-search.tool.ts): they log their own progress and never throw.
       case "web_search":
         return runWebSearch(args);
@@ -1148,9 +1327,35 @@ When you are done and have no more actions to take, reply normally with a final 
         const command = String(args.command ?? "");
         if (!command.trim()) return 'TOOL ERROR: run_command requires a non-empty "command".';
 
+        // Known loops and dead ends are refused BEFORE they run (an `npm install` that starts itself forever, `npm install -g npm@latest`).
+        const advice = adviseBeforeRun(command, (dir) => this.readPackageJson(dir));
+        if (advice) {
+          const blocked = (blockedRuns.get(state) ?? 0) + 1;
+          blockedRuns.set(state, blocked);
+          console.log(pc.yellow(`\n🩺 Not running this command: ${advice.diagnosis.summary}`));
+          logLine(`Command not run: ${advice.diagnosis.summary}`, "warn");
+          if (blocked >= BLOCKED_RUN_LIMIT) {
+            state.haltMessage = haltText(advice.diagnosis);
+            state.haltLabel = "🩺 Stopped: a blocked command was proposed again and again.";
+          }
+          return advice.refuse;
+        }
+
         const diagnostic = state.autoDiagnostics && isSafeDiagnostic(command);
         if (state.readOnly && !diagnostic) {
-          return "TOOL ERROR: this is a review role: only read-only commands (git status, git diff, git log, ls, ...) are allowed. Do not try to change anything; report what you find.";
+          state.readOnlyRefusals++;
+          const base = "TOOL ERROR: this is a review role: only read-only commands (git status, git diff, git log, ls, ...) are allowed. echo, cat, builds, installs and servers are refused. Do not try to change or run anything; report what you find.";
+          if (state.readOnlyRefusals >= 4) {
+            // The reviewer is looping on refused commands: end it now instead of burning every step it has.
+            state.haltLabel = "\u{1F6D1} The reviewer kept trying commands a review role may not run; ending its review.";
+            state.haltMessage =
+              "VERDICT: UNKNOWN\nBLOCKERS:\n- none established\nWARNINGS:\n- The reviewer kept trying commands a read-only role may not run and never finished its review. Treat these changes as UNREVIEWED.\nCHECKED: incomplete";
+            return base;
+          }
+          if (state.readOnlyRefusals >= 2) {
+            return `${base} You have now been refused ${state.readOnlyRefusals} times. STOP running commands. Write your final answer NOW from what you have already read, ending with VERDICT: PASS or VERDICT: FAIL in the required format.`;
+          }
+          return base;
         }
         const autoRun = !diagnostic && this.autoRunEnabled() && !isDangerousCommand(command) && !escapesWorkspace(command, this.workspaceRoot);
         if (autoRun) {
@@ -1185,6 +1390,8 @@ When you are done and have no more actions to take, reply normally with a final 
         const timeoutMs = clampTimeoutMs(args.timeout_seconds, command);
         console.log(pc.dim(`(Ctrl+C stops this command; limit ${formatElapsed(Math.round(timeoutMs / 1000))})`));
         const stopWatching = watchForInterrupt();
+        // An install that starts itself again and again is stopped after the third repeat instead of running for minutes.
+        const loopWatch = new LoopWatch();
         let result: Awaited<ReturnType<ShellTool["runAsync"]>>;
         try {
           result = await this.shell.runAsync(
@@ -1195,6 +1402,11 @@ When you are done and have no more actions to take, reply normally with a final 
               bus.emit("tool_output", { callId, chunk: truncate(text, 2000) });
             },
             (sec) => console.log(pc.dim(`\n⏳ still running, ${formatElapsed(sec)} so far (Ctrl+C stops it)`)),
+            undefined,
+            (text) => {
+              const loop = loopWatch.feed(text);
+              return loop ? `the install step "${loop.pkg} ${loop.script}" (${loop.command}) started itself ${loop.count} times in a row` : null;
+            },
           );
         } finally {
           stopWatching();
@@ -1202,18 +1414,62 @@ When you are done and have no more actions to take, reply normally with a final 
         console.log();
         if (result.interrupted) state.interrupted = true;
         state.commandsRun.push(command);
-        state.runsSinceWrite++;
-        if (!diagnostic) state.heavyRuns++;
+        // Looking is not verifying: echo / ls / cat / git status after a change must not satisfy the verify gate.
+        // (A real run auto-ran 78 `echo "... complete"` commands and passed the gate with them.)
+        const inspectOnly = isInspectCommand(command);
+        if (!inspectOnly) state.runsSinceWrite++;
+        if (!diagnostic && !inspectOnly) state.heavyRuns++;
 
         // A failed run: a short list of the failing lines (the middle of a long log is cut), and a stop signal when
         // the same failure keeps coming back.
         const failed = !result.timedOut && !result.interrupted && result.exitCode !== 0;
         state.lastRunFailed = failed;
+        if (result.aborted) {
+          console.log(pc.yellow(`\n⛔ Stopped this command: ${result.aborted}.`));
+          logLine(`Command stopped by the watchdog: ${result.aborted}.`, "warn");
+        }
+
+        // Known environment problems (an install loop, a Node/npm version mismatch) are explained from the real output and
+        // package.json, not left to the model's guess. When only the person can fix it, the run ends with plain instructions.
+        const diagnosis = failed
+          ? diagnoseFailure({
+              command,
+              output: result.output,
+              nodePath: process.execPath,
+              nodeVersion: process.version,
+              readPackageJson: (dir) => this.readPackageJson(dir),
+            })
+          : null;
+        if (diagnosis) {
+          console.log(pc.yellow(`\n🩺 ${diagnosis.summary}`));
+          logLine(`Diagnosis: ${diagnosis.summary}`, "warn");
+          if (diagnosis.userMustAct) {
+            state.haltMessage = haltText(diagnosis);
+            state.haltLabel = "🩺 Stopped: this needs a change on your computer, outside the project.";
+          }
+        }
+        // A failure the agent has met before comes with its exact fix: no debug run, no investigation.
+        const knownFixes = failed && !diagnosis ? matchKnownFixes(command, result.output) : [];
+        if (knownFixes.length) {
+          const shown = knownFixShown.get(state) ?? new Map<string, number>();
+          knownFixShown.set(state, shown);
+          for (const fix of knownFixes) {
+            const n = (shown.get(fix.id) ?? 0) + 1;
+            shown.set(fix.id, n);
+            console.log(pc.yellow(`\n\u{1F9E9} Known problem: ${fix.title}`));
+            logLine(`Known problem: ${fix.title}`, "warn");
+            if (n >= KNOWN_FIX_SHOW_LIMIT && !state.haltMessage) {
+              state.haltMessage = knownFixStopText(fix, command);
+              state.haltLabel = "\u{1F9E9} Stopped: a known problem keeps coming back.";
+            }
+          }
+        }
         const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
         const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
+        if (!failed) state.repeats.clear();
         if (repeatCount >= REPEAT_LIMIT) {
-          console.log(pc.yellow(`\n(Same failure ${repeatCount} times — telling the agent to stop and report.)`));
-          logLine(`Same failure ${repeatCount} times: telling the agent to stop and report.`, "warn");
+          console.log(pc.yellow(`\n(Same failure ${repeatCount} times — the run will stop unless auto-debug verifies a fix.)`));
+          logLine(`Same failure ${repeatCount} times: stopping unless auto-debug verifies a fix.`, "warn");
         }
 
         // The same command succeeding again and again (nothing written in between) is a loop, not progress.
@@ -1233,10 +1489,22 @@ When you are done and have no more actions to take, reply normally with a final 
         }
 
         // Reactive debugging: the agent is paused here until the interceptor (Debug Agent) is done.
-        let autoDebug: { note: string; verified: boolean } | null = null;
-        if (failed && this.hooks.commandInterceptor) {
+        let autoDebug: { note: string; verified: boolean; halt?: string } | null = null;
+        // A diagnosed failure is not a code bug the Debug Agent could patch: it would only burn its attempts on it.
+        if (failed && !diagnosis && knownFixes.length === 0 && this.hooks.commandInterceptor) {
           autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, command, output: result.output, exitCode: result.exitCode });
-          if (autoDebug?.verified) state.lastRunFailed = false;
+          if (autoDebug?.verified) {
+            state.lastRunFailed = false;
+            state.repeats.clear();
+          }
+          if (autoDebug?.halt) state.haltMessage = autoDebug.halt;
+        }
+
+        // Repeat warnings alone relied on the model to obey an instruction. A local model can ignore that nudge and
+        // keep overwriting the same file, so enforce the stop after auto-debug has had its bounded chance to verify a fix.
+        if (repeatCount >= REPEAT_LIMIT && !autoDebug?.verified && !state.haltMessage) {
+          state.haltMessage = repeatedFailureReport(command, result.output, repeatCount);
+          state.haltLabel = "🛑 Stopped: the same command failure repeated without a verified fix.";
         }
 
         return JSON.stringify({
@@ -1245,7 +1513,15 @@ When you are done and have no more actions to take, reply normally with a final 
           ...(failureSummary ? { failureSummary } : {}),
           ...(repeatCount >= REPEAT_LIMIT && !autoDebug?.verified ? { note: repeatNote(repeatCount) } : {}),
           ...(autoDebug ? { autoDebug: autoDebug.note } : {}),
+          ...(diagnosis ? { diagnosis: formatDiagnosis(diagnosis) } : {}),
+          ...(knownFixes.length ? { knownFix: formatKnownFixes(knownFixes) } : {}),
           ...(successNote ? { note: successNote } : {}),
+          ...(result.aborted
+            ? {
+                aborted: true,
+                note: `The agent stopped this command because ${result.aborted}. Do not run it again until the cause is fixed: read "diagnosis" and follow it.`,
+              }
+            : {}),
           ...(result.interrupted
             ? {
                 interrupted: true,
@@ -1295,7 +1571,61 @@ When you are done and have no more actions to take, reply normally with a final 
     return d;
   }
 
+  /** ask_user: one short question to the person (terminal or dashboard). Never blocks an unattended run. */
+  private async handleAskUser(args: Record<string, any>, state: SessionState): Promise<string> {
+    const parsed = parseAskArgs(args);
+    if (!parsed.ok) return `TOOL ERROR: ${parsed.error}`;
+    const used = askCounts.get(state) ?? 0;
+    const max = maxQuestions();
+    if (used >= max) return limitReached(used, max);
+    if (!canAskUser(bus.origin(), Boolean(process.stdin.isTTY))) {
+      console.log(pc.dim(`\nThe agent has a question but nobody can answer (no terminal): ${parsed.value.question}`));
+      return unattendedAnswer(parsed.value);
+    }
+    askCounts.set(state, used + 1);
+    const raw = await askUser(parsed.value);
+    return formatAnswer(raw, parsed.value);
+  }
+
+  /**
+   * edit_file: replace one exact piece of an existing file. The new file content is built here and sent through
+   * handleWriteInner, so every write gate (approval and diff, placeholder check, package.json guard, hooks) still applies.
+   */
+  private async handleEdit(args: Record<string, any>, state: SessionState): Promise<string> {
+    const p = this.np(args.path);
+    if (!p || p === ".") return `TOOL ERROR: edit_file requires a file "path".`;
+    if (isSecretPath(p)) return `TOOL ERROR: editing ${p} is blocked (secret env file).`;
+    if (this.fs.isDirectory(p) || !this.fs.fileExists(p)) {
+      return `TOOL ERROR: edit_file only changes a file that already exists, and ${p} was not found. Use write_file to create a new file.`;
+    }
+    const replaceAll = args.replace_all === true || args.replace_all === "true";
+    const r = applyEdit(this.fs.readFile(p), args.old_string, args.new_string, replaceAll);
+    if (!r.ok) {
+      console.log(pc.yellow(`\n✖ edit_file refused: ${r.error.split("\n")[0].slice(0, 300)}`));
+      return `TOOL ERROR: ${r.error}`;
+    }
+    // An exact match proves the model knows this part of the file, so write_file's "read the whole file first" gate does not apply.
+    state.filesRead.add(p);
+    const result = await this.handleWriteInner(false, { path: p, content: r.content }, state);
+    if (result.startsWith("File written:")) {
+      const head = /^File written: \S+ \(\d+ lines\)\./.exec(result)?.[0] ?? `File written: ${p}.`;
+      return `${head} Edited ${r.replaced} place${r.replaced === 1 ? "" : "s"}, the first at line ${r.firstLine}. Run the check that covers this file before the next change.`;
+    }
+    if (result.startsWith("TOOL ERROR")) console.log(pc.yellow(`\n✖ edit_file refused: ${result.split("\n")[0].replace(/^TOOL ERROR:\s*/, "").slice(0, 300)}`));
+    return result;
+  }
+
+  /** Runs a write and shows a refusal in the terminal, so a file that never appears has a visible reason in the log. */
   private async handleWrite(append: boolean, args: Record<string, any>, state: SessionState): Promise<string> {
+    const result = await this.handleWriteInner(append, args, state);
+    if (result.startsWith("TOOL ERROR")) {
+      const first = result.split("\n")[0].replace(/^TOOL ERROR:\s*/, "");
+      console.log(pc.yellow(`\n✖ ${append ? "append_file" : "write_file"} refused: ${first.length > 300 ? `${first.slice(0, 300)}…` : first}`));
+    }
+    return result;
+  }
+
+  private async handleWriteInner(append: boolean, args: Record<string, any>, state: SessionState): Promise<string> {
     const toolName = append ? "append_file" : "write_file";
     const p = this.np(args.path);
 
@@ -1319,6 +1649,12 @@ When you are done and have no more actions to take, reply normally with a final 
         "Placeholders replace real code with nothing. Write the complete real content instead; for long files use " +
         "write_file with the first ~150 lines and append_file for the remaining chunks."
       );
+    }
+
+    // A package.json whose install-time script starts another install would make `npm install` run itself forever.
+    if (path.posix.basename(p) === "package.json") {
+      const loop = refuseRecursiveInstallScript(content);
+      if (loop) return loop;
     }
 
     if (append) return this.handleAppend(p, content, exists, state);
@@ -1422,6 +1758,20 @@ When you are done and have no more actions to take, reply normally with a final 
   private async handleAppend(p: string, content: string, exists: boolean, state: SessionState): Promise<string> {
     if (!exists || !state.filesWritten.includes(p)) {
       return `TOOL ERROR: append_file only continues a file you already created or overwrote with write_file in this session (${p} is not one). Use write_file first.`;
+    }
+
+    // A chunk that starts the file over would glue a second copy to the first (duplicate declarations, a build that cannot pass).
+    // Refused once; the same chunk sent again is allowed, in case the repeat is intended.
+    if (repeatsEarlierContent(this.fs.readFile(p), content)) {
+      const key = `${p}:${content.length}`;
+      if (!state.warnedRepeatAppend.has(key)) {
+        state.warnedRepeatAppend.add(key);
+        return (
+          `TOOL ERROR: refused to append to ${p}: the first lines of this chunk are already in the file, so it looks like you sent the file from the top again. ` +
+          `Do NOT send the file again. Send ONLY the lines that come after the end of the file. It currently ends with:\n${this.tailOf(p)}\n` +
+          "If you really mean to repeat this block, send the same append_file again and it will be allowed."
+        );
+      }
     }
 
     const lines = content.split("\n");

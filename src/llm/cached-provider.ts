@@ -29,6 +29,10 @@ export class CachedLLMProvider implements LLMProvider {
   }
 
   async chat(messages: ChatMessage[], tools?: ToolSchema[], options?: ChatOptions): Promise<LLMResponse> {
+    // noCache: the caller validates the answer afterwards (team planner) and may reject it. A cache hit would replay
+    // the same rejected answer on every identical request, so such calls neither read nor write the cache.
+    if (options?.noCache) return this.baseProvider.chat(messages, tools, options);
+
     // The salt covers everything besides the messages that changes the answer: the model,
     // the tool protocol, the sampling settings and per-call overrides. Switching any of them
     // can therefore never replay another configuration's answer.

@@ -21,6 +21,11 @@ export interface InterceptResult {
   note: string;
   /** True when the failed command was re-run and now succeeds: the failure no longer counts. */
   verified: boolean;
+  /**
+   * Set when the automatic debug attempts for this command are used up: the executor stops the run at once (no further
+   * attempt, no further tool call) and returns this text, a "Project Failure & Triage Report", as the final message.
+   */
+  halt?: string;
 }
 
 export interface ExecutorHooks {
@@ -34,4 +39,6 @@ export interface ExecutorHooks {
   teamUpdates?(agentId: string): string;
   /** True: there is nobody to answer approval prompts (parallel runs). Commands that would ask are declined instead. */
   unattended?: boolean;
+  /** Checked before every model request. True: the run was cancelled from outside (Ctrl+C on a parallel team run); stop now. */
+  cancelled?(): boolean;
 }

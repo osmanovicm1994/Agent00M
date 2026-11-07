@@ -21,5 +21,5 @@ editing them, and always propose full-file content for write_file.` +
       "02-qa-automation/appium-standards.md",
       "02-qa-automation/appium-csharp.md",
       "02-qa-automation/playwright-standards.md",
-    ]),
+    ], 13_800), // about 13.2 KB; at the old 9000 the C# and Playwright standards were cut
 };
