@@ -110,6 +110,9 @@ function interventions(failure: Failure, command: string): string[] {
     case "module-not-found":
       return ["Should the missing module be installed from a package (name and version?) or is it an alias or file path that exists on your side?"];
     case "typescript":
+      return [
+        `\`${command}\` still reports type errors in several files (the first one is in the output above). Which files should the agent fix first, or is a decision needed before it can (which auth approach: next-auth or the project's own session helper; how the Prisma client is created; which Next.js or Zod major to target)?`,
+      ];
     case "build":
     case "test":
       return [

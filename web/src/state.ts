@@ -1,8 +1,13 @@
 import type { AgentEvent, AgentInfo, FileEntry, SettingsState } from "./protocol";
+import { extractLocalUrls, mergeUrls } from "./preview/helpers";
 
-const FEED_LIMIT = 800;
-const OUTPUT_LIMIT = 20_000;
+// The Live screen shows everything the agent did, so these are generous. Older items fall off the front.
+const FEED_LIMIT = 5000;
+const OUTPUT_LIMIT = 300_000;
 const USAGE_LIMIT = 600;
+// How long a file counts as "just changed" in the tree, and how many such files are remembered.
+const CHANGED_TTL_MS = 5 * 60_000;
+const CHANGED_MAX = 500;
 
 export type ToolStatus = "running" | "ok" | "error";
 
@@ -111,6 +116,14 @@ export interface DashboardState {
   usage: UsageEntry[];
   // Project folder listing, filled after a list_files request.
   files: FileTree | null;
+  // Files the watcher reported as changed (path -> time), newest within the last few minutes.
+  changed: Record<string, number>;
+  // Counts every files_changed push, so panels can react to "something changed" without comparing objects.
+  changeTick: number;
+  // Key of the design-preview route (GET /preview/<key>/...). Null until the server sent it (needs the token).
+  previewKey: string | null;
+  // Local dev-server addresses seen in command output (newest first), offered in the Preview panel.
+  devUrls: string[];
 }
 
 export const initialState: DashboardState = {
@@ -131,6 +144,10 @@ export const initialState: DashboardState = {
   settings: null,
   usage: [],
   files: null,
+  changed: {},
+  changeTick: 0,
+  previewKey: null,
+  devUrls: [],
 };
 
 export type Action =
@@ -140,6 +157,8 @@ export type Action =
   | { type: "event"; event: AgentEvent }
   | { type: "busy"; busy: boolean }
   | { type: "files"; tree: FileTree }
+  | { type: "files_changed"; paths: string[]; at: number }
+  | { type: "preview_key"; key: string }
   | { type: "settings"; settings: SettingsState }
   | { type: "notice"; level: "info" | "error"; text: string }
   | { type: "dismiss_notice" };
@@ -280,15 +299,24 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
         }),
       };
 
-    case "tool_output":
-      return {
-        ...state,
-        feed: state.feed.map((item) =>
-          item.kind === "tool" && item.callId === e.payload.callId
-            ? { ...item, output: (item.output + e.payload.chunk).slice(-OUTPUT_LIMIT) }
-            : item,
-        ),
-      };
+    case "tool_output": {
+      // The running tool is almost always one of the newest items: search from the end.
+      let at = -1;
+      for (let i = state.feed.length - 1; i >= 0; i--) {
+        const item = state.feed[i];
+        if (item.kind === "tool" && item.callId === e.payload.callId) {
+          at = i;
+          break;
+        }
+      }
+      const urls = extractLocalUrls(e.payload.chunk);
+      const devUrls = urls.length > 0 ? mergeUrls(state.devUrls, urls) : state.devUrls;
+      if (at < 0) return devUrls === state.devUrls ? state : { ...state, devUrls };
+      const target = state.feed[at] as Extract<FeedItem, { kind: "tool" }>;
+      const feed = state.feed.slice();
+      feed[at] = { ...target, output: (target.output + e.payload.chunk).slice(-OUTPUT_LIMIT) };
+      return { ...state, feed, devUrls };
+    }
 
     case "tool_result":
       return {
@@ -362,16 +390,32 @@ export function applyEvent(state: DashboardState, e: AgentEvent): DashboardState
   }
 }
 
+// Adds freshly changed files and forgets old ones.
+function mergeChanged(current: Record<string, number>, paths: string[], at: number): Record<string, number> {
+  const next: Record<string, number> = {};
+  for (const [p, t] of Object.entries(current)) if (at - t < CHANGED_TTL_MS) next[p] = t;
+  for (const p of paths) next[p] = at;
+  const keys = Object.keys(next);
+  if (keys.length > CHANGED_MAX) {
+    keys.sort((a, b) => next[a] - next[b]);
+    for (const k of keys.slice(0, keys.length - CHANGED_MAX)) delete next[k];
+  }
+  return next;
+}
+
 export function reducer(state: DashboardState, action: Action): DashboardState {
   switch (action.type) {
     case "connection":
       return { ...state, connected: action.connected };
     case "hello":
       // A (re)connect replays the server's history from scratch, so start from a clean slate
-      // (the project tree is kept: it does not depend on the event history).
+      // (the project tree and preview key are kept: they do not depend on the event history).
       return action.history.reduce(applyEvent, {
         ...initialState,
         files: state.files,
+        changed: state.changed,
+        changeTick: state.changeTick,
+        previewKey: state.previewKey,
         team: state.team,
         settings: state.settings,
         connected: true,
@@ -388,6 +432,10 @@ export function reducer(state: DashboardState, action: Action): DashboardState {
       return { ...state, busy: action.busy };
     case "files":
       return { ...state, files: action.tree };
+    case "files_changed":
+      return { ...state, changed: mergeChanged(state.changed, action.paths, action.at), changeTick: state.changeTick + 1 };
+    case "preview_key":
+      return { ...state, previewKey: action.key };
     case "settings":
       return { ...state, team: action.settings.team, settings: action.settings };
     case "notice":

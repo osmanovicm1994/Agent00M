@@ -1,20 +1,26 @@
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactElement, type ReactNode } from "react";
 import { useAgentSocket } from "./useAgentSocket";
 import { AgentRail } from "./components/AgentRail";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { FilesPanel } from "./components/FilesPanel";
+import { GuidePanel } from "./components/GuidePanel";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { LiveFeed } from "./components/LiveFeed";
+import { PreviewPanel, type PreviewTarget } from "./components/PreviewPanel";
 import { RunHeader } from "./components/RunHeader";
+import { SettingsHub } from "./components/SettingsHub";
 import { SetupPanel } from "./components/SetupPanel";
 import { StackPanel } from "./components/StackPanel";
 import { TaskComposer } from "./components/TaskComposer";
 import { ThinkingPanel } from "./components/ThinkingPanel";
 import { TokenPanel } from "./components/TokenPanel";
-import { GuidePanel } from "./components/GuidePanel";
-import { SettingsScreen } from "./components/SettingsScreen";
+import { TreePanel } from "./components/TreePanel";
+import { AgentsIcon, LiveIcon, MoreIcon, ProjectIcon, PromptIcon } from "./components/icons";
+import { Workspace } from "./layout/Workspace";
+import { useLayout } from "./layout/useLayout";
+import { FILL_PANELS, hasPanel, PANEL_IDS, PANEL_TITLES, PRESETS, type PanelId } from "./layout/model";
 import { useNotifications } from "./notifications";
-import { AgentsIcon, HistoryIcon, LiveIcon, MoreIcon, ProjectIcon, PromptIcon } from "./components/icons";
+import { loadIgnoreText, parseIgnoreText, saveIgnoreText } from "./prefs";
 import {
   clearRuns,
   forgetToken,
@@ -70,34 +76,73 @@ function readToken(): string | undefined {
 const TOKEN = readToken();
 const WS_URL = TOKEN ? `${WS_BASE}?token=${encodeURIComponent(TOKEN)}` : WS_BASE;
 
-// agents / prompt / project make up the Monitor (all three side by side on a wide screen, one at a time on a phone).
-// live, history and stack are screens of their own.
-// settings (notifications) and guide (the prompting tutorial) are screens of their own too.
-type View = "agents" | "live" | "prompt" | "project" | "history" | "stack" | "settings" | "guide";
-const MONITOR_VIEWS: View[] = ["agents", "prompt", "project"];
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
 
-const MOBILE_TABS: { id: View; label: string; icon: () => ReactElement }[] = [
-  { id: "agents", label: "Agents", icon: AgentsIcon },
+// Phone: one panel at a time, chosen with the bottom bar. "More" holds the rest.
+const MORE_PANELS: PanelId[] = ["status", "tokens", "history", "settings", "stack", "guide"];
+
+const PreviewIcon = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    <rect x="3" y="4" width="18" height="13" rx="2" />
+    <path d="M8 21h8M12 17v4" />
+  </svg>
+);
+
+const MOBILE_TABS: { id: PanelId; label: string; icon: () => ReactElement }[] = [
   { id: "live", label: "Live", icon: LiveIcon },
   { id: "prompt", label: "Prompt", icon: PromptIcon },
-  { id: "project", label: "Project", icon: ProjectIcon },
-  { id: "history", label: "History", icon: HistoryIcon },
+  { id: "tree", label: "Project", icon: ProjectIcon },
+  { id: "preview", label: "Preview", icon: PreviewIcon },
+  { id: "agents", label: "Agents", icon: AgentsIcon },
   { id: "settings", label: "More", icon: MoreIcon },
 ];
 
-const DESKTOP_TABS: { id: View; label: string }[] = [
-  { id: "agents", label: "Monitor" },
-  { id: "live", label: "Live" },
-  { id: "history", label: "History" },
-  { id: "stack", label: "Stack" },
-  { id: "guide", label: "Guide" },
-  { id: "settings", label: "Settings" },
-];
+function Menu({ label, children }: { label: string; children: (close: () => void) => ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        className="min-h-10 rounded-lg px-3 text-sm font-medium text-slate-300 hover:bg-slate-900"
+      >
+        {label} ▾
+      </button>
+      {open && (
+        <>
+          <button type="button" aria-label="Close menu" onClick={() => setOpen(false)} className="fixed inset-0 z-30 cursor-default" />
+          <div role="menu" className="absolute left-0 top-full z-40 mt-1 w-60 overflow-hidden rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl">
+            {children(() => setOpen(false))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 export default function Dashboard() {
-  const { state, send, dismissNotice, requestFiles, stop } = useAgentSocket(WS_URL);
+  const [ignoreText, setIgnoreText] = useState(() => loadIgnoreText());
+  const ignoreList = useMemo(() => parseIgnoreText(ignoreText), [ignoreText]);
+  const { state, send, dismissNotice, requestFiles, stop } = useAgentSocket(WS_URL, ignoreList);
   useNotifications(state);
-  const [view, setView] = useState<View>("agents");
+
+  const wide = useMediaQuery("(min-width: 1024px)");
+  const { layout, actions, applyPreset, replace } = useLayout();
+  const [mobilePanel, setMobilePanel] = useState<PanelId>("live");
+  const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
+
   const [pinned, setPinned] = useState<string | null>(() => loadPinned());
   const [context, setContext] = useState<string[]>([]);
   const [picker, setPicker] = useState(false);
@@ -105,9 +150,19 @@ export default function Dashboard() {
   const [usage, setUsage] = useState(() => loadUsage());
   const [remembered, setRemembered] = useState(() => Boolean(loadRememberedToken()));
 
-  const monitorOn = MONITOR_VIEWS.includes(view);
-  // Phone: one screen at a time. Wide screen: the whole Monitor is visible, so a panel also shows there.
-  const vis = (name: View): string => (view === name ? "" : monitorOn ? "hidden lg:block" : "hidden");
+  // Show a panel: on a wide screen in the layout, on a phone as the current screen.
+  const openPanel = useCallback(
+    (panel: PanelId) => {
+      if (wide) actions.open(panel);
+      else setMobilePanel(panel);
+    },
+    [wide, actions],
+  );
+
+  const changeIgnore = useCallback((text: string) => {
+    setIgnoreText(text);
+    saveIgnoreText(text);
+  }, []);
 
   // A pinned agent that no longer exists (renamed roster) falls back to auto routing.
   useEffect(() => {
@@ -139,7 +194,13 @@ export default function Dashboard() {
     return () => window.removeEventListener("keydown", onKey);
   }, [picker]);
 
-  // Keep the project tree fresh: after every written file and when a run ends.
+  // Load the project tree as soon as the agent can take tasks (the project folder is known by then), and again
+  // whenever the ignore list changes. After that the file watcher keeps it live.
+  useEffect(() => {
+    if (state.canControl && state.connected && state.acceptsTasks) requestFiles();
+  }, [state.canControl, state.connected, state.acceptsTasks, ignoreList, requestFiles]);
+
+  // Fallback for platforms without a file watcher: refresh after every written file and when a run ends.
   const artifactCount = useMemo(() => state.feed.filter((i) => i.kind === "artifact").length, [state.feed]);
   const runStatus = state.run?.status;
   useEffect(() => {
@@ -211,7 +272,88 @@ export default function Dashboard() {
     />
   );
 
-  const filesPanel = (modal: boolean) => (
+  const renderPanel = (id: PanelId): ReactNode => {
+    switch (id) {
+      case "live":
+        return <LiveFeed state={state} fill />;
+      case "tree":
+        return (
+          <TreePanel
+            tree={state.files}
+            connected={state.connected}
+            canControl={state.canControl}
+            touched={state.run?.filesWritten ?? []}
+            changed={state.changed}
+            changeTick={state.changeTick}
+            context={context}
+            onContextChange={setContext}
+            onRefresh={requestFiles}
+            ignoreText={ignoreText}
+            onOpenSettings={() => openPanel("settings")}
+            onPreviewFile={(path) => {
+              setPreviewTarget({ kind: "file", path });
+              openPanel("preview");
+            }}
+          />
+        );
+      case "preview":
+        return <PreviewPanel state={state} send={send} pinned={pinned} target={previewTarget} onTargetChange={setPreviewTarget} />;
+      case "prompt":
+        return (
+          composer || (
+            <p className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-400">
+              {state.canControl
+                ? "The agent is not ready for prompts yet. Answer the startup questions first."
+                : "Prompts need the control token: open the full URL printed in the terminal."}
+            </p>
+          )
+        );
+      case "status":
+        return (
+          <div className="flex flex-col gap-4">
+            <RunHeader state={state} />
+            <ThinkingPanel state={state} stop={stop} />
+          </div>
+        );
+      case "agents":
+        return <AgentRail state={state} pinned={pinned} onPin={pin} />;
+      case "tokens":
+        return <TokenPanel usage={usage} sessionKeys={sessionKeys} roster={state.roster} />;
+      case "history":
+        return (
+          <HistoryPanel
+            runs={runs}
+            names={names}
+            onClear={() => {
+              clearRuns();
+              setRuns([]);
+            }}
+          />
+        );
+      case "settings":
+        return (
+          <SettingsHub
+            state={state}
+            send={send}
+            ignoreText={ignoreText}
+            onIgnoreChange={changeIgnore}
+            layout={layout}
+            onOpenPanel={actions.open}
+            onClosePanel={actions.close}
+            onPreset={applyPreset}
+            onReplaceLayout={replace}
+            onOpenGuide={() => openPanel("guide")}
+            showLayout={wide}
+          />
+        );
+      case "stack":
+        return <StackPanel state={state} wsUrl={WS_URL} />;
+      case "guide":
+        return <GuidePanel onBack={() => (wide ? actions.close("guide") : setMobilePanel("settings"))} />;
+    }
+  };
+
+  const filesPicker = (
     <FilesPanel
       tree={state.files}
       connected={state.connected}
@@ -220,36 +362,95 @@ export default function Dashboard() {
       context={context}
       onContextChange={setContext}
       onRefresh={requestFiles}
-      onUse={() => {
-        if (modal) setPicker(false);
-        else setView("prompt");
-      }}
-      modal={modal}
+      onUse={() => setPicker(false)}
+      modal
     />
   );
+
+  const menuItem = "flex min-h-10 w-full items-center justify-between px-3 text-left text-sm text-slate-200 hover:bg-slate-800";
 
   return (
     <div className="flex h-dvh flex-col bg-slate-950 text-slate-100">
       <header className="shrink-0 border-b border-slate-800 bg-slate-950 px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
-        <div className="mx-auto flex max-w-[110rem] items-center gap-3">
+        <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold tracking-tight">Agent Mustafa</h1>
 
-          <nav aria-label="Screens" className="ml-4 hidden gap-1 lg:flex">
-            {DESKTOP_TABS.map(({ id, label }) => {
-              const on = id === "agents" ? monitorOn : view === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  aria-current={on ? "page" : undefined}
-                  onClick={() => setView(id === "agents" && monitorOn ? view : id)}
-                  className={`min-h-10 rounded-lg px-4 text-sm font-medium ${on ? "bg-slate-800 text-teal-300" : "text-slate-300 hover:bg-slate-900"}`}
-                >
-                  {label}
-                </button>
-              );
-            })}
-          </nav>
+          {wide && (
+            <nav aria-label="Layout" className="ml-3 flex gap-1">
+              <Menu label="Panels">
+                {(close) =>
+                  PANEL_IDS.map((id) => {
+                    const open = hasPanel(layout, id);
+                    return (
+                      <div key={id} className="flex items-center hover:bg-slate-800">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            actions.open(id);
+                            close();
+                          }}
+                          className="flex min-h-10 flex-1 items-center gap-2 px-3 text-left text-sm text-slate-200"
+                        >
+                          <span className={`w-3 ${open ? "text-teal-300" : "text-transparent"}`}>✓</span>
+                          {PANEL_TITLES[id]}
+                        </button>
+                        {open && (
+                          <button type="button" aria-label={`Close ${PANEL_TITLES[id]}`} onClick={() => actions.close(id)} className="min-h-10 px-3 text-slate-400 hover:text-slate-100">
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })
+                }
+              </Menu>
+              <Menu label="Layout">
+                {(close) => (
+                  <>
+                    {PRESETS.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        role="menuitem"
+                        title={p.hint}
+                        onClick={() => {
+                          applyPreset(p.id);
+                          close();
+                        }}
+                        className={menuItem}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                    <div className="my-1 border-t border-slate-800" />
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        applyPreset("coding");
+                        close();
+                      }}
+                      className={menuItem}
+                    >
+                      Reset layout
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        actions.open("settings");
+                        close();
+                      }}
+                      className={menuItem}
+                    >
+                      Export / import…
+                    </button>
+                  </>
+                )}
+              </Menu>
+            </nav>
+          )}
 
           <div className="ml-auto flex items-center gap-2 text-xs">
             {state.team && <span className="rounded-full bg-sky-300/10 px-3 py-1 text-sky-300">Team</span>}
@@ -270,9 +471,7 @@ export default function Dashboard() {
             >
               {state.canControl ? "Control" : "Read-only"}
             </span>
-            <span
-              className={`flex items-center gap-2 rounded-full px-3 py-1 ${state.connected ? "bg-emerald-400/10 text-emerald-300" : "bg-rose-400/10 text-rose-300"}`}
-            >
+            <span className={`flex items-center gap-2 rounded-full px-3 py-1 ${state.connected ? "bg-emerald-400/10 text-emerald-300" : "bg-rose-400/10 text-rose-300"}`}>
               <span className={`h-2 w-2 rounded-full ${state.connected ? "bg-emerald-400" : "animate-pulse bg-rose-400"}`} />
               {state.connected ? "Connected" : "Reconnecting…"}
             </span>
@@ -280,115 +479,61 @@ export default function Dashboard() {
         </div>
       </header>
 
-      <main className="mx-auto flex min-h-0 w-full max-w-[110rem] flex-1 flex-col gap-3 overflow-y-auto px-4 py-3 lg:overflow-hidden">
+      <main className="flex min-h-0 w-full flex-1 flex-col gap-3 px-3 py-3">
         <SetupPanel state={state} send={send} />
         <ApprovalBanner state={state} send={send} />
 
-        {/* Monitor: Agents | status + prompt | tokens + project. Each column scrolls on its own on a wide screen. */}
-        <div className={monitorOn ? "flex flex-col gap-4 lg:grid lg:min-h-0 lg:flex-1 lg:grid-cols-[21rem_minmax(0,1fr)_22rem]" : "hidden"}>
-          <div className="flex flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-            <div className={vis("agents")}>
-              <AgentRail state={state} pinned={pinned} onPin={pin} />
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-            <div className="hidden lg:block">
-              <RunHeader state={state} />
-            </div>
-            <div className="hidden lg:block">
-              <ThinkingPanel state={state} stop={stop} />
-            </div>
-            <div className={vis("prompt")}>
-              {composer || (
-                <p className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-400">
-                  {state.canControl
-                    ? "The agent is not ready for prompts yet. Answer the startup questions first."
-                    : "Prompts need the control token: open the full URL printed in the terminal."}
-                </p>
+        <div className="min-h-0 flex-1">
+          {wide ? (
+            <Workspace layout={layout} actions={actions} renderPanel={renderPanel} />
+          ) : (
+            <div className="flex h-full min-h-0 flex-col gap-2">
+              {MORE_PANELS.includes(mobilePanel) && (
+                <div role="tablist" aria-label="More" className="flex shrink-0 gap-1 overflow-x-auto">
+                  {MORE_PANELS.map((id) => (
+                    <button
+                      key={id}
+                      type="button"
+                      role="tab"
+                      aria-selected={mobilePanel === id}
+                      onClick={() => setMobilePanel(id)}
+                      className={`min-h-10 shrink-0 rounded-lg px-3 text-xs font-medium ${mobilePanel === id ? "bg-slate-800 text-teal-300" : "text-slate-300"}`}
+                    >
+                      {PANEL_TITLES[id]}
+                    </button>
+                  ))}
+                </div>
               )}
+              <div className={`min-h-0 flex-1 ${FILL_PANELS.has(mobilePanel) ? "overflow-hidden rounded-xl border border-slate-800 bg-slate-900/60" : "overflow-y-auto"}`}>
+                {renderPanel(mobilePanel)}
+              </div>
             </div>
-          </div>
-
-          <div className="flex flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-            <div className={vis("agents")}>
-              <TokenPanel usage={usage} sessionKeys={sessionKeys} roster={state.roster} />
-            </div>
-            <div className={vis("project")}>
-              {filesPanel(false)}
-              <button
-                type="button"
-                onClick={() => setView("stack")}
-                className="mt-3 min-h-12 w-full rounded-xl border border-slate-700 bg-slate-900 text-sm font-medium hover:bg-slate-800 lg:hidden"
-              >
-                Stack details
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Live: what the agent is doing on the left, the full detailed feed filling the rest. */}
-        <div className={view === "live" ? "flex flex-col gap-4 lg:min-h-0 lg:flex-1 lg:flex-row" : "hidden"}>
-          <div className="flex flex-col gap-4 lg:w-[24rem] lg:shrink-0 lg:overflow-y-auto lg:pr-1">
-            <RunHeader state={state} />
-            <ThinkingPanel state={state} stop={stop} />
-          </div>
-          <div className="h-[70vh] lg:h-auto lg:min-h-0 lg:flex-1">
-            <LiveFeed state={state} fill />
-          </div>
-        </div>
-
-        <div className={view === "history" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
-          <HistoryPanel
-            runs={runs}
-            names={names}
-            onClear={() => {
-              clearRuns();
-              setRuns([]);
-            }}
-          />
-        </div>
-
-        <div className={view === "stack" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
-          <StackPanel state={state} wsUrl={WS_URL} />
-        </div>
-
-        <div className={view === "settings" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
-          <SettingsScreen onOpenGuide={() => setView("guide")} />
-        </div>
-
-        <div className={view === "guide" ? "lg:min-h-0 lg:flex-1 lg:overflow-y-auto" : "hidden"}>
-          <GuidePanel onBack={() => setView("settings")} />
+          )}
         </div>
       </main>
 
-      <nav
-        aria-label="Tabs"
-        className="flex shrink-0 border-t border-slate-800 bg-slate-900 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-1.5 lg:hidden"
-      >
-        {MOBILE_TABS.map(({ id, label, icon: Icon }) => {
-          const on = view === id || (id === "project" && view === "stack") || (id === "settings" && view === "guide");
-          return (
-            <button
-              key={id}
-              type="button"
-              aria-current={on ? "page" : undefined}
-              onClick={() => setView(id)}
-              className={`flex min-h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[11px] font-medium ${on ? "text-teal-300" : "text-slate-400"}`}
-            >
-              <Icon />
-              {label}
-            </button>
-          );
-        })}
-      </nav>
+      {!wide && (
+        <nav aria-label="Tabs" className="flex shrink-0 border-t border-slate-800 bg-slate-900 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-1.5">
+          {MOBILE_TABS.map(({ id, label, icon: Icon }) => {
+            const on = mobilePanel === id || (id === "settings" && MORE_PANELS.includes(mobilePanel));
+            return (
+              <button
+                key={id}
+                type="button"
+                aria-current={on ? "page" : undefined}
+                onClick={() => setMobilePanel(id)}
+                className={`flex min-h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[11px] font-medium ${on ? "text-teal-300" : "text-slate-400"}`}
+              >
+                <Icon />
+                {label}
+              </button>
+            );
+          })}
+        </nav>
+      )}
 
       {picker && (
-        <div
-          className="fixed inset-0 z-30 flex items-end justify-center bg-black/60 p-0 sm:items-center sm:p-4"
-          onClick={() => setPicker(false)}
-          role="presentation"
-        >
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 p-0 sm:items-center sm:p-4" onClick={() => setPicker(false)} role="presentation">
           <div
             role="dialog"
             aria-modal="true"
@@ -398,16 +543,11 @@ export default function Dashboard() {
           >
             <div className="mb-2 flex items-center justify-between">
               <h2 className="text-base font-semibold">Add files to the prompt</h2>
-              <button
-                type="button"
-                onClick={() => setPicker(false)}
-                aria-label="Close"
-                className="min-h-11 min-w-11 rounded-xl text-slate-300 hover:bg-slate-800"
-              >
+              <button type="button" onClick={() => setPicker(false)} aria-label="Close" className="min-h-11 min-w-11 rounded-xl text-slate-300 hover:bg-slate-800">
                 ✕
               </button>
             </div>
-            {filesPanel(true)}
+            {filesPicker}
           </div>
         </div>
       )}

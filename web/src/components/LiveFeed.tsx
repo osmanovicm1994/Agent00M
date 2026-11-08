@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { elapsed, exitCodeOf, parseArgs } from "../format";
 import type { DashboardState, FeedItem } from "../state";
+import { useStickToBottom } from "../useStickToBottom";
 
 type Filter = "all" | "tools" | "thinking" | "files" | "alerts";
 
@@ -11,6 +12,9 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: "files", label: "Files" },
   { id: "alerts", label: "Warnings" },
 ];
+
+// Older events stay in memory but are drawn on request, so a long session keeps the page fast.
+const PAGE = 600;
 
 function matches(item: FeedItem, f: Filter): boolean {
   switch (f) {
@@ -36,18 +40,20 @@ function AgentTag({ agent }: { agent: string }) {
 }
 
 // Long text is cut to a few lines with a "Show more" toggle, so one huge prompt does not push everything away.
-function Clamp({ text, lines = 3, className = "" }: { text: string; lines?: number; className?: string }) {
+// `all` (the Expand all switch) shows everything.
+function Clamp({ text, all, lines = 3, className = "" }: { text: string; all: boolean; lines?: number; className?: string }) {
   const [open, setOpen] = useState(false);
   const long = text.length > 280 || text.split("\n").length > lines;
+  const showAll = open || all || !long;
   return (
     <div className={className}>
       <div
         className="whitespace-pre-wrap break-words"
-        style={open || !long ? undefined : { display: "-webkit-box", WebkitLineClamp: lines, WebkitBoxOrient: "vertical", overflow: "hidden" }}
+        style={showAll ? undefined : { display: "-webkit-box", WebkitLineClamp: lines, WebkitBoxOrient: "vertical", overflow: "hidden" }}
       >
         {text}
       </div>
-      {long && (
+      {long && !all && (
         <button type="button" onClick={() => setOpen(!open)} className="mt-1 text-xs text-teal-300 hover:underline">
           {open ? "Show less" : "Show more"}
         </button>
@@ -56,7 +62,23 @@ function Clamp({ text, lines = 3, className = "" }: { text: string; lines?: numb
   );
 }
 
-function ToolCard({ item }: { item: Extract<FeedItem, { kind: "tool" }> }) {
+// Command output. While the command runs it follows the newest line (scroll up inside it to pause).
+function Output({ body, expanded }: { body: string; expanded: boolean }) {
+  const { scrollRef, contentRef, onScroll } = useStickToBottom<HTMLDivElement>();
+  return (
+    <div
+      ref={scrollRef}
+      onScroll={onScroll}
+      className={`mt-2 overflow-auto border-t border-slate-800 pt-2 ${expanded ? "max-h-[40rem]" : "max-h-72"}`}
+    >
+      <div ref={contentRef}>
+        <pre className="whitespace-pre-wrap break-words text-slate-300">{body}</pre>
+      </div>
+    </div>
+  );
+}
+
+function ToolCard({ item, all }: { item: Extract<FeedItem, { kind: "tool" }>; all: boolean }) {
   const [openOut, setOpenOut] = useState(false);
   const a = parseArgs(item.args);
   const code = item.status === "running" ? undefined : exitCodeOf(item.preview);
@@ -94,12 +116,8 @@ function ToolCard({ item }: { item: Extract<FeedItem, { kind: "tool" }> }) {
       {!a.command && !a.path && !a.rest && !a.reason && <div className="mt-2 break-all text-slate-400">{item.args}</div>}
       {body && (
         <>
-          <pre
-            className={`mt-2 overflow-auto whitespace-pre-wrap break-words border-t border-slate-800 pt-2 text-slate-300 ${openOut ? "max-h-[32rem]" : "max-h-48"}`}
-          >
-            {body}
-          </pre>
-          {longBody && (
+          <Output body={body} expanded={openOut || all} />
+          {longBody && !all && (
             <button type="button" onClick={() => setOpenOut(!openOut)} className="mt-1 text-teal-300 hover:underline">
               {openOut ? "Collapse output" : "Expand output"}
             </button>
@@ -110,13 +128,13 @@ function ToolCard({ item }: { item: Extract<FeedItem, { kind: "tool" }> }) {
   );
 }
 
-function FeedBody({ item }: { item: FeedItem }) {
+function FeedBody({ item, all }: { item: FeedItem; all: boolean }) {
   switch (item.kind) {
     case "note":
       return (
         <div className="text-sm text-slate-300">
           <AgentTag agent={item.agent} />
-          <Clamp text={item.text} className="inline-block align-top" />
+          <Clamp text={item.text} all={all} className="inline-block align-top" />
         </div>
       );
 
@@ -130,7 +148,7 @@ function FeedBody({ item }: { item: FeedItem }) {
         return (
           <div className="rounded-xl border border-sky-300/30 bg-sky-300/5 p-3">
             <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-sky-300">Team plan</div>
-            <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words font-sans text-sm text-slate-200">{item.text}</pre>
+            <pre className={`overflow-auto whitespace-pre-wrap break-words font-sans text-sm text-slate-200 ${all ? "" : "max-h-80"}`}>{item.text}</pre>
           </div>
         );
       }
@@ -150,14 +168,14 @@ function FeedBody({ item }: { item: FeedItem }) {
           <div className="mb-1 flex items-center text-[11px] text-slate-400">
             <AgentTag agent={item.agent} />💭 {item.label}
           </div>
-          <div className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950/60 p-3 text-sm text-slate-300 italic">
+          <div className={`overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950/60 p-3 text-sm text-slate-300 italic ${all ? "" : "max-h-48"}`}>
             {item.text}
           </div>
         </div>
       );
 
     case "tool":
-      return <ToolCard item={item} />;
+      return <ToolCard item={item} all={all} />;
 
     case "artifact":
       return (
@@ -184,30 +202,33 @@ function FeedBody({ item }: { item: FeedItem }) {
   }
 }
 
-// `fill`: the feed takes all the height its parent gives it and scrolls inside (the Live screen), instead of a fixed box.
+// The live feed of everything the agent does. It follows new output on its own (like a terminal) and pauses when
+// you scroll up; "Jump to latest" resumes. `fill`: take all the height the parent gives and scroll inside.
 export function LiveFeed({ state, fill = false }: { state: DashboardState; fill?: boolean }) {
-  const scroller = useRef<HTMLDivElement>(null);
   const [filter, setFilter] = useState<Filter>("all");
-  // Follow new events only while the reader is at the bottom; scrolling up pauses auto-scroll.
-  const stick = useRef(true);
+  const [all, setAll] = useState(false);
+  const [limit, setLimit] = useState(PAGE);
+  const { scrollRef, contentRef, following, onScroll, jump } = useStickToBottom<HTMLDivElement>();
 
   const items = useMemo(() => state.feed.filter((i) => matches(i, filter)), [state.feed, filter]);
+  const shown = items.length > limit ? items.slice(items.length - limit) : items;
+  const hidden = items.length - shown.length;
 
-  const onScroll = () => {
-    const el = scroller.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
-
+  // How many events arrived while paused.
+  const total = useRef(items.length);
+  total.current = items.length;
+  const [pausedAt, setPausedAt] = useState<number | null>(null);
   useEffect(() => {
-    const el = scroller.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [items, state.llmWaiting]);
+    setPausedAt(following ? null : total.current);
+  }, [following]);
+  const fresh = pausedAt === null ? 0 : Math.max(0, items.length - pausedAt);
 
+  const running = state.run?.status === "running";
   const t0 = state.run?.startedAt ?? state.feed[0]?.ts ?? 0;
 
   return (
     <section aria-label="Live feed" className={`flex min-h-0 flex-col rounded-2xl border border-slate-800 bg-slate-900/60 ${fill ? "h-full" : ""}`}>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-2.5 text-xs text-slate-400">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-3 py-2 text-xs text-slate-400">
         <div role="group" aria-label="Filter" className="flex flex-wrap gap-1">
           {FILTERS.map((f) => (
             <button
@@ -221,26 +242,67 @@ export function LiveFeed({ state, fill = false }: { state: DashboardState; fill?
             </button>
           ))}
         </div>
-        <span>
-          {items.length}
-          {filter !== "all" ? ` of ${state.feed.length}` : ""} events
-        </span>
+        <div className="flex items-center gap-2">
+          <span
+            role="status"
+            className={`rounded-full px-2.5 py-1 ${following ? (running ? "bg-emerald-400/10 text-emerald-300" : "bg-slate-800 text-slate-300") : "bg-amber-300/10 text-amber-300"}`}
+          >
+            {following ? (running ? "● Live · following" : "Following") : "⏸ Paused"}
+          </span>
+          <button
+            type="button"
+            aria-pressed={all}
+            onClick={() => setAll(!all)}
+            title="Show full thinking, plans and command output without cutting them"
+            className={`min-h-9 rounded-lg px-3 font-medium ${all ? "bg-slate-800 text-teal-300" : "text-slate-300 hover:bg-slate-800/60"}`}
+          >
+            Expand all
+          </button>
+          <span>
+            {items.length}
+            {filter !== "all" ? ` of ${state.feed.length}` : ""} events
+          </span>
+        </div>
       </div>
-      <div ref={scroller} onScroll={onScroll} className={`min-h-0 space-y-3 overflow-y-auto p-4 ${fill ? "flex-1" : "h-[32rem]"}`}>
-        {items.length === 0 && <p className="text-sm text-slate-400">Nothing yet. The feed fills in as soon as an agent starts working.</p>}
-        {items.map((item) => (
-          <div key={item.id} className="flex gap-3">
-            <span className="w-14 shrink-0 pt-0.5 text-right font-mono text-[11px] text-slate-500">+{elapsed(t0, item.ts)}</span>
-            <div className="min-w-0 flex-1">
-              <FeedBody item={item} />
-            </div>
+
+      <div className="relative min-h-0 flex-1">
+        <div ref={scrollRef} onScroll={onScroll} className={`h-full overflow-y-auto p-4 ${fill ? "" : "max-h-[32rem]"}`}>
+          <div ref={contentRef} className="space-y-3">
+            {hidden > 0 && (
+              <button
+                type="button"
+                onClick={() => setLimit(limit + PAGE)}
+                className="min-h-9 w-full rounded-lg border border-slate-700 text-xs font-medium text-teal-300 hover:bg-slate-800"
+              >
+                Show {Math.min(PAGE, hidden)} earlier events ({hidden} not shown)
+              </button>
+            )}
+            {items.length === 0 && <p className="text-sm text-slate-400">Nothing yet. The feed fills in as soon as an agent starts working.</p>}
+            {shown.map((item) => (
+              <div key={item.id} className="feed-row flex gap-3">
+                <span className="w-14 shrink-0 pt-0.5 text-right font-mono text-[11px] text-slate-500">+{elapsed(t0, item.ts)}</span>
+                <div className="min-w-0 flex-1">
+                  <FeedBody item={item} all={all} />
+                </div>
+              </div>
+            ))}
+            {state.llmWaiting && (
+              <div className="flex gap-3">
+                <span className="w-14 shrink-0" />
+                <span className="animate-pulse text-xs text-teal-300">The model is generating…</span>
+              </div>
+            )}
           </div>
-        ))}
-        {state.llmWaiting && (
-          <div className="flex gap-3">
-            <span className="w-14 shrink-0" />
-            <span className="animate-pulse text-xs text-teal-300">The model is generating…</span>
-          </div>
+        </div>
+
+        {!following && (
+          <button
+            type="button"
+            onClick={jump}
+            className="absolute bottom-3 left-1/2 min-h-10 -translate-x-1/2 rounded-full bg-teal-300 px-4 text-xs font-semibold text-slate-950 shadow-lg hover:bg-teal-200"
+          >
+            ↓ Jump to latest{fresh > 0 ? ` · ${fresh} new` : ""}
+          </button>
         )}
       </div>
     </section>

@@ -40,7 +40,95 @@ export const SELF_TYPED_PACKAGES = ["zod", "bcryptjs", "jose", "pdf-lib", "next-
 const SCHEMA_MISMATCH_RE =
   /\berror TS(?:2551|2353|2339|2561|2724)\b[^\n]*|Unknown (?:argument|field|arg) [`'"]?\w+|diagnosticCodes: \[[^\]]*(?:2551|2353|2339)/;
 
+const NEXT_AUTH_AUGMENTATION =
+  'import { DefaultSession } from "next-auth";\n' +
+  'declare module "next-auth" {\n' +
+  '  interface Session { user: { id: string; role: "ADMIN" | "CUSTOMER" } & DefaultSession["user"]; }\n' +
+  '  interface User { id: string; role: "ADMIN" | "CUSTOMER"; }\n' +
+  "}\n" +
+  'declare module "next-auth/jwt" { interface JWT { id?: string; role?: "ADMIN" | "CUSTOMER"; } }';
+
 const RULES: Rule[] = [
+  {
+    id: "next-route-handler-shape",
+    // .next/types/validator.ts rejects a route file whose handlers take params the folder does not define (a collection route with
+    // { params: { id } }, or params that are not a Promise), and two exported GETs in one file are a duplicate. One agent rewrote the
+    // same route.ts six times because every rewrite kept the same wrong shape.
+    test: (_c, o) => /does not satisfy the constraint 'RouteHandlerConfig<|Cannot redeclare exported variable '(?:GET|POST|PUT|PATCH|DELETE)'/.test(o),
+    fix: () => ({
+      title: "A route.ts has the wrong shape (params it does not have, or two handlers with the same method)",
+      steps: [
+        "The folder decides the params. src/app/api/users/route.ts is /api/users: it exports GET (list) and POST, takes NO params and has NO id logic.",
+        "One user belongs in src/app/api/users/[id]/route.ts with GET, PUT and DELETE: export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) { const { id } = await params; ... }. In Next 15/16 params is a Promise, never { params: { id: string } } and never an optional id.",
+        "One file never exports two functions with the same method name. Do not merge 'list' and 'get by id' into one GET.",
+        "Fix BOTH files in one pass: write route.ts (collection) first, then [id]/route.ts, then run `npm run typecheck` once. Never edit .next/types: Next regenerates it from your exports.",
+      ],
+    }),
+  },
+  {
+    id: "next-auth-session-types",
+    // session.user.id / .role and user.role are not on the default next-auth types: they need a module augmentation, and the project
+    // must use one auth approach (next-auth OR its own session helper), not a mix of both.
+    test: (_c, o) => /Property '(?:id|role)' does not exist on type '(?:\{ name\?: string \| null \| undefined;|AdapterUser \| User|User\b|Session\b)/.test(o),
+    fix: () => ({
+      title: "session.user.id / role are not on the next-auth types",
+      steps: [
+        "Create src/types/next-auth.d.ts (tsconfig must include it; the default include of **/*.ts does) with exactly:\n" + NEXT_AUTH_AUGMENTATION,
+        "Copy id and role in the callbacks (jwt: token.id = user.id; token.role = user.role. session: session.user.id = token.id as string; session.user.role = token.role as ...), then write them once.",
+        "The project must use ONE auth approach. If the login route calls createSession from src/lib/auth/session.ts, it is a custom session: do not call getServerSession in routes. Export ONE helper (requireUser / requireAdmin) from src/lib/auth and import only that in every route and page.",
+      ],
+    }),
+  },
+  {
+    id: "prisma7-client-args-missing",
+    // Prisma 7: `new PrismaClient()` without options fails the type check (TS2554). Seen in src/lib/prisma.ts next to a second client in src/lib/db.ts.
+    test: (_c, o) => /error TS2554: Expected 1 arguments, but got 0/.test(o) && /prisma|[\\/]db\.ts/i.test(o),
+    fix: () => ({
+      title: "Prisma 7: new PrismaClient() needs a driver adapter",
+      steps: [
+        'Write ONE client file, src/lib/prisma.ts: import { PrismaPg } from "@prisma/adapter-pg"; import { PrismaClient } from "@/generated/prisma/client"; const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL }); export const prisma = globalThis.prisma ?? new PrismaClient({ adapter }); if (process.env.NODE_ENV !== "production") globalThis.prisma = prisma;',
+        "Make src/lib/db.ts re-export from it (export { prisma } from \"./prisma\") or delete it and fix the imports. Two client files is how the build ends up importing two different clients.",
+        "Check that @prisma/adapter-pg and pg are in package.json (npm install @prisma/adapter-pg pg). Then run the typecheck once.",
+      ],
+    }),
+  },
+  {
+    id: "prisma-model-type-import",
+    // import { User } from "@/generated/prisma/models/User": the generated model files do not export the model type by that name.
+    test: (_c, o) => /@\/generated\/prisma\/models\/\w+["']* has no exported member|Module '"@prisma\/client"' has no exported member '(?!PrismaClient\b)[A-Z]\w+'/.test(o),
+    fix: () => ({
+      title: "Wrong import for a Prisma model type or enum",
+      steps: [
+        'Import model types and enums from the client entry, not from the models folder and not from @prisma/client: import type { User } from "@/generated/prisma/client"; import { UserRole } from "@/generated/prisma/client" (in a client component: "@/generated/prisma/browser").',
+        "Use the enum values the schema declares (read prisma/schema.prisma once). They are not USER or any value you remember from another project.",
+        "A type the UI needs but the database must not leak (passwordHash) is a small interface of its own in src/types, not the raw model.",
+      ],
+    }),
+  },
+  {
+    id: "prisma-generated-js-extension",
+    // The Prisma 7 generator writes imports such as './enums.js' next to enums.ts. Turbopack does not map .js to .ts there.
+    test: (_c, o) => /Can't resolve '\.\/(?:enums|internal\/\w+|models\/\w+|browser|client)\.js'/.test(o),
+    fix: () => ({
+      title: "The generated Prisma client imports './x.js' but only x.ts exists",
+      steps: [
+        'Do not edit files in src/generated: they are rewritten by every prisma generate.',
+        'In the generator block of prisma/schema.prisma add  importFileExtension = "ts"  (keep provider = "prisma-client" and the output line), add  "allowImportingTsExtensions": true  to compilerOptions in tsconfig.json (Next already sets noEmit), then run npx prisma generate and npm run build once.',
+        "If the build still cannot resolve the files, stop and report the exact first error line and the versions of next and prisma. Do not switch to another generator output folder and do not copy the client around.",
+      ],
+    }),
+  },
+  {
+    id: "zod-v4-issues",
+    test: (_c, o) => /Property 'errors' does not exist on type 'ZodError/.test(o),
+    fix: () => ({
+      title: "Zod 4: ZodError has no .errors",
+      steps: [
+        'Use error.issues: return NextResponse.json({ error: "Validation failed", details: error.issues }, { status: 400 }).',
+        "Prefer schema.safeParse(body): if (!parsed.success) return ... parsed.error.issues. In a catch block check error instanceof z.ZodError first, and error instanceof Error before reading error.message (error is unknown).",
+      ],
+    }),
+  },
   {
     id: "next-async-request-api",
     // Next 15+: cookies(), headers(), draftMode(), params and searchParams return Promises. Using them without await gives TS2339 on a Promise type.

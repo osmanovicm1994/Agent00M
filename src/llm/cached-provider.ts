@@ -33,6 +33,11 @@ export class CachedLLMProvider implements LLMProvider {
     // the same rejected answer on every identical request, so such calls neither read nor write the cache.
     if (options?.noCache) return this.baseProvider.chat(messages, tools, options);
 
+    // Agent loops (a tools payload is present) are never replayed from the cache. The key holds the whole history, so a hit means the
+    // agent is in exactly the situation where its last answer led nowhere (a no-op edit, an empty write_file, the same failing
+    // command): replaying that answer on a repair run made it repeat the mistake forever. AI_CACHE_AGENT=1 brings the old behaviour back.
+    if (tools && tools.length > 0 && process.env.AI_CACHE_AGENT !== "1") return this.baseProvider.chat(messages, tools, options);
+
     // The salt covers everything besides the messages that changes the answer: the model,
     // the tool protocol, the sampling settings and per-call overrides. Switching any of them
     // can therefore never replay another configuration's answer.

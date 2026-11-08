@@ -32,10 +32,12 @@ export default defineConfig({
     ...(remote ? { allowedHosts: remoteHost ? [remoteHost] : [".ts.net"] } : {}),
     // The page is served over HTTPS on port 443 by Tailscale Serve, so hot reload must connect there.
     ...(remote ? { hmr: { clientPort: 443 } } : {}),
-    // One URL for page and socket: the dashboard connects to wss://<same host>/ws, which is
-    // forwarded to the agent socket on 127.0.0.1. Local use (ws://127.0.0.1:3001/ws) is unchanged.
+    // One URL for page, socket and design preview: the dashboard connects to wss://<same host>/ws and shows
+    // /preview/<key>/... in an iframe; both are forwarded to the agent server on 127.0.0.1.
+    // Local use (ws://127.0.0.1:3001/ws) is unchanged.
     proxy: {
       "/ws": { target: `ws://127.0.0.1:${agentPort}`, ws: true },
+      "/preview": { target: `http://127.0.0.1:${agentPort}` },
     },
   },
 });

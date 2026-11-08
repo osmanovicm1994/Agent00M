@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { isHiddenName, listWorkspace } from "./file-tree";
+import { compileIgnore, DEFAULT_TREE_IGNORE, isHiddenName, listWorkspace, sanitizeIgnore } from "./file-tree";
 
 let root: string;
 let outside: string;
@@ -95,5 +95,69 @@ describe("listWorkspace", () => {
     const result = listWorkspace(path.join(root, "does-not-exist"));
     expect(result.entries).toEqual([]);
     expect(result.truncated).toBe(false);
+  });
+});
+
+describe("ignore list (like tree -I)", () => {
+  it("replaces the built-in folder list, so dist can be shown", () => {
+    put("dist/out.js");
+    put("node_modules/x/index.js");
+    put(".agent_cache/a.gz");
+    put("src/a.ts");
+    const paths = listWorkspace(root, { maxDepth: 40, ignore: DEFAULT_TREE_IGNORE }).entries.map((e) => e.path);
+    expect(paths).toEqual(["dist", "dist/out.js", "src", "src/a.ts"]);
+  });
+
+  it("still hides secret env files and OS clutter with a custom list", () => {
+    put(".env", "S=1");
+    put(".env.local", "S=2");
+    put(".env.example", "S=");
+    put(".DS_Store");
+    put("a.ts");
+    const paths = listWorkspace(root, { ignore: ["nothing"] }).entries.map((e) => e.path);
+    expect(paths).toEqual([".env.example", "a.ts"]);
+  });
+
+  it("supports * and ? patterns on file and folder names", () => {
+    put("a.log");
+    put("b.ts");
+    put("tmp1/x.txt");
+    put("tmp22/x.txt");
+    const paths = listWorkspace(root, { maxDepth: 5, ignore: ["*.log", "tmp?"] }).entries.map((e) => e.path);
+    expect(paths).toEqual(["tmp22", "tmp22/x.txt", "b.ts"]);
+  });
+
+  it("goes deeper than the default 3 levels when asked", () => {
+    put("a/b/c/d/e/deep.txt");
+    const paths = listWorkspace(root, { maxDepth: 40, maxEntries: 20000, ignore: DEFAULT_TREE_IGNORE }).entries.map((e) => e.path);
+    expect(paths).toContain("a/b/c/d/e/deep.txt");
+  });
+
+  it("treats an empty ignore list as not given", () => {
+    put("node_modules/x.js");
+    put("a.ts");
+    expect(listWorkspace(root, { ignore: [] }).entries.map((e) => e.path)).toEqual(["a.ts"]);
+  });
+});
+
+describe("sanitizeIgnore / compileIgnore", () => {
+  it("keeps plain names, trims, drops paths, duplicates and non-strings", () => {
+    expect(sanitizeIgnore([" node_modules ", "dist/", "a/b", "a\\b", "", 5, "dist", "*.log"])).toEqual(["node_modules", "dist", "*.log"]);
+    expect(sanitizeIgnore("node_modules")).toBeUndefined();
+    expect(sanitizeIgnore(undefined)).toBeUndefined();
+  });
+
+  it("bounds the number and length of patterns", () => {
+    expect(sanitizeIgnore(Array.from({ length: 100 }, (_, i) => `n${i}`))).toHaveLength(40);
+    expect(sanitizeIgnore(["x".repeat(200)])).toEqual([]);
+  });
+
+  it("matches exactly and with wildcards, escaping regex characters", () => {
+    const m = compileIgnore(["node_modules", "*.min.js", "a+b"]);
+    expect(m("node_modules")).toBe(true);
+    expect(m("node_modules2")).toBe(false);
+    expect(m("app.min.js")).toBe(true);
+    expect(m("app.minXjs")).toBe(false);
+    expect(m("a+b")).toBe(true);
   });
 });

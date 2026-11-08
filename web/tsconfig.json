@@ -12,5 +12,6 @@
     "resolveJsonModule": true,
     "types": ["vite/client"]
   },
-  "include": ["src", "vite.config.ts", "../src/core/event-types.ts"]
+  "include": ["src", "vite.config.ts", "../src/core/event-types.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }

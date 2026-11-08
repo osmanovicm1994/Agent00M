@@ -14,7 +14,29 @@ body {
 button:focus-visible,
 textarea:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+[tabindex]:focus-visible {
   outline: 2px solid #5eead4;
   outline-offset: 2px;
+}
+
+/* Rows of the live feed that are off screen are not laid out or painted: a long session stays fast. */
+.feed-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+}
+
+/* While a panel tab or divider is being dragged, text must not get selected and iframes must not eat the pointer. */
+body.dock-dragging {
+  user-select: none;
+  cursor: grabbing;
+}
+body.dock-dragging iframe {
+  pointer-events: none;
+}
+body.dock-resizing {
+  user-select: none;
+}
+body.dock-resizing iframe {
+  pointer-events: none;
 }

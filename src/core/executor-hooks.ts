@@ -10,6 +10,8 @@
 
 export interface CommandFailure {
   agentId: string;
+  /** Unique per executor run. An auto-debug halt applies to this run only, never to a later run that has not tried anything yet. */
+  runId?: string;
   command: string;
   /** The exact combined output of the command. */
   output: string;
@@ -28,7 +30,44 @@ export interface InterceptResult {
   halt?: string;
 }
 
+/** Why the agent is asking for outside help: it keeps hitting the same wall. */
+export type ResolverTrigger = "repeated-failure" | "circling" | "known-problem";
+
+export interface ResolverRequest {
+  agentId: string;
+  /** The task text of this run. */
+  task: string;
+  trigger: ResolverTrigger;
+  /** The command that keeps failing (empty when the trigger is not a command). */
+  command: string;
+  /** The exact output of the last failing run. */
+  output: string;
+  filesWritten: string[];
+  /** The last commands of this run, oldest first: what was already tried. */
+  commandsRun: string[];
+  /** Per-file summary of a many-file typecheck (see digestTypeErrors), or "". */
+  errorDigest: string;
+  /** Reads a project file by relative path; undefined when it cannot be read. */
+  readFile(relPath: string): string | undefined;
+}
+
+export interface ResolverPrepared {
+  /** What would be sent, as plain text: shown to the person before anything leaves the machine. */
+  preview: string;
+  /** What the local review of the full issue found (missing context that was added, secrets masked, ...). */
+  notes: string[];
+  /** Sends the reviewed report and returns the advice. Throws when no answer could be obtained. */
+  send(): Promise<string>;
+}
+
+export interface ProblemResolver {
+  /** Collects and reviews the full issue. Returns null when no help can be offered (no key, limit reached). Must not throw. */
+  prepare(req: ResolverRequest): Promise<ResolverPrepared | null>;
+}
+
 export interface ExecutorHooks {
+  /** Called when the same problem keeps coming back. Optional: without it the run just stops as before. */
+  problemResolver?: ProblemResolver;
   /** Called before every write_file. Return `{ allowed: false, reason }` to refuse it; the reason goes to the agent. */
   writeGuard?(agentId: string, relPath: string): { allowed: boolean; reason?: string };
   /** Called after a write_file succeeded. */

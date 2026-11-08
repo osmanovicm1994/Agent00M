@@ -92,6 +92,8 @@ export function commandFamily(command: string): string {
 export function isInspectCommand(command: string): boolean {
   // `echo x > file` writes: a redirect into a file (anything but /dev/null or 2>&1) makes it a change.
   if (/(^|\s)\d*>>?\s*(?!&|\/dev\/null)[^\s>]/.test(command)) return false;
+  // `echo "Build: $(npm run build)"` runs the build inside the substitution: it only LOOKS like an echo. Not an inspect command.
+  if (/\$\(|`/.test(command)) return false;
   const segs = splitSegments(command);
   if (!segs.length) return false;
   return segs.every((seg) => {

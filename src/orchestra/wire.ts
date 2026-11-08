@@ -135,15 +135,16 @@ export function makeCommandInterceptor(deps: AutoDebugDeps): ExecutorHooks["comm
     if (!deps.mayRun()) return null;
     // The Debug Agent already is the debugger: starting a second one for its own failed commands only duplicates work.
     if (failure.agentId === "debug") return null;
-    // Another agent already used up the attempts on this exact command: stop this one too, with the same report.
-    const earlier = interceptor.haltFor(failure.command);
+    // This run already used up the attempts on this exact command. (A halt is per run: a later run, for example the next task of
+    // /tasks resume, gets its own chance instead of inheriting the stop and the stale report.)
+    const earlier = interceptor.haltFor(failure.command, failure.runId);
     if (earlier) {
       return { note: `AUTO-DEBUG STOP: the debug attempts for \`${failure.command}\` are used up. The run ends here with a triage report.`, verified: false, halt: earlier };
     }
     const note = await interceptor.handle({ ...failure });
     if (!note) return null;
     // takeHalt: this call used up the attempts. haltFor: another agent's call sharing the same debug run did.
-    const halt = interceptor.takeHalt() ?? interceptor.haltFor(failure.command);
+    const halt = interceptor.takeHalt() ?? interceptor.haltFor(failure.command, failure.runId);
     return { note, verified: note.includes(VERIFIED_MARKER), ...(halt ? { halt } : {}) };
   };
 }

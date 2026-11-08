@@ -7,7 +7,7 @@ export interface AgentSocket {
   // Sends a command. Returns false if the socket is not open.
   send: (command: ClientCommand) => boolean;
   dismissNotice: () => void;
-  // Asks the agent for the project folder listing (answer arrives in state.files).
+  // Asks the agent for the full project tree (answer arrives in state.files). Calls close together are merged.
   requestFiles: () => void;
   // Stops the running shell command, like Ctrl+C in the terminal.
   stop: () => void;
@@ -16,9 +16,36 @@ export interface AgentSocket {
 // Connects to the agent's WebSocket, reconnects automatically, and folds every event into
 // DashboardState. The server replays recent history on connect, so refreshing the page is safe.
 // With a control token in the URL the server also accepts tasks and approvals from this page.
-export function useAgentSocket(url: string): AgentSocket {
+// `ignore` = names or patterns the project tree leaves out (like `tree -I`).
+export function useAgentSocket(url: string, ignore: string[]): AgentSocket {
   const [state, dispatch] = useReducer(reducer, initialState);
   const socketRef = useRef<WebSocket | undefined>(undefined);
+  const ignoreRef = useRef<string[]>(ignore);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const requestFilesRef = useRef<() => void>(() => undefined);
+
+  useEffect(() => {
+    ignoreRef.current = ignore;
+  }, [ignore]);
+
+  const send = useCallback((command: ClientCommand): boolean => {
+    const ws = socketRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(command));
+    return true;
+  }, []);
+
+  const requestFiles = useCallback(() => {
+    if (refreshTimer.current) return;
+    refreshTimer.current = setTimeout(() => {
+      refreshTimer.current = undefined;
+      send({ kind: "list_files", full: true, ignore: ignoreRef.current });
+    }, 150);
+  }, [send]);
+
+  useEffect(() => {
+    requestFilesRef.current = requestFiles;
+  }, [requestFiles]);
 
   useEffect(() => {
     let retry: ReturnType<typeof setTimeout> | undefined;
@@ -69,6 +96,13 @@ export function useAgentSocket(url: string): AgentSocket {
           case "files":
             dispatch({ type: "files", tree: { root: parsed.root, entries: parsed.entries, truncated: parsed.truncated } });
             break;
+          case "files_changed":
+            dispatch({ type: "files_changed", paths: parsed.paths, at: Date.now() });
+            requestFilesRef.current();
+            break;
+          case "preview":
+            dispatch({ type: "preview_key", key: parsed.key });
+            break;
         }
       };
 
@@ -85,22 +119,14 @@ export function useAgentSocket(url: string): AgentSocket {
     return () => {
       disposed = true;
       if (retry) clearTimeout(retry);
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = undefined;
       socketRef.current?.close();
     };
   }, [url]);
 
-  const send = useCallback((command: ClientCommand): boolean => {
-    const ws = socketRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify(command));
-    return true;
-  }, []);
-
   const dismissNotice = useCallback(() => dispatch({ type: "dismiss_notice" }), []);
 
-  const requestFiles = useCallback(() => {
-    send({ kind: "list_files" });
-  }, [send]);
   const stop = useCallback(() => {
     send({ kind: "stop_command" });
   }, [send]);

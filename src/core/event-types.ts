@@ -118,6 +118,13 @@ export type ServerMessage =
   | ({ kind: "settings" } & SettingsState)
   // Answer to list_files: names only (never file contents), without secret env files and heavy folders.
   | { kind: "files"; root: string; entries: FileEntry[]; truncated: boolean }
+  // Pushed to connections with the control token when files in the project folder changed (debounced,
+  // paths relative to the project folder with "/" separators, never secret env files or ignored folders).
+  // The dashboard highlights them and refreshes the tree.
+  | { kind: "files_changed"; paths: string[] }
+  // Sent once to connections with the control token: the random key of the design-preview route
+  // (GET /preview/<key>/<path inside the project>). It only grants reading project files through that route.
+  | { kind: "preview"; key: string }
   // Answer to get_guide: the prompting tutorial (docs/PROMPTING.md) as Markdown text.
   | { kind: "guide"; markdown: string }
   // Feedback for a command (rejected task, bad token, ...).
@@ -129,8 +136,10 @@ export type ClientCommand =
   | { kind: "answer_approval"; approved: boolean }
   // Answer to a setup_question: "yes"/"no" for confirm, free text otherwise.
   | { kind: "answer_question"; id: string; answer: string }
-  // Ask for the project tree of the folder the agent works in.
-  | { kind: "list_files" }
+  // Ask for the project tree of the folder the agent works in. Without options: depth 3, 500 entries and the
+  // built-in skip list (the native iOS app uses this). full: the whole tree (like `tree -I`), up to 20000
+  // entries; ignore = names or patterns (* and ?) to leave out, replacing the built-in folder list.
+  | { kind: "list_files"; full?: boolean; ignore?: string[] }
   // Ask for the prompting tutorial as text (the native iOS app shows it; the web app bundles its own copy).
   | { kind: "get_guide" }
   // Same as Ctrl+C in the terminal while a command runs: stops the running shell command(s).

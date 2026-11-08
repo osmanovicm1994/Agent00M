@@ -4,18 +4,23 @@
 //    chat startup questions, submit a task and answer approvals. The agent can run commands and
 //    write files, so this is the sensitive part: loopback only, Origin allowlist, random token
 //    printed in the terminal.
+//  - Token holders also get the project tree (list_files), live file-change pushes (files_changed) and
+//    the design-preview route (GET /preview/<key>/<path>, see core/preview.ts).
 // The server never imports agent logic; it talks to the core only through `bus` and `control`.
 
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import pc from "picocolors";
 import { randomBytes, timingSafeEqual } from "crypto";
+import * as fs from "fs";
 import * as os from "os";
 import { AGENTS } from "./agents/definitions";
 import { bus } from "./core/events";
 import { control, MAX_ANSWER_CHARS } from "./core/control";
-import { listWorkspace } from "./core/file-tree";
+import { DEFAULT_TREE_IGNORE, listWorkspace, sanitizeIgnore } from "./core/file-tree";
 import { readGuide } from "./core/guide";
+import { contentTypeFor, injectPreviewHtml, PREVIEW_CSP, previewBaseHref, resolvePreviewFile } from "./core/preview";
+import { watchWorkspace, type WorkspaceWatcher } from "./core/workspace-watch";
 import type { AgentInfo, ClientCommand, ServerMessage, SettingKey } from "./core/event-types";
 import { REMOTE_MODE, detectTailscale, resolveRemoteHost } from "./remote";
 import { startNotifier } from "./notify";
@@ -34,6 +39,9 @@ const WS_OPEN = 1;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const WEB_PORT = Number(process.env.AGENT_UI_WEB_PORT) || 5173;
 const MIN_REMOTE_TOKEN_CHARS = 24;
+// The full project tree (list_files with full:true): deep, but bounded so one huge folder cannot freeze the browser.
+const FULL_TREE_DEPTH = 40;
+const FULL_TREE_MAX_ENTRIES = 20000;
 
 // LAN mode (AGENT_UI_LAN=1, or `npm run chat:ui:lan`): the socket and the web app are reachable from
 // other devices on your home network, e.g. your phone. Off by default (loopback only).
@@ -43,7 +51,7 @@ export const LAN_MODE = ["1", "on", "true", "yes"].includes((process.env.AGENT_U
 
 // Remote mode (AGENT_UI_REMOTE=1, or `npm run chat:ui:remote`): reachable from outside your home
 // network through Tailscale (works behind CGNAT). The socket STILL binds to 127.0.0.1: Tailscale
-// Serve proxies HTTPS to the Vite dev server, which forwards /ws to this server. The token is
+// Serve proxies HTTPS to the Vite dev server, which forwards /ws and /preview to this server. The token is
 // required for every connection and the Tailscale host name is added to the origin allowlist.
 // See src/remote.ts and docs/REMOTE.md.
 export { REMOTE_MODE };
@@ -94,7 +102,9 @@ function parseCommand(raw: unknown): ClientCommand | undefined {
   if (value?.kind === "answer_question" && typeof value.id === "string" && typeof value.answer === "string") {
     return { kind: "answer_question", id: value.id, answer: value.answer.slice(0, MAX_ANSWER_CHARS) };
   }
-  if (value?.kind === "list_files") return { kind: "list_files" };
+  if (value?.kind === "list_files") {
+    return { kind: "list_files", full: value.full === true, ignore: sanitizeIgnore(value.ignore) };
+  }
   if (value?.kind === "get_guide") return { kind: "get_guide" };
   if (value?.kind === "stop_command") return { kind: "stop_command" };
   if (value?.kind === "set_team" && typeof value.on === "boolean") return { kind: "set_team", on: value.on };
@@ -114,6 +124,9 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
   const origins = allowedOrigins(remoteHost);
   const fixedToken = process.env.AGENT_UI_TOKEN?.trim();
   const token = fixedToken || randomBytes(16).toString("hex");
+  // A separate key for the preview route: it only reads project files (never drives the agent), so a page that
+  // learns it cannot do more than the route already allows.
+  const previewKey = randomBytes(16).toString("hex");
   const requireToken = LAN_MODE || REMOTE_MODE;
   const roster: AgentInfo[] = AGENTS.map((a) => ({ id: a.id, name: a.name, description: a.description }));
   const agentIds = new Set(AGENTS.map((a) => a.id));
@@ -122,6 +135,55 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
   await app.register(websocket, { options: { maxPayload: MAX_MESSAGE_BYTES } });
 
   app.get("/health", async () => ({ ok: true }));
+
+  // Design preview: read-only files of the project folder, for the dashboard's Preview panel.
+  // Reached through the Vite proxy (/preview), so the page and the preview share one URL (also over Tailscale).
+  app.get("/preview/:key/*", async (req, reply) => {
+    const params = req.params as { key?: string; "*"?: string };
+    const query = req.query as { raw?: string };
+    const text = (status: number, message: string) => reply.code(status).type("text/plain; charset=utf-8").send(message);
+
+    if (!tokenMatches(params.key, previewKey)) return text(404, "Not found.");
+    const root = control.getWorkspace();
+    if (!root) return text(404, "No project folder yet.");
+    const found = resolvePreviewFile(root, params["*"] ?? "");
+    if (!found.ok || !found.file || found.rel === undefined) return text(found.status ?? 404, found.reason ?? "Not found.");
+
+    reply.headers({
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": PREVIEW_CSP,
+      "Access-Control-Allow-Origin": "*",
+      "Cross-Origin-Resource-Policy": "cross-origin",
+      "Referrer-Policy": "no-referrer",
+    });
+    const type = contentTypeFor(found.file);
+    try {
+      if (type.startsWith("text/html") && query.raw !== "1") {
+        const html = await fs.promises.readFile(found.file, "utf8");
+        return reply.type(type).send(injectPreviewHtml(html, previewBaseHref(previewKey, found.rel)));
+      }
+      return reply.type(type).send(await fs.promises.readFile(found.file));
+    } catch {
+      return text(404, "Not found.");
+    }
+  });
+
+  // One watcher for all token-holding connections; it only runs while at least one is connected.
+  let watcher: WorkspaceWatcher | undefined;
+  const changeListeners = new Set<(paths: string[]) => void>();
+  const ensureWatcher = (root: string): void => {
+    if (watcher && watcher.root === root) return;
+    watcher?.close();
+    watcher = watchWorkspace(root, (paths) => {
+      for (const listener of changeListeners) listener(paths);
+    });
+  };
+  const releaseWatcher = (): void => {
+    if (changeListeners.size > 0) return;
+    watcher?.close();
+    watcher = undefined;
+  };
 
   let controllers = 0;
 
@@ -154,12 +216,17 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
       busy: control.isBusy(),
     });
     send({ kind: "settings", ...control.getSettings() });
+    if (canControl) send({ kind: "preview", key: previewKey });
     const unsubscribeTeam = control.onSettingsChange((settings) => send({ kind: "settings", ...settings }));
     const unsubscribeEvents = bus.subscribe((event) => send({ kind: "event", event }));
     const unsubscribeBusy = control.onBusyChange((busy) => send({ kind: "busy", busy }));
     const unsubscribeSession = control.onSessionChange((acceptsTasks) => send({ kind: "session", acceptsTasks }));
+    const onFilesChanged = (paths: string[]) => send({ kind: "files_changed", paths });
 
-    if (canControl) controllers++;
+    if (canControl) {
+      controllers++;
+      changeListeners.add(onFilesChanged);
+    }
 
     socket.on("message", (raw: unknown) => {
       const command = parseCommand(raw);
@@ -197,7 +264,13 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
           return;
         }
         try {
-          send({ kind: "files", ...listWorkspace(root) });
+          if (command.full) {
+            const ignore = command.ignore && command.ignore.length > 0 ? command.ignore : DEFAULT_TREE_IGNORE;
+            send({ kind: "files", ...listWorkspace(root, { maxDepth: FULL_TREE_DEPTH, maxEntries: FULL_TREE_MAX_ENTRIES, ignore }) });
+          } else {
+            send({ kind: "files", ...listWorkspace(root) });
+          }
+          ensureWatcher(root);
         } catch (err) {
           send({ kind: "notice", level: "error", text: `Could not read the project folder: ${(err as Error).message}` });
         }
@@ -227,6 +300,8 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
       unsubscribeSession();
       if (canControl) {
         controllers--;
+        changeListeners.delete(onFilesChanged);
+        releaseWatcher();
         // Nobody left who could answer: reject instead of leaving the agent hanging.
         if (controllers <= 0) control.cancelPendingApproval();
       }
@@ -283,6 +358,8 @@ export async function startServer(port: number = DEFAULT_PORT): Promise<Dashboar
     url,
     close: () => {
       stopNotifier?.();
+      watcher?.close();
+      watcher = undefined;
       return app.close();
     },
   };

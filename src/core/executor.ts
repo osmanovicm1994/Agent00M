@@ -25,8 +25,21 @@ import { styleToolSchemas, runStyleCheck } from "../tools/styles.tool";
 import { designSearchSchema, loadDesignSystem, runDesignSearch } from "../tools/design-search.tool";
 import { PlanStore, applyPlanUpdate, describePlan, emptyPlan, openSteps, planToolSchema } from "./plan";
 import { OMITTED_CONTENT_REFUSAL, containsOmittedContentNote, omittedContentNote } from "./written-placeholder";
-import { REPEAT_LIMIT, RepeatTracker, errorSignature, isCodeFile, repeatNote, repeatedFailureReport, summarizeFailures } from "./run-feedback";
-import type { ExecutorHooks } from "./executor-hooks";
+import {
+  MASKED_CHECK_NOTE,
+  REPEAT_LIMIT,
+  RepeatTracker,
+  checkOutputFailed,
+  countErrorLines,
+  digestTypeErrors,
+  isCodeFile,
+  isMaskedCheck,
+  progressSignature,
+  repeatNote,
+  repeatedFailureReport,
+  summarizeFailures,
+} from "./run-feedback";
+import type { ExecutorHooks, ResolverTrigger } from "./executor-hooks";
 import { LoopWatch, adviseBeforeRun, diagnoseFailure, formatDiagnosis, haltText, refuseRecursiveInstallScript } from "./toolchain-doctor";
 import { StallGuard, classifyCall, isInspectCommand, stallGuardEnabled, stallOptionsFor } from "./stall-guard";
 import { KNOWN_FIX_SHOW_LIMIT, formatKnownFixes, knownFixStopText, matchKnownFixes } from "./known-fixes";
@@ -303,6 +316,16 @@ const askCounts = new WeakMap<object, number>();
 // Known failures (see known-fixes.ts): how often each fix was shown in this run. A fix that was shown KNOWN_FIX_SHOW_LIMIT times and
 // did not help ends the run with a plain explanation instead of more tries.
 const knownFixShown = new WeakMap<object, Map<string, number>>();
+// Error lines the last output had when each fix was shown: fewer lines now means the agent is making progress, so it is not a repeat.
+const knownFixErrors = new WeakMap<object, Map<string, number>>();
+// The write counter of the run when each fix was last shown, and the fixes already shown often enough (see the run_command case).
+const knownFixWrites = new WeakMap<object, Map<string, number>>();
+const knownFixQuiet = new WeakMap<object, Set<string>>();
+
+// Outside help (Gemini, see gateway/problem-resolver.ts) is asked for when the same failure comes back this many times in a run.
+const RESOLVER_AT_REPEAT = Number(process.env.AGENT_RESOLVER_AT) || 2;
+// Reports one run may send. Each one needs the person's approval unless AGENT_RESOLVER_AUTO=1.
+const RESOLVER_PER_RUN = Number(process.env.AGENT_RESOLVER_PER_RUN) || 2;
 
 async function confirm(message: string, detail?: string): Promise<boolean> {
   // Runs started from the dashboard are approved there; terminal runs keep the terminal prompt
@@ -408,8 +431,18 @@ interface SessionState {
   interrupted: boolean;
   // Id of the agent running in this session (used by the hooks).
   agentId: string;
+  // Unique per run: the auto-debug halt of an earlier run must never stop a new run before it has written anything.
+  runId: string;
   // Catches an agent that goes in circles (see stall-guard.ts). null when switched off (AGENT_STALL_GUARD=0).
   stall: StallGuard | null;
+  // The task text of this run, and the last command with its output (what a problem report is built from).
+  task: string;
+  lastCommand: string;
+  lastOutput: string;
+  // Successful writes in this run (a counter, unlike filesWritten which lists each path once).
+  writeSeq: number;
+  // Problems already sent to the resolver in this run.
+  resolverUses: Set<string>;
 }
 
 function newSessionState(): SessionState {
@@ -439,7 +472,13 @@ function newSessionState(): SessionState {
     readOnlyRefusals: 0,
     interrupted: false,
     agentId: "agent",
+    runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     stall: null,
+    task: "",
+    lastCommand: "",
+    lastOutput: "",
+    writeSeq: 0,
+    resolverUses: new Set(),
   };
 }
 
@@ -751,6 +790,7 @@ When you are done and have no more actions to take, reply normally with a final 
     state.autoDiagnostics = Boolean(agent.autoDiagnostics) && process.env.AGENT_AUTO_DIAG !== "0";
     state.readOnly = Boolean(agent.readOnly);
     state.agentId = agent.id;
+    state.task = task;
     state.stall = stallGuardEnabled() ? new StallGuard(stallOptionsFor(agent.id)) : null;
     this.activeSchemas = selectToolSchemas(this.toolSchemas, agent.id, `${task}\n${extraContext ?? ""}`);
     if (this.activeSchemas.length < this.toolSchemas.length) {
@@ -1037,9 +1077,16 @@ When you are done and have no more actions to take, reply normally with a final 
             logLine("Stall guard: the agent is repeating the same steps; told it to change approach.", "warn");
             result += `\n\n${verdict.message}`;
           } else if (verdict.level === "stop" && verdict.message && !state.haltMessage) {
-            logLine("Stall guard: the agent kept repeating the same steps; stopping the run.", "warn");
-            state.haltMessage = verdict.message;
-            state.haltLabel = "\u{1F501} Stopped: the agent was going in circles.";
+            // Before the run is ended: outside help gets one chance, with the whole issue.
+            const advice = await this.escalateToResolver(state, "circling", state.lastCommand, state.lastOutput);
+            if (advice) {
+              state.stall = new StallGuard(stallOptionsFor(state.agentId));
+              result += `\n\n${advice}`;
+            } else {
+              logLine("Stall guard: the agent kept repeating the same steps; stopping the run.", "warn");
+              state.haltMessage = verdict.message;
+              state.haltLabel = "\u{1F501} Stopped: the agent was going in circles.";
+            }
           }
         }
 
@@ -1414,16 +1461,23 @@ When you are done and have no more actions to take, reply normally with a final 
         console.log();
         if (result.interrupted) state.interrupted = true;
         state.commandsRun.push(command);
+        state.lastCommand = command;
+        state.lastOutput = result.output;
         // Looking is not verifying: echo / ls / cat / git status after a change must not satisfy the verify gate.
         // (A real run auto-ran 78 `echo "... complete"` commands and passed the gate with them.)
         const inspectOnly = isInspectCommand(command);
-        if (!inspectOnly) state.runsSinceWrite++;
-        if (!diagnostic && !inspectOnly) state.heavyRuns++;
+        // A check wrapped in a pipe, `|| echo` or `$(...)` reports the exit code of the wrapper, not of the check: it is not verification.
+        const masked = !inspectOnly && isMaskedCheck(command);
+        if (!inspectOnly && !masked) state.runsSinceWrite++;
+        if (!diagnostic && !inspectOnly && !masked) state.heavyRuns++;
 
         // A failed run: a short list of the failing lines (the middle of a long log is cut), and a stop signal when
         // the same failure keeps coming back.
-        const failed = !result.timedOut && !result.interrupted && result.exitCode !== 0;
-        state.lastRunFailed = failed;
+        const ran = !result.timedOut && !result.interrupted;
+        const failed = ran && (result.exitCode !== 0 || (masked && checkOutputFailed(result.output)));
+        // Looking (echo, ls, cat) and masked checks prove nothing, so they never clear an earlier failure: a run once ended
+        // with `echo "complete"` after a failed build and was reported as done.
+        if (!inspectOnly && (!masked || failed)) state.lastRunFailed = failed;
         if (result.aborted) {
           console.log(pc.yellow(`\n⛔ Stopped this command: ${result.aborted}.`));
           logLine(`Command stopped by the watchdog: ${result.aborted}.`, "warn");
@@ -1449,24 +1503,60 @@ When you are done and have no more actions to take, reply normally with a final 
           }
         }
         // A failure the agent has met before comes with its exact fix: no debug run, no investigation.
-        const knownFixes = failed && !diagnosis ? matchKnownFixes(command, result.output) : [];
-        if (knownFixes.length) {
+        const matchedFixes = failed && !diagnosis ? matchKnownFixes(command, result.output) : [];
+        // The fixes shown to the agent this time (a fix shown often enough is left out, see below).
+        const knownFixes: typeof matchedFixes = [];
+        if (matchedFixes.length) {
           const shown = knownFixShown.get(state) ?? new Map<string, number>();
           knownFixShown.set(state, shown);
-          for (const fix of knownFixes) {
-            const n = (shown.get(fix.id) ?? 0) + 1;
+          const errorsNow = countErrorLines(result.output);
+          const lastErrors = knownFixErrors.get(state) ?? new Map<string, number>();
+          knownFixErrors.set(state, lastErrors);
+          const wroteAt = knownFixWrites.get(state) ?? new Map<string, number>();
+          knownFixWrites.set(state, wroteAt);
+          const quiet = knownFixQuiet.get(state) ?? new Set<string>();
+          knownFixQuiet.set(state, quiet);
+          for (const fix of matchedFixes) {
+            const before = lastErrors.get(fix.id);
+            lastErrors.set(fix.id, errorsNow);
+            const wroteSince = wroteAt.get(fix.id) !== state.writeSeq;
+            wroteAt.set(fix.id, state.writeSeq);
+            if (quiet.has(fix.id)) continue;
+            // A whole-project typecheck matches the same fix again and again while the agent works on other files. Fewer error
+            // lines than the last time means progress: start counting again instead of stopping the run.
+            const n = before !== undefined && errorsNow < before ? 1 : (shown.get(fix.id) ?? 0) + 1;
             shown.set(fix.id, n);
+            knownFixes.push(fix);
             console.log(pc.yellow(`\n\u{1F9E9} Known problem: ${fix.title}`));
             logLine(`Known problem: ${fix.title}`, "warn");
-            if (n >= KNOWN_FIX_SHOW_LIMIT && !state.haltMessage) {
-              state.haltMessage = knownFixStopText(fix, command);
-              state.haltLabel = "\u{1F9E9} Stopped: a known problem keeps coming back.";
+            if (n >= KNOWN_FIX_SHOW_LIMIT) {
+              if (wroteSince) {
+                // The agent is still writing files (a whole-project check lists problems of other tasks too): this one belongs to
+                // somebody else. Stop repeating it, keep the run going. The final report lists what is still red.
+                quiet.add(fix.id);
+                logLine(`Known problem "${fix.title}" is still open but the agent keeps working on other files: not shown again.`, "warn");
+              } else if (!state.haltMessage) {
+                // Nothing was written since it was last shown: the agent is not even trying.
+                state.haltMessage = knownFixStopText(fix, command);
+                state.haltLabel = "\u{1F9E9} Stopped: a known problem keeps coming back.";
+              }
             }
           }
         }
         const failureSummary = failed && result.output.length > 3000 ? summarizeFailures(result.output) : "";
-        const repeatCount = failed ? state.repeats.record(errorSignature(result.output)) : 0;
-        if (!failed) state.repeats.clear();
+        let repeatCount = failed ? state.repeats.record(progressSignature(result.output)) : 0;
+        if (!failed && !masked) state.repeats.clear();
+        // Many type errors in many files: say which files, and put the ones this run changed first.
+        const errorDigest = failed ? digestTypeErrors(result.output, state.filesWritten) : "";
+        // The same failure for the second time: outside help with the whole issue, before the third repeat ends the run.
+        let resolverAdvice: string | null = null;
+        if (failed && !diagnosis && repeatCount >= RESOLVER_AT_REPEAT) {
+          resolverAdvice = await this.escalateToResolver(state, "repeated-failure", command, result.output);
+          if (resolverAdvice) {
+            state.repeats.clear();
+            repeatCount = 0;
+          }
+        }
         if (repeatCount >= REPEAT_LIMIT) {
           console.log(pc.yellow(`\n(Same failure ${repeatCount} times — the run will stop unless auto-debug verifies a fix.)`));
           logLine(`Same failure ${repeatCount} times: stopping unless auto-debug verifies a fix.`, "warn");
@@ -1491,8 +1581,8 @@ When you are done and have no more actions to take, reply normally with a final 
         // Reactive debugging: the agent is paused here until the interceptor (Debug Agent) is done.
         let autoDebug: { note: string; verified: boolean; halt?: string } | null = null;
         // A diagnosed failure is not a code bug the Debug Agent could patch: it would only burn its attempts on it.
-        if (failed && !diagnosis && knownFixes.length === 0 && this.hooks.commandInterceptor) {
-          autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, command, output: result.output, exitCode: result.exitCode });
+        if (failed && !diagnosis && matchedFixes.length === 0 && !resolverAdvice && this.hooks.commandInterceptor) {
+          autoDebug = await this.hooks.commandInterceptor({ agentId: state.agentId, runId: state.runId, command, output: result.output, exitCode: result.exitCode });
           if (autoDebug?.verified) {
             state.lastRunFailed = false;
             state.repeats.clear();
@@ -1511,6 +1601,9 @@ When you are done and have no more actions to take, reply normally with a final 
           exitCode: result.exitCode,
           timedOut: result.timedOut,
           ...(failureSummary ? { failureSummary } : {}),
+          ...(errorDigest ? { errorDigest } : {}),
+          ...(resolverAdvice ? { resolverAdvice } : {}),
+          ...(masked ? { warning: MASKED_CHECK_NOTE } : {}),
           ...(repeatCount >= REPEAT_LIMIT && !autoDebug?.verified ? { note: repeatNote(repeatCount) } : {}),
           ...(autoDebug ? { autoDebug: autoDebug.note } : {}),
           ...(diagnosis ? { diagnosis: formatDiagnosis(diagnosis) } : {}),
@@ -1569,6 +1662,58 @@ When you are done and have no more actions to take, reply normally with a final 
     let d = dir;
     while (d !== "." && !this.fs.isDirectory(d)) d = dirnameOf(d);
     return d;
+  }
+
+  /**
+   * Outside help for a problem the agent cannot get past (see gateway/problem-resolver.ts): the full issue is collected and reviewed,
+   * the person approves what is sent (AGENT_RESOLVER_AUTO=1 skips that), and the advice comes back as text for the agent.
+   * Returns null when no help was given: no resolver, a review role, an unattended run that may not ask, the limit for this run
+   * is reached, the person declined, or Gemini did not answer. The caller then carries on exactly as it did before.
+   */
+  private async escalateToResolver(state: SessionState, trigger: ResolverTrigger, command: string, output: string): Promise<string | null> {
+    const resolver = this.hooks.problemResolver;
+    if (!resolver || state.readOnly || state.agentId === "debug") return null;
+    const auto = process.env.AGENT_RESOLVER_AUTO === "1";
+    if (this.hooks.unattended && !auto) return null;
+    const key = `${trigger}|${command.trim()}`;
+    if (state.resolverUses.has(key) || state.resolverUses.size >= RESOLVER_PER_RUN) return null;
+    state.resolverUses.add(key);
+
+    try {
+      const prepared = await resolver.prepare({
+        agentId: state.agentId,
+        task: state.task,
+        trigger,
+        command,
+        output,
+        filesWritten: [...state.filesWritten],
+        commandsRun: state.commandsRun.slice(-15),
+        errorDigest: digestTypeErrors(output, state.filesWritten),
+        readFile: (rel) => {
+          try {
+            return isSecretPath(rel) ? undefined : this.fs.readFile(rel);
+          } catch {
+            return undefined;
+          }
+        },
+      });
+      if (!prepared) return null;
+      const label = trigger === "circling" ? "going in circles" : "the same failure again";
+      console.log(pc.yellow(`\n\u{1F198} The agent is stuck (${label}). The full issue was reviewed${prepared.notes.length ? `: ${prepared.notes.join(" ")}` : "."}`));
+      logLine(`Stuck (${label}): problem report prepared for Gemini.${prepared.notes.length ? ` ${prepared.notes.join(" ")}` : ""}`, "warn");
+      if (!auto && !(await confirm("Send this problem report to Gemini for help?", prepared.preview))) {
+        logLine("Problem report not sent (declined).", "warn");
+        return null;
+      }
+      const advice = await prepared.send();
+      console.log(pc.green("\u{1F4A1} Gemini answered; the advice goes to the agent."));
+      logLine("Gemini answered: the advice goes to the agent.");
+      bus.emit("agent_thinking", { source: "reply", step: 0, text: truncate(advice, 1200) });
+      return advice;
+    } catch (err: any) {
+      logLine(`Outside help failed: ${String(err?.message ?? err).split("\n")[0].slice(0, 200)}`, "warn");
+      return null;
+    }
   }
 
   /** ask_user: one short question to the person (terminal or dashboard). Never blocks an unattended run. */
@@ -1751,6 +1896,7 @@ When you are done and have no more actions to take, reply normally with a final 
     state.verifyNudged = false;
     state.filesRead.add(p);
     if (!state.filesWritten.includes(p)) state.filesWritten.push(p);
+    state.writeSeq++;
     this.hooks.onFileWritten?.(state.agentId, p);
     return `File written: ${p} (${newLines - 1} lines). The file now ends with:\n${this.tailOf(p)}\nIf this is only the first chunk of a longer file, continue with append_file starting right after these lines; otherwise move on.`;
   }
@@ -1790,6 +1936,7 @@ When you are done and have no more actions to take, reply normally with a final 
     }
 
     this.fs.appendToFile(p, content);
+    state.writeSeq++;
     bus.emit("artifact_generated", { path: p, action: "appended", lines: lines.length });
     state.heavyRunsAtLastWrite = state.heavyRuns;
     state.verifyNudged = false;

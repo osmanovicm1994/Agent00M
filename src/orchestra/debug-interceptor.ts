@@ -22,6 +22,8 @@ import { buildTriageReport, type AttemptRecord, type ProjectFacts } from "./tria
 
 export interface InterceptEvent {
   agentId: string;
+  /** The executor run the command belongs to (see CommandFailure.runId). */
+  runId?: string;
   command: string;
   output: string;
   exitCode?: number | null;
@@ -97,7 +99,18 @@ function tail(text: string, max = MAX_OUTPUT): string {
   return text.length <= max ? text : "[...earlier output cut...]\n" + text.slice(-max);
 }
 
+/**
+ * Start AND end of a long output. A whole-project typecheck prints the errors that matter first and a long generated-types message
+ * last; keeping only the tail (as before) handed the Debug Agent the wrong end of the log.
+ */
+function headAndTail(text: string, max = MAX_OUTPUT): string {
+  if (text.length <= max) return text;
+  const head = Math.floor(max * 0.6);
+  return `${text.slice(0, head)}\n[...${text.length - max} characters cut from the middle...]\n${text.slice(-(max - head))}`;
+}
+
 const normalizeCommand = (c: string) => c.trim().replace(/\s+/g, " ");
+const haltKey = (command: string, runId?: string) => `${runId ?? ""}|${normalizeCommand(command)}`;
 
 export class DebugInterceptor {
   private seen = new Map<string, number>();
@@ -107,7 +120,8 @@ export class DebugInterceptor {
   private notedUnfixable = new Set<string>();
   private total = 0;
   private haltReport: string | undefined;
-  // Reports by command, kept for the whole session: a second agent that runs the same exhausted command is stopped too.
+  // Reports by run and command. A halt ends THAT run only: it used to be kept for the whole session, so every later task (a new
+  // run that had not written a single file) was stopped at its first typecheck with the same stale report.
   private haltByCommand = new Map<string, string>();
 
   constructor(
@@ -126,9 +140,9 @@ export class DebugInterceptor {
     return r;
   }
 
-  /** The triage report of a command whose attempts are used up (kept, unlike takeHalt), or undefined. */
-  haltFor(command: string): string | undefined {
-    return this.haltByCommand.get(normalizeCommand(command));
+  /** The triage report of a command whose attempts are used up in this run (kept, unlike takeHalt), or undefined. */
+  haltFor(command: string, runId?: string): string | undefined {
+    return this.haltByCommand.get(haltKey(command, runId));
   }
 
   /** Returns text to append to the tool result, or null when nothing should happen. Never throws. */
@@ -190,7 +204,7 @@ export class DebugInterceptor {
       attempts,
       limit,
     });
-    this.haltByCommand.set(normalizeCommand(e.command), this.haltReport);
+    this.haltByCommand.set(haltKey(e.command, e.runId), this.haltReport);
     this.deps.log?.(`auto-debug: ${attempts.length}/${limit} attempts used on \`${e.command}\`; stopping with a triage report`);
     return `AUTO-DEBUG STOP (${failure.kind}): ${attempts.length} of ${limit} debug attempts are used and \`${e.command}\` still fails. Do not run it again. The run ends here with a triage report for the user.`;
   }
@@ -205,7 +219,7 @@ export class DebugInterceptor {
         agentId: e.agentId,
         failure,
         command: e.command,
-        output: tail(e.output),
+        output: headAndTail(e.output),
         cwd: e.cwd,
       });
     } catch (err) {

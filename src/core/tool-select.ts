@@ -15,6 +15,9 @@ const WEB_TOOLS = new Set(["web_search", "web_fetch", "web_research"]);
 const BROWSER_TOOLS = new Set(["inspect_page", "check_styles", "design_search"]);
 const DEPLOY_TOOLS = new Set(["deploy_template", "predeploy_check"]);
 const PROCESS_TOOLS = new Set(["start_process", "process_logs", "stop_process"]);
+// The Playwright MCP server adds about eleven browser_* tools (roughly 3k tokens of schema on every call). They are sent only when
+// the role or task is about something a person looks at in a browser; on a 32k window that room is worth more to the code.
+const BROWSER_MCP_RE = /^browser_/;
 
 /** The task asks for something that lives on the web: docs, a version, a lookup, a URL. */
 const WEB_TASK_RE = /\b(web|online|internet|search|look ?up|latest|newest|current|docs?|documentation|changelog|release notes?|npm view|upgrade|compatib|deprecat)\b|https?:\/\//i;
@@ -41,7 +44,7 @@ export function selectToolSchemas(all: ToolSchema[], agentId: string, task: stri
 
   return all.filter((t) => {
     if (WEB_TOOLS.has(t.name)) return wantsWeb;
-    if (BROWSER_TOOLS.has(t.name)) return wantsBrowser;
+    if (BROWSER_TOOLS.has(t.name) || BROWSER_MCP_RE.test(t.name)) return wantsBrowser;
     if (DEPLOY_TOOLS.has(t.name)) return wantsDeploy;
     if (PROCESS_TOOLS.has(t.name)) return wantsProcess;
     return true;
